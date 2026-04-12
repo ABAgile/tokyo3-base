@@ -243,4 +243,149 @@ StackFrame(0)
 
 // only frames in your own packages
 StackFrame(0, "github.com/acme/myapp", "github.com/acme/shared")
+
 ```
+---
+## api/ — HTTP client utilities
+
+Thin option-driven wrapper over [go-resty/resty](https://github.com/go-resty/resty/v2) with bearer-token management, structured request logging, and context-scoped log annotation.
+
+### Client construction
+
+```go
+func NewRestClient(baseURL string, opts ...RestyClientOption) *RestyClient
+```
+
+```go
+rc := api.NewRestClient("https://api.example.com",
+    api.CO.WithTimeout(10 * time.Second),
+    api.CO.WithHeader("Accept", "application/json"),
+    api.CO.WithRequestLogger(logger),
+)
+```
+
+#### Client options (`CO`)
+
+| Option | Description |
+|---|---|
+| `CO.WithBaseUrl(url)` | Overrides the base URL after construction |
+| `CO.WithTimeout(d)` | Request timeout |
+| `CO.WithRetryCount(n)` | Number of retries on transient errors |
+| `CO.WithHeader(k, v)` | Sets a default request header |
+| `CO.WithHeaders(map)` | Sets multiple default request headers |
+| `CO.WithAuthToken(token)` | Sets `Authorization: Bearer <token>` on every request |
+| `CO.WithBasicAuth(u, p)` | Sets `Authorization: Basic …` on every request |
+| `CO.WithTransport(rt)` | Replaces the underlying `http.RoundTripper` (custom TLS, proxies, test mocks) |
+| `CO.WithDebug(bool)` | Enables resty debug output |
+| `CO.WithRequestLogger(logger)` | Attaches structured request/response logging (see below) |
+
+### Request execution
+
+```go
+func (rc *RestyClient) R(ctx context.Context, method, path string, result any, opts ...RestyRequestOption) error
+```
+
+Executes a request and unmarshals the response body into `result` on success. Returns `*ApiError` on HTTP error status.
+
+```go
+var out MyResponse
+err := rc.R(ctx, http.MethodGet, "/v1/orders/{id}", &out,
+    api.RO.WithPathParam("id", orderID),
+    api.RO.WithQueryParam("expand", "items"),
+)
+var apiErr *api.ApiError
+if errors.As(err, &apiErr) {
+    // apiErr.StatusCode holds the HTTP status
+}
+```
+
+#### Request options (`RO`)
+
+| Option | Description |
+|---|---|
+| `RO.WithQueryParam(k, v)` | Adds a query parameter |
+| `RO.WithQueryParams(map)` | Adds multiple query parameters |
+| `RO.WithPathParam(k, v)` | Substitutes a `{k}` placeholder in the path |
+| `RO.WithPathParams(map)` | Substitutes multiple path placeholders |
+| `RO.WithBody(v)` | Sets the request body (JSON-encoded) |
+| `RO.WithHeader(k, v)` | Sets a per-request header |
+| `RO.WithHeaders(map)` | Sets multiple per-request headers |
+| `RO.WithAuthToken(token)` | Overrides auth token for this request only |
+| `RO.WithBasicAuth(u, p)` | Overrides basic auth for this request only |
+| `RO.WithDebug(bool)` | Enables resty debug for this request only |
+
+### Bearer token management
+
+```go
+type BearerTokenManager struct { ... }
+type BearerTokenRefresher func(context.Context) (string, time.Time, error)
+```
+
+Thread-safe token cache with automatic refresh. Calls `Refresher` when the token is within 5 minutes of expiry (default buffer). Override per call via context:
+
+```go
+tm := &api.BearerTokenManager{
+    Refresher: func(ctx context.Context) (string, time.Time, error) {
+        return fetchTokenFromIDP(ctx) // returns token, expiresAt, err
+    },
+}
+
+// use default 5-min buffer
+token, err := tm.GetToken(ctx)
+
+// override buffer — refresh 10 min before expiry
+ctx = api.WithTokenRefreshBuffer(ctx, -10*time.Minute)
+token, err = tm.GetToken(ctx)
+```
+
+### Request logging
+
+`CO.WithRequestLogger` attaches a `*slog.Logger` that emits one `OUTGOING_REQUEST` line before each call and one `INCOMING_RESPONSE` line after. `Authorization` and `Cookie` headers are redacted automatically.
+
+#### Context log attributes
+
+Arbitrary key-value pairs stored in the context are appended to both log lines — no changes to client configuration required:
+
+```go
+ctx = api.WithLogAttr(ctx, "plan_no", "P-123")
+ctx = api.WithLogAttrs(ctx, map[string]string{"tref": "T-456", "tenant": "acme"})
+
+// OUTGOING_REQUEST: GET /orders |>> plan_no: [P-123] tenant: [acme] tref: [T-456]
+// INCOMING_RESPONSE: GET /orders 200 |>> plan_no: [P-123] tenant: [acme] tref: [T-456]
+```
+
+Each `WithLogAttr` / `WithLogAttrs` call produces a new context; the parent is never mutated. Keys are sorted alphabetically in the log output.
+
+```go
+func SanitizeHeaders(h map[string][]string) map[string][]string
+```
+
+Redacts `Authorization` and `Cookie` values (case-insensitive). Used internally by the logger; also available for custom middleware.
+
+---
+## api/google — Google Maps / Places client
+
+Typed client for the [Geocoding API](https://developers.google.com/maps/documentation/geocoding) and [Places Text Search API](https://developers.google.com/maps/documentation/places/web-service/text-search).
+
+### Address lookup
+
+```go
+svc := google.NewGeocodeService(apiKey, api.CO.WithTimeout(5*time.Second))
+// or
+svc := google.NewPlacesService(apiKey, api.CO.WithTimeout(5*time.Second))
+
+results, err := svc.GetResults(ctx, "Shinjuku, Tokyo")
+// results[0].Address → "1 Chome Shinjuku, Shinjuku City, Tokyo 160-0022, Japan"
+// results[0].City    → "Shinjuku"
+```
+
+Both constructors return `google.Addresser`, making the backend interchangeable and easy to mock in tests:
+
+```go
+type Addresser interface {
+    GetResults(ctx context.Context, address string) ([]AddressResult, error)
+}
+```
+
+City is extracted by priority: `locality` is preferred over `administrative_area_level_1`. `AddressComponent.Name()` transparently unifies the field-name difference between the two APIs (`long_name` in Geocoding, `longText` in Places).
+
