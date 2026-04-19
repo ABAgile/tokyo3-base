@@ -13,6 +13,82 @@ import (
 	"github.com/phuslu/log"
 )
 
+// AppLogger constructs a structured JSON logger for the named application.
+//
+// With no [WriterOption]s, output goes to stdout. Compose writers explicitly:
+//
+//	AppLogger("svc", WithStdout())                    // stdout only
+//	AppLogger("svc", WithAsyncNats(nc))               // async NATS only
+//	AppLogger("svc", WithStdout(), WithAsyncNats(nc)) // both
+//
+// The returned [*slog.LevelVar] controls the effective log level at runtime
+// (default: Info). Adjust it with lv.Set(slog.LevelDebug) without restarting.
+func AppLogger(app string, writerOpts ...WriterOption) (*slog.Logger, *slog.LevelVar) {
+	var writers []log.Writer
+	for _, opt := range writerOpts {
+		opt(app, &writers)
+	}
+
+	var writer log.Writer
+	switch len(writers) {
+	case 0:
+		writer = &log.IOWriter{Writer: os.Stdout}
+	case 1:
+		writer = writers[0]
+	default:
+		mw := log.MultiEntryWriter(writers)
+		writer = &mw
+	}
+
+	phuslu := &log.Logger{Level: log.TraceLevel, Writer: writer}
+	lv := new(slog.LevelVar)
+	return slog.New(&levelHandler{level: lv, inner: phuslu.Slog().Handler()}).With("app", app), lv
+}
+
+type levelHandler struct {
+	level *slog.LevelVar
+	inner slog.Handler
+}
+
+func (h *levelHandler) Enabled(_ context.Context, l slog.Level) bool {
+	return l >= h.level.Level()
+}
+
+func (h *levelHandler) Handle(ctx context.Context, r slog.Record) error {
+	return h.inner.Handle(ctx, r)
+}
+
+func (h *levelHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &levelHandler{h.level, h.inner.WithAttrs(attrs)}
+}
+
+func (h *levelHandler) WithGroup(name string) slog.Handler {
+	return &levelHandler{h.level, h.inner.WithGroup(name)}
+}
+
+// WriterOption configures a log destination for [AppLogger].
+// Use [WithStdout] and [WithAsyncNats] to compose the desired combination.
+type WriterOption func(app string, ws *[]log.Writer)
+
+// WithStdout adds a synchronous stdout writer.
+func WithStdout() WriterOption {
+	return func(_ string, ws *[]log.Writer) {
+		*ws = append(*ws, &log.IOWriter{Writer: os.Stdout})
+	}
+}
+
+// WithAsyncNats adds an async NATS writer that publishes to "app_log.<app>".
+// Entries are discarded when the 200-entry channel is full.
+func WithAsyncNats(nc *nats.Conn) WriterOption {
+	return func(app string, ws *[]log.Writer) {
+		*ws = append(*ws, &log.AsyncWriter{
+			ChannelSize:   200,
+			DiscardOnFull: true,
+			Writer:        &log.IOWriter{Writer: &NatsWriter{Nc: nc, Subject: "app_log." + app}},
+		})
+	}
+}
+
 type NatsWriter struct {
 	Nc      *nats.Conn
 	Subject string
@@ -24,83 +100,6 @@ func (nw *NatsWriter) Write(p []byte) (n int, err error) {
 		return 0, err
 	}
 	return len(p), nil
-}
-
-type AppLoggerOption func(*appLoggerConfig)
-
-type appLoggerConfig struct {
-	level log.Level
-	ctx   log.Context
-}
-
-func WithLevel[L slog.Level | log.Level](level L) AppLoggerOption {
-	return func(cfg *appLoggerConfig) { cfg.level = toPhusluLevel(any(level)) }
-}
-
-func toPhusluLevel(level any) log.Level {
-	switch l := level.(type) {
-	case slog.Level:
-		switch {
-		case l < slog.LevelDebug:
-			return log.TraceLevel
-		case l < slog.LevelInfo:
-			return log.DebugLevel
-		case l < slog.LevelWarn:
-			return log.InfoLevel
-		case l < slog.LevelError:
-			return log.WarnLevel
-		default:
-			return log.ErrorLevel
-		}
-	default:
-		return l.(log.Level)
-	}
-}
-
-func WithSite(site string) AppLoggerOption {
-	return func(cfg *appLoggerConfig) {
-		cfg.ctx = log.NewContext(cfg.ctx).Str("site", site).Value()
-	}
-}
-
-func WithModule(module string) AppLoggerOption {
-	return func(cfg *appLoggerConfig) {
-		cfg.ctx = log.NewContext(cfg.ctx).Str("module", module).Value()
-	}
-}
-
-func AppLogger(app string, nc *nats.Conn, opts ...AppLoggerOption) log.Logger {
-	cfg := &appLoggerConfig{level: log.InfoLevel}
-	for _, opt := range opts {
-		opt(cfg)
-	}
-
-	ctx := log.NewContext(cfg.ctx).Str("app", app).Value()
-
-	var writer log.Writer = &log.IOWriter{Writer: os.Stdout}
-	if nc != nil {
-		writer = &log.MultiEntryWriter{
-			&log.IOWriter{Writer: os.Stdout},
-			&log.AsyncWriter{
-				ChannelSize:   200,
-				DiscardOnFull: true,
-				Writer: &log.IOWriter{Writer: &NatsWriter{
-					Nc:      nc,
-					Subject: "app_log." + app,
-				}},
-			},
-		}
-	}
-
-	return log.Logger{Level: cfg.level, Context: ctx, Writer: writer}
-}
-
-func LoggerWithContext(l *log.Logger, opts ...AppLoggerOption) *log.Logger {
-	cfg := &appLoggerConfig{ctx: l.Context}
-	for _, opt := range opts {
-		opt(cfg)
-	}
-	return &log.Logger{Level: l.Level, Writer: l.Writer, Context: cfg.ctx}
 }
 
 // AttrsHandler is a slog.Handler that appends attributes to the log message

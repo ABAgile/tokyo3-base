@@ -111,70 +111,55 @@ model, err := CopyDeref(row, &Model{})
 
 ## log.go — Logging helpers
 
-The logging layer is designed to be **implementation-agnostic at the call site**: all
-application code works against the standard `log/slog` interface.
-[`github.com/phuslu/log`](https://github.com/phuslu/log) is used as the underlying
-engine specifically for its flexible multi-writer pipeline and low-allocation
-structured output, but that choice is an internal detail — swapping it out would
-require no changes to application code.
+The logging layer is **entirely `log/slog`-based at every call site**.
+[`github.com/phuslu/log`](https://github.com/phuslu/log) is used internally as the
+output engine for its multi-writer pipeline and low-allocation JSON output, but that
+is an internal detail — application code never imports it.
 
 ### Design split
 
 | Layer | Type | Interface |
 |---|---|---|
-| App logger construction | `AppLogger`, `LoggerWithContext` | phuslu `log.Logger` — used at startup only |
-| Log-call sites | `NewAttrsLogger` → `*slog.Logger` | standard `log/slog` |
+| App logger construction | `AppLogger` | returns `*slog.Logger` + `*slog.LevelVar` |
+| Writer composition | `WithStdout`, `WithAsyncNats` | `WriterOption` |
+| Log-call sites | `*slog.Logger` | standard `log/slog` |
 | Message annotation | `AttrsHandler` | `slog.Handler` — wraps any handler |
 | Stack capture | `StackFrame` | plain `string` — no logger dependency |
 
-### `AppLogger` — structured app logger with optional NATS fanout
+### `AppLogger` — structured app logger with composable writers
 
 ```go
-func AppLogger(app string, nc *nats.Conn, opts ...AppLoggerOption) log.Logger
+func AppLogger(app string, writerOpts ...WriterOption) (*slog.Logger, *slog.LevelVar)
 ```
 
-Constructs a phuslu logger that writes JSON to stdout. When `nc` is non-nil a
-second writer fans out asynchronously to the NATS subject `app_log.<app>` (buffered
-at 200 entries, discards on full). Pass `nil` for a stdout-only logger.
+Constructs a `*slog.Logger` that emits JSON. With no writer options, output goes to
+stdout. Compose writers explicitly via `WriterOption`:
 
 ```go
-logger := AppLogger("myapp", nc,
-    WithSite("tokyo"),
-    WithModule("api"),
-    WithLevel(slog.LevelDebug),
-)
+logger, lv := AppLogger("myapp", WithStdout())                   // stdout only
+logger, lv := AppLogger("myapp", WithAsyncNats(nc))              // NATS only
+logger, lv := AppLogger("myapp", WithStdout(), WithAsyncNats(nc)) // both
 ```
 
-#### Options
+The returned `*slog.LevelVar` controls the minimum log level at runtime (default:
+`Info`). It is safe for concurrent use:
+
+```go
+lv.Set(slog.LevelDebug) // takes effect immediately, no restart needed
+```
+
+Add fixed context fields with standard slog:
+
+```go
+logger = logger.With("site", "tokyo", "module", "api")
+```
+
+#### Writer options
 
 | Option | Description |
 |---|---|
-| `WithSite(site string)` | Adds `site` field to every log entry |
-| `WithModule(module string)` | Adds `module` field to every log entry |
-| `WithLevel(level)` | Sets minimum log level; accepts both `slog.Level` and `log.Level` — defaults to `InfoLevel` |
-
-`WithLevel` accepts either scheme transparently:
-
-```go
-WithLevel(slog.LevelWarn)   // slog constant — no phuslu import needed
-WithLevel(log.DebugLevel)   // phuslu constant — full range including Trace/Fatal/Panic
-```
-
-slog has no `Fatal` or `Panic` levels by design (see below); those remain
-accessible via the phuslu constant directly when genuinely needed.
-
-### `LoggerWithContext` — derive a child logger with additional context fields
-
-```go
-func LoggerWithContext(l *log.Logger, opts ...AppLoggerOption) *log.Logger
-```
-
-Returns a new logger that shares the parent's writer and level but carries
-additional context fields. Uses the same `AppLoggerOption` set as `AppLogger`:
-
-```go
-requestLogger := LoggerWithContext(&logger, WithModule("payment"))
-```
+| `WithStdout()` | Synchronous stdout writer |
+| `WithAsyncNats(nc)` | Async NATS writer; publishes to `app_log.<app>`, 200-entry buffer, discards on full |
 
 ### `AttrsHandler` / `NewAttrsLogger` — human-readable message annotation
 
@@ -222,10 +207,6 @@ The idiomatic replacement is explicit and testable:
 logger.Error("unrecoverable state", slog.Any("err", err))
 os.Exit(1)
 ```
-
-`Fatal` and `Panic` levels remain available through phuslu's `log.FatalLevel` and
-`log.PanicLevel` via `WithLevel` for cases where drop-in compatibility with existing
-infrastructure requires them.
 
 ### `StackFrame` — filtered stack capture
 
