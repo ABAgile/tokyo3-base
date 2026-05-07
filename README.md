@@ -575,3 +575,75 @@ http.DefaultClient.Transport = &http.Transport{TLSClientConfig: cfg}
 `CertPoolFromPEM` is the lower-level building block when you already have
 PEM bytes and just want a `*x509.CertPool` for `RootCAs` / `ClientCAs`.
 
+---
+
+## journal/ — Append-only durable event sink
+
+A write-only, append-only, ordered, **fail-closed** publish primitive — the
+shape that fits audit trails, event-sourcing stores, financial ledgers,
+change-data-capture, and anywhere "this event happened, never lose it"
+matters.
+
+```go
+import (
+    "github.com/abagile/tokyo3-base/journal"
+    "github.com/abagile/tokyo3-base/journal/jetstream"
+)
+```
+
+### Reliability contract
+
+`Sink.Append` publishes synchronously and returns the publish error to the
+caller. Implementations must not silently drop or swallow failures —
+callers rely on `Append`'s error to decide whether the originating
+operation may be considered complete. This is the property that makes a
+journal usable as compliance evidence or as the source of truth for an
+event-sourced system.
+
+> **Don't reach for a journal to implement application logs**. Operational
+> logs are a different reliability tier (lossy, fire-and-forget,
+> backpressure-tolerant). Use `base.AppLogger` with `WithAsyncNats` for
+> that. Mixing the two contracts under one interface erodes both.
+
+### Interface
+
+```go
+type Sink interface {
+    Append(ctx context.Context, payload []byte) error
+    Close() error
+}
+
+type Noop struct{} // discards every payload; for tests / disabled-in-dev
+```
+
+The interface is byte-oriented; callers marshal their own payload format
+(JSON, protobuf, length-prefixed binary, …). Implementations live in
+sub-packages so each transport's SDK weight is opt-in.
+
+### `journal/jetstream` — NATS JetStream implementation
+
+```go
+cfg := jetstream.Config{
+    URL:     "tls://nats:4222",
+    Subject: "vault.audit.events",     // must be covered by an existing JetStream stream
+    TLS:     tlsCfg,                   // optional; nil for plaintext (dev only)
+}
+sink, err := jetstream.New(cfg)
+if err != nil { /* ... */ }
+defer sink.Close()
+
+// Per write:
+payload, _ := json.Marshal(event)
+if err := sink.Append(ctx, payload); err != nil {
+    // fail the originating operation — the event is NOT in the journal
+    return fmt.Errorf("append: %w", err)
+}
+```
+
+`Append` blocks on the JetStream server-ack, so the caller observes any
+publish error before returning. The publisher's NATS credential needs only
+PUBLISH on the configured subject — no stream-management rights, since the
+package does not provision streams. Provision streams out-of-band (a
+sidecar container running `nats stream add`, an operator-managed stream, or
+a one-shot init job).
+
