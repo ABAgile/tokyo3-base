@@ -620,6 +620,46 @@ The interface is byte-oriented; callers marshal their own payload format
 (JSON, protobuf, length-prefixed binary, …). Implementations live in
 sub-packages so each transport's SDK weight is opt-in.
 
+### Typed events with `EncodedSink[T]`
+
+```go
+type EncodedSink[T any] struct { /* ... */ }
+
+func NewEncodedSink[T any](inner Sink, encode func(T) ([]byte, error)) *EncodedSink[T]
+func NewJSONSink   [T any](inner Sink) *EncodedSink[T]   // convenience: encode = json.Marshal
+```
+
+Most consumers have a typed event struct (audit entry, domain event, CDC
+record, ledger transaction) and a wire format. `EncodedSink[T]` wraps a
+byte-level `Sink` with a typed `Append(ctx, v T) error` that runs the
+configured encoder before publishing — saving every consumer from
+re-implementing the same marshal-then-Append shim.
+
+```go
+type AuditEntry struct {
+    ID, Action, ActorID string
+    OccurredAt          time.Time
+}
+
+inner, _ := jetstream.New(jetstream.Config{URL: "...", Subject: "..."})
+sink := journal.NewJSONSink[AuditEntry](inner)
+
+// Per write:
+err := sink.Append(ctx, AuditEntry{ID: "e-1", Action: "secret.set", /* ... */})
+```
+
+For non-JSON formats, supply your own encoder:
+
+```go
+sink := journal.NewEncodedSink(inner, func(e AuditEntry) ([]byte, error) {
+    return proto.Marshal(toProto(e))
+})
+```
+
+Encode failures surface as the return of `Append` and the inner Sink is
+not called; inner publish failures surface verbatim — the fail-closed
+contract is preserved end-to-end.
+
 ### `journal/jetstream` — NATS JetStream implementation
 
 ```go
