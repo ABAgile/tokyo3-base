@@ -13,7 +13,7 @@ go get github.com/abagile/tokyo3-base
 ```
 
 ---
-## db.go — PostgreSQL / pgx utilities
+## db/ — PostgreSQL / pgx utilities
 
 ### Pool construction
 
@@ -109,7 +109,7 @@ model, err := CopyDeref(row, &Model{})
 
 ---
 
-## log.go — Logging helpers
+## applog/ — Application logging helpers
 
 The logging layer is **entirely `log/slog`-based at every call site**.
 [`github.com/phuslu/log`](https://github.com/phuslu/log) is used internally as the
@@ -494,22 +494,22 @@ cache.Invalidate(projectID)
 
 ---
 
-## natsutil/ — NATS dial helper
+## nats/ — NATS dial helper
 
 A one-line wrapper around the boilerplate every NATS-connecting binary
-spells out by hand: load optional mTLS material via `tlsutil.FromFiles`,
+spells out by hand: load optional mTLS material via `tls.FromFiles`,
 attach `nats.Secure` when the TLS config is non-nil, then `nats.Connect`.
 
 ```go
 import (
-    "github.com/abagile/tokyo3-base/natsutil"
+    "github.com/abagile/tokyo3-base/nats"
     "github.com/nats-io/nats.go"
 )
 
 func Dial(url, certFile, keyFile, caFile string, opts ...nats.Option) (*nats.Conn, error)
 ```
 
-`certFile`/`keyFile`/`caFile` are forwarded to `tlsutil.FromFiles` — pass
+`certFile`/`keyFile`/`caFile` are forwarded to `tls.FromFiles` — pass
 all three (or all empty) together; empty paths produce a plaintext
 connection (development only).
 
@@ -520,7 +520,7 @@ caller's TLS opinion (if any) wins for everything other than the cert
 material itself.
 
 ```go
-nc, err := natsutil.Dial(
+nc, err := nats.Dial(
     os.Getenv("VAULT_NATS_URL"),
     os.Getenv("VAULT_NATS_CERT"),
     os.Getenv("VAULT_NATS_KEY"),
@@ -536,7 +536,7 @@ externally-owned `*nats.Conn`).
 
 ---
 
-## tlsutil/ — TLS config and self-signed cert helpers
+## tls/ — TLS config and self-signed cert helpers
 
 Helpers for the boring parts of running a TLS server or client without
 inventing your own PKI: hot-reload a cert/key pair on rotation, build
@@ -544,7 +544,7 @@ inventing your own PKI: hot-reload a cert/key pair on rotation, build
 fallback that covers `localhost`, `*.localhost`, and loopback IPs.
 
 ```go
-import "github.com/abagile/tokyo3-base/tlsutil"
+import "github.com/abagile/tokyo3-base/tls"
 ```
 
 ### CertLoader — hot-reload cert/key on disk change
@@ -565,7 +565,7 @@ not yet during a rotation) the previously cached cert is returned so
 in-flight handshakes are unaffected.
 
 ```go
-loader := tlsutil.NewCertLoader("/etc/tls/server.crt", "/etc/tls/server.key")
+loader := tls.NewCertLoader("/etc/tls/server.crt", "/etc/tls/server.key")
 srv := &http.Server{
     Addr:      ":443",
     TLSConfig: &tls.Config{GetCertificate: loader.GetCertificate},
@@ -605,7 +605,7 @@ CA input is optional and populates `RootCAs` when provided.
 
 ```go
 // mTLS client config from disk
-cfg, err := tlsutil.FromFiles(
+cfg, err := tls.FromFiles(
     "/etc/tls/client.crt",
     "/etc/tls/client.key",
     "/etc/tls/ca.crt",
@@ -644,7 +644,7 @@ event-sourced system.
 
 > **Don't reach for a journal to implement application logs**. Operational
 > logs are a different reliability tier (lossy, fire-and-forget,
-> backpressure-tolerant). Use `base.AppLogger` with `WithAsyncNats` for
+> backpressure-tolerant). Use `applog.AppLogger` with `WithAsyncNats` for
 > that. Mixing the two contracts under one interface erodes both.
 
 ### Interface

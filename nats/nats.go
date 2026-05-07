@@ -1,7 +1,7 @@
 // Package natsutil provides a small dial helper that composes tlsutil + nats.go
 // in the shape three of our internal binaries currently spell out by hand:
 //
-//	tlsCfg, err := tlsutil.FromFiles(certFile, keyFile, caFile)
+//	tlsCfg, err := tls.FromFiles(certFile, keyFile, caFile)
 //	if err != nil { ... }
 //	var opts []nats.Option
 //	if tlsCfg != nil { opts = append(opts, nats.Secure(tlsCfg)) }
@@ -13,19 +13,19 @@
 // reconnect handlers, …) without bloating the helper's signature — they're
 // applied after nats.Secure so the caller's choices win for anything other
 // than TLS.
-package natsutil
+package nats
 
 import (
-	"github.com/abagile/tokyo3-base/tlsutil"
+	"github.com/abagile/tokyo3-base/tls"
 	"github.com/nats-io/nats.go"
 )
 
 // Dial dials a NATS server with optional mTLS. certFile/keyFile/caFile are
-// passed to tlsutil.FromFiles — supply all three (or all empty) together;
+// passed to tls.FromFiles — supply all three (or all empty) together;
 // when non-nil the resulting TLS config is wired in via nats.Secure ahead of
 // any caller-supplied opts.
 func Dial(url, certFile, keyFile, caFile string, opts ...nats.Option) (*nats.Conn, error) {
-	tlsCfg, err := tlsutil.FromFiles(certFile, keyFile, caFile)
+	tlsCfg, err := tls.FromFiles(certFile, keyFile, caFile)
 	if err != nil {
 		return nil, err
 	}

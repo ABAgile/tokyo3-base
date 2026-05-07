@@ -13,7 +13,7 @@
 // material on disk or already in memory; both return (nil, nil) when given no
 // inputs so callers can switch transparently between TLS and plaintext.
 
-package tlsutil
+package tls
 
 import (
 	"crypto/ecdsa"

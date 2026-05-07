@@ -1,4 +1,4 @@
-package base
+package applog
 
 import (
 	"context"
