@@ -494,6 +494,48 @@ cache.Invalidate(projectID)
 
 ---
 
+## natsutil/ — NATS dial helper
+
+A one-line wrapper around the boilerplate every NATS-connecting binary
+spells out by hand: load optional mTLS material via `tlsutil.FromFiles`,
+attach `nats.Secure` when the TLS config is non-nil, then `nats.Connect`.
+
+```go
+import (
+    "github.com/abagile/tokyo3-base/natsutil"
+    "github.com/nats-io/nats.go"
+)
+
+func Dial(url, certFile, keyFile, caFile string, opts ...nats.Option) (*nats.Conn, error)
+```
+
+`certFile`/`keyFile`/`caFile` are forwarded to `tlsutil.FromFiles` — pass
+all three (or all empty) together; empty paths produce a plaintext
+connection (development only).
+
+The variadic `opts ...nats.Option` lets callers tune timeouts, drain
+behaviour, retry policy, reconnect handlers, etc. without bloating the
+signature. They're applied **after** the implicit `nats.Secure` so the
+caller's TLS opinion (if any) wins for everything other than the cert
+material itself.
+
+```go
+nc, err := natsutil.Dial(
+    os.Getenv("VAULT_NATS_URL"),
+    os.Getenv("VAULT_NATS_CERT"),
+    os.Getenv("VAULT_NATS_KEY"),
+    os.Getenv("VAULT_NATS_CA"),
+    nats.Timeout(1*time.Second),         // fail fast if the broker is unreachable
+    nats.DrainTimeout(500*time.Millisecond), // bound shutdown drain
+)
+```
+
+Pairs with `journal/jetstream` (which dials internally via the same
+shape) and with `WithAsyncNats` from `log.go` (which takes an
+externally-owned `*nats.Conn`).
+
+---
+
 ## tlsutil/ — TLS config and self-signed cert helpers
 
 Helpers for the boring parts of running a TLS server or client without
