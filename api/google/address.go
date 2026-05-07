@@ -82,7 +82,7 @@ func NewPlacesService(apiKey string, opts ...api.RestyClientOption) Addresser {
 func (s *PlacesService) GetResults(ctx context.Context, address string) ([]AddressResult, error) {
 	var res placesResponse
 	if err := s.client.SearchPlaces(ctx, &res,
-		api.RO.WithHeaders(map[string]string{"X-Goog-Api-Key": s.apiKey, "X-Goog-FieldMask": "*"}),
+		api.RO.WithHeaders(map[string]string{headerGoogApiKey: s.apiKey, headerGoogFieldMask: "*"}),
 		api.RO.WithBody(map[string]string{"textQuery": address}),
 	); err != nil {
 		return nil, err

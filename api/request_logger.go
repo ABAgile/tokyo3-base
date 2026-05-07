@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/go-resty/resty/v2"
@@ -33,22 +33,13 @@ func WithLogAttrs(ctx context.Context, attrs map[string]string) context.Context 
 	return context.WithValue(ctx, logAttrsKey, next)
 }
 
-func sortedKeys(attrs map[string]string) []string {
-	keys := make([]string, 0, len(attrs))
-	for k := range attrs {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
-}
-
 func logAttrsSuffix(attrs map[string]string) string {
 	if len(attrs) == 0 {
 		return ""
 	}
 	var sb strings.Builder
 	sb.WriteString(" |>>")
-	for _, k := range sortedKeys(attrs) {
+	for _, k := range slices.Sorted(maps.Keys(attrs)) {
 		fmt.Fprintf(&sb, " %s: [%s]", k, attrs[k])
 	}
 	return sb.String()
@@ -58,7 +49,7 @@ func logAttrsToSlog(attrs map[string]string) []slog.Attr {
 	if len(attrs) == 0 {
 		return nil
 	}
-	keys := sortedKeys(attrs)
+	keys := slices.Sorted(maps.Keys(attrs))
 	result := make([]slog.Attr, len(keys))
 	for i, k := range keys {
 		result[i] = slog.String(k, attrs[k])
@@ -84,7 +75,6 @@ func (co *ClientOption) WithRequestLogger(logger *slog.Logger) RestyClientOption
 		if logger == nil {
 			logger = slog.Default()
 		}
-		// setup send log
 		c.OnBeforeRequest(func(rc *resty.Client, r *resty.Request) error {
 			var bodyStr string
 			if r.Body != nil {
@@ -95,7 +85,7 @@ func (co *ClientOption) WithRequestLogger(logger *slog.Logger) RestyClientOption
 			fullUrl := r.URL
 			queryStr := r.QueryParam.Encode()
 			if queryStr != "" {
-				fullUrl += "&" + queryStr
+				fullUrl += "?" + queryStr
 			}
 			pathParamStr := ""
 			if len(r.PathParams) > 0 {
@@ -106,19 +96,18 @@ func (co *ClientOption) WithRequestLogger(logger *slog.Logger) RestyClientOption
 			logAttrs := append([]slog.Attr{
 				slog.String("method", r.Method),
 				slog.String("url", r.URL),
-				slog.String("queryParam", r.QueryParam.Encode()),
+				slog.String("queryParam", queryStr),
 				slog.String("pathParam", pathParamStr),
 				slog.Any("header", SanitizeHeaders(r.Header)),
 				slog.String("body", bodyStr),
 			}, logAttrsToSlog(attrs)...)
-			logger.LogAttrs(context.Background(), slog.LevelInfo,
+			logger.LogAttrs(r.Context(), slog.LevelInfo,
 				fmt.Sprintf("OUTGOING_REQUEST: %s %s%s", r.Method, fullUrl, logAttrsSuffix(attrs)),
 				logAttrs...,
 			)
 			return nil
 		})
 
-		// setup receive log
 		c.OnAfterResponse(func(rc *resty.Client, r *resty.Response) error {
 			attrs, _ := r.Request.Context().Value(logAttrsKey).(map[string]string)
 			logAttrs := append([]slog.Attr{
@@ -130,7 +119,7 @@ func (co *ClientOption) WithRequestLogger(logger *slog.Logger) RestyClientOption
 				slog.String("elapsed", r.Time().String()),
 				slog.Duration("elapsed_ms", r.Time()),
 			}, logAttrsToSlog(attrs)...)
-			logger.LogAttrs(context.Background(), slog.LevelInfo,
+			logger.LogAttrs(r.Request.Context(), slog.LevelInfo,
 				fmt.Sprintf("INCOMING_RESPONSE: %s %s %d%s", r.Request.Method, r.Request.URL, r.StatusCode(), logAttrsSuffix(attrs)),
 				logAttrs...,
 			)

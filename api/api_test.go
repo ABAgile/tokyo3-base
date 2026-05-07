@@ -349,4 +349,3 @@ func TestRequestOption_WithBasicAuth(t *testing.T) {
 	assert.Equal(t, "u", gotUser)
 	assert.Equal(t, "p", gotPass)
 }
-
