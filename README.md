@@ -619,17 +619,19 @@ PEM bytes and just want a `*x509.CertPool` for `RootCAs` / `ClientCAs`.
 
 ---
 
-## journal/ — Append-only durable event sink
+## journal/ — Append-only durable event journal
 
-A write-only, append-only, ordered, **fail-closed** publish primitive — the
-shape that fits audit trails, event-sourcing stores, financial ledgers,
-change-data-capture, and anywhere "this event happened, never lose it"
-matters.
+An append-only, ordered, **fail-closed** event journal with symmetric write
+and read faces — the shape that fits audit trails, event-sourcing stores,
+financial ledgers, change-data-capture, and anywhere "this event happened,
+never lose it" matters. Producers use `Sink`; viewers and consumers use
+`Source`. The two are independent — pick whichever face you need.
 
 ```go
 import (
     "github.com/abagile/tokyo3-base/journal"
     "github.com/abagile/tokyo3-base/journal/jetstream"
+    "github.com/abagile/tokyo3-base/journal/sse"
 )
 ```
 
@@ -647,7 +649,13 @@ event-sourced system.
 > backpressure-tolerant). Use `applog.AppLogger` with `WithAsyncNats` for
 > that. Mixing the two contracts under one interface erodes both.
 
-### Interface
+`Source.Subscribe` mirrors that contract on the read side: implementations
+deliver every published record exactly once per subscription, in publish
+order, until the caller cancels the context. Backfill semantics are
+explicit (replay the last N, or resume from a known sequence) rather than
+implicit, so reconnect behaviour is observable rather than magical.
+
+### Write face — `Sink`
 
 ```go
 type Sink interface {
@@ -655,14 +663,14 @@ type Sink interface {
     Close() error
 }
 
-type Noop struct{} // discards every payload; for tests / disabled-in-dev
+type NoopSink struct{} // discards every payload; for tests / disabled-in-dev
 ```
 
 The interface is byte-oriented; callers marshal their own payload format
 (JSON, protobuf, length-prefixed binary, …). Implementations live in
 sub-packages so each transport's SDK weight is opt-in.
 
-### Typed events with `EncodedSink[T]`
+#### Typed events with `EncodedSink[T]`
 
 ```go
 type EncodedSink[T any] struct { /* ... */ }
@@ -683,7 +691,7 @@ type AuditEntry struct {
     OccurredAt          time.Time
 }
 
-inner, _ := jetstream.New(jetstream.Config{URL: "...", Subject: "..."})
+inner, _ := jetstream.NewSink(jetstream.SinkConfig{URL: "...", Subject: "..."})
 sink := journal.NewJSONSink[AuditEntry](inner)
 
 // Per write:
@@ -702,15 +710,102 @@ Encode failures surface as the return of `Append` and the inner Sink is
 not called; inner publish failures surface verbatim — the fail-closed
 contract is preserved end-to-end.
 
-### `journal/jetstream` — NATS JetStream implementation
+### Read face — `Source`
 
 ```go
-cfg := jetstream.Config{
+type Msg struct {
+    Seq  uint64    // monotonic per-stream sequence assigned by the transport
+    Time time.Time // publish time stamped by the transport
+    Data []byte    // payload, byte-for-byte as Sink.Append delivered it
+}
+
+type Source interface {
+    // Subscribe yields a channel of Msgs in publish order, blending a
+    // backfill window of historical records with a live tail of new
+    // records, until ctx is cancelled.
+    //
+    //   replay > 0, startFromSeq == 0   → last `replay` records, then tail
+    //   replay == 0, startFromSeq == 0  → tail only, no backfill
+    //   startFromSeq > 0                → resume from that sequence (replay ignored)
+    Subscribe(ctx context.Context, replay int, startFromSeq uint64) (<-chan Msg, error)
+    Close() error
+}
+
+type NoopSource struct{} // yields nothing; closes channel on ctx cancel
+```
+
+Two backfill knobs cover the three patterns a UI / consumer typically
+needs: "show me the last 100 events and keep going" (replay > 0,
+startFromSeq = 0); "tail forward from now" (both zero); and "resume after a
+disconnect from the last sequence I saw" (startFromSeq > 0). The third is
+exactly the `Last-Event-ID` reconnect path that `journal/sse` plumbs
+through — `Msg.Seq` is the sequence the consumer remembers, and the next
+Subscribe with `startFromSeq = lastSeen + 1` continues without duplicates.
+
+`Source` is independent of `Sink`. A process that only consumes (a SCIM
+projector, an SSE viewer, a CLI tail) holds a `Source`; a process that
+only publishes holds a `Sink`; both can co-exist and own their own NATS
+connection. Implementations clean up the underlying transport-level
+consumer when ctx is cancelled, so per-request Subscribe is cheap.
+
+#### Typed reads with `EncodedSource[T]`
+
+```go
+type Event[T any] struct {
+    Seq   uint64
+    Time  time.Time
+    Value T          // decoded payload
+}
+
+type EncodedSource[T any] struct { /* ... */ }
+
+func NewEncodedSource[T any](inner Source, decode func([]byte) (T, error)) *EncodedSource[T]
+func NewJSONSource   [T any](inner Source) *EncodedSource[T]   // convenience: decode = json.Unmarshal
+```
+
+Symmetric to `EncodedSink[T]`: takes a byte-level `Source` and yields a
+channel of `Event[T]` with the decoded value alongside the transport's
+sequence and timestamp. The same typed event struct flows on both sides:
+
+```go
+src, _ := jetstream.NewSource(jetstream.SourceConfig{ /* ... */ })
+typed := journal.NewJSONSource[AuditEntry](src)
+
+events, err := typed.Subscribe(ctx, 100, 0) // last 100 + tail
+if err != nil { /* ... */ }
+for ev := range events {
+    fmt.Printf("seq=%d t=%s entry=%+v\n", ev.Seq, ev.Time, ev.Value)
+}
+```
+
+For non-JSON formats, supply your own decoder (mirror of `NewEncodedSink`):
+
+```go
+typed := journal.NewEncodedSource(src, func(b []byte) (AuditEntry, error) {
+    var p eventpb.AuditEntry
+    if err := proto.Unmarshal(b, &p); err != nil { return AuditEntry{}, err }
+    return fromProto(&p), nil
+})
+```
+
+**Decode failures are silently dropped.** A malformed record means "this
+consumer can't read this payload" — the producer or the type T is the
+thing to fix; retrying won't help, and aborting the stream punishes good
+records that follow. If you need stricter behaviour (e.g. for compliance
+evidence that no record was ever skipped), wrap a raw `Source` and apply
+your own decode + error policy — `EncodedSource` is the ergonomic default,
+not the universal one.
+
+### `journal/jetstream` — NATS JetStream implementation
+
+Sink (write face):
+
+```go
+sink, err := jetstream.NewSink(jetstream.SinkConfig{
     URL:     "tls://nats:4222",
     Subject: "vault.audit.events",     // must be covered by an existing JetStream stream
     TLS:     tlsCfg,                   // optional; nil for plaintext (dev only)
-}
-sink, err := jetstream.New(cfg)
+})
 if err != nil { /* ... */ }
 defer sink.Close()
 
@@ -728,4 +823,89 @@ PUBLISH on the configured subject — no stream-management rights, since the
 package does not provision streams. Provision streams out-of-band (a
 sidecar container running `nats stream add`, an operator-managed stream, or
 a one-shot init job).
+
+Source (read face — for live tail / SSE):
+
+```go
+src, err := jetstream.NewSource(jetstream.SourceConfig{
+    URL:               "tls://nats:4222",
+    StreamName:        "vault_audit",          // the stream that covers Subject
+    Subject:           "vault.audit.events",
+    TLS:               tlsCfg,
+    InactiveThreshold: 5 * time.Minute,        // optional; default 5m
+})
+if err != nil { /* ... */ }
+defer src.Close()
+
+// Per subscriber: replay the last 100 records, then tail forever (until ctx done).
+msgs, err := src.Subscribe(ctx, 100, 0)
+for m := range msgs {
+    fmt.Printf("seq=%d t=%s data=%s\n", m.Seq, m.Time, m.Data)
+}
+```
+
+`Subscribe` creates an **ephemeral, ack-none** JetStream consumer per call,
+chooses a delivery policy from the requested backfill window, and tails
+the stream until the caller cancels:
+
+| Inputs                         | JetStream `DeliverPolicy` | `OptStartSeq`        |
+|--------------------------------|---------------------------|----------------------|
+| `startFromSeq > 0`             | `ByStartSequence`         | `startFromSeq`       |
+| `replay <= 0` or empty stream  | `New`                     | —                    |
+| `replay >= stream length`      | `All`                     | —                    |
+| otherwise                      | `ByStartSequence`         | `LastSeq − replay+1` |
+
+Ephemeral + ack-none means the consumer carries no state — JetStream
+deletes it after `InactiveThreshold` of silence (default 5 minutes), which
+covers a browser reconnect window without leaking abandoned consumers.
+The reader's NATS credential needs CONSUME rights on the subject; no
+stream-management rights, again because this package does not provision
+streams.
+
+### `journal/sse` — generic Server-Sent-Events handler
+
+```go
+type Handler struct {
+    Source    journal.Source
+    Replay    int           // default 100
+    Heartbeat time.Duration // default 30s; 0 disables
+}
+
+func (Handler) ServeHTTP(w http.ResponseWriter, r *http.Request)
+```
+
+Streams any `journal.Source` to a browser as Server-Sent Events with one
+HTTP handler. Each `Msg` becomes one SSE event:
+
+```
+id: 1234
+data: {"id":"e-1","action":"secret.set",…}
+
+```
+
+The `id:` line is the journal sequence; on reconnect the browser's
+`EventSource` automatically sends `Last-Event-ID: 1234`, and the handler
+resumes via `Source.Subscribe(ctx, _, 1235)` so a transient drop replays
+only the missed events — not the full backfill window. Comment-line
+heartbeats (`: ping`) fire every `Heartbeat` to keep proxy connections
+warm.
+
+Handler doesn't speak authentication — wrap with whatever middleware the
+host app already uses (cookie session, bearer token, mTLS):
+
+```go
+src, _ := jetstream.NewSource(jetstream.SourceConfig{ /* ... */ })
+defer src.Close()
+
+mux.Handle("GET /admin/audit/sse",
+    s.adminAuth(sse.Handler{
+        Source:    src,
+        Replay:    100,
+        Heartbeat: 30 * time.Second,
+    }))
+```
+
+The Data is forwarded byte-for-byte from `Msg.Data`, so producers using
+`journal.NewJSONSink[T]` already publish wire-ready JSON — no transcoding
+on the read side. Browsers parse the `data:` payload as their own JSON.
 

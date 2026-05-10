@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 // captureSink stores every Append payload for inspection.
@@ -95,8 +96,191 @@ func TestEncodedSink_InnerError(t *testing.T) {
 
 // TestEncodedSink_Close: Close is forwarded to the inner Sink.
 func TestEncodedSink_Close(t *testing.T) {
-	s := NewJSONSink[sample](Noop{})
+	s := NewJSONSink[sample](NoopSink{})
 	if err := s.Close(); err != nil {
 		t.Errorf("Close: %v", err)
+	}
+}
+
+// staticSource yields the configured msgs in order then closes the channel
+// (no live tail). Mirrors captureSink on the read side.
+type staticSource struct {
+	msgs []Msg
+	// recorded args for assertions
+	gotReplay   int
+	gotStartSeq uint64
+	closeCalled bool
+}
+
+func (s *staticSource) Subscribe(ctx context.Context, replay int, startFromSeq uint64) (<-chan Msg, error) {
+	s.gotReplay = replay
+	s.gotStartSeq = startFromSeq
+	out := make(chan Msg)
+	go func() {
+		defer close(out)
+		for _, m := range s.msgs {
+			select {
+			case <-ctx.Done():
+				return
+			case out <- m:
+			}
+		}
+	}()
+	return out, nil
+}
+func (s *staticSource) Close() error { s.closeCalled = true; return nil }
+
+// errSource fails every Subscribe. Lets us prove the inner Source's error
+// propagates through EncodedSource — symmetric to errSink above.
+type errSource struct{}
+
+func (errSource) Subscribe(context.Context, int, uint64) (<-chan Msg, error) {
+	return nil, errors.New("inner subscribe failed")
+}
+func (errSource) Close() error { return nil }
+
+// TestJSONSource_RoundTrip: inner Msg.Data containing JSON of T comes back
+// as Event[T] with Seq, Time, and decoded Value preserved. Symmetric to
+// TestJSONSink_RoundTrip.
+func TestJSONSource_RoundTrip(t *testing.T) {
+	in := sample{ID: "e-1", Name: "alice"}
+	payload, _ := json.Marshal(in)
+	when := time.Unix(1700000000, 0).UTC()
+
+	src := &staticSource{msgs: []Msg{{Seq: 7, Time: when, Data: payload}}}
+	s := NewJSONSource[sample](src)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	events, err := s.Subscribe(ctx, 100, 0)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	got, ok := <-events
+	if !ok {
+		t.Fatal("channel closed before delivering event")
+	}
+	if got.Seq != 7 {
+		t.Errorf("Seq = %d, want 7", got.Seq)
+	}
+	if !got.Time.Equal(when) {
+		t.Errorf("Time = %s, want %s", got.Time, when)
+	}
+	if got.Value != in {
+		t.Errorf("Value = %+v, want %+v", got.Value, in)
+	}
+
+	// Subscribe args are forwarded verbatim to the inner Source.
+	if src.gotReplay != 100 || src.gotStartSeq != 0 {
+		t.Errorf("inner got replay=%d startSeq=%d, want 100, 0", src.gotReplay, src.gotStartSeq)
+	}
+}
+
+// TestEncodedSource_CustomDecoder: callers can pick any wire format.
+// Mirror of TestEncodedSink_CustomEncoder.
+func TestEncodedSource_CustomDecoder(t *testing.T) {
+	src := &staticSource{msgs: []Msg{{Seq: 1, Data: []byte("bob")}}}
+	// Toy "decoder": treat the raw bytes as the Name field.
+	decode := func(b []byte) (sample, error) { return sample{Name: string(b)}, nil }
+	s := NewEncodedSource(Source(src), decode)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	events, err := s.Subscribe(ctx, 0, 0)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	e := <-events
+	if e.Value.Name != "bob" {
+		t.Errorf("got %+v, want Name=bob", e.Value)
+	}
+}
+
+// TestEncodedSource_DecodeError: decode failures are silently dropped per
+// the contract — a malformed record means "this consumer can't read it",
+// not "abort the stream". Other records in the same subscription still
+// flow through. Symmetric to (but inverted from) TestEncodedSink_EncodeError.
+func TestEncodedSource_DecodeError(t *testing.T) {
+	good, _ := json.Marshal(sample{Name: "alice"})
+	src := &staticSource{msgs: []Msg{
+		{Seq: 1, Data: []byte("not json")}, // dropped
+		{Seq: 2, Data: good},               // forwarded
+	}}
+	s := NewJSONSource[sample](src)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	events, err := s.Subscribe(ctx, 0, 0)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	var got []Event[sample]
+	for e := range events {
+		got = append(got, e)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d events, want 1 (the malformed one should be dropped)", len(got))
+	}
+	if got[0].Seq != 2 || got[0].Value.Name != "alice" {
+		t.Errorf("got %+v, want Seq=2 Name=alice", got[0])
+	}
+}
+
+// TestEncodedSource_InnerError: inner.Subscribe failures surface verbatim.
+// Symmetric to TestEncodedSink_InnerError.
+func TestEncodedSource_InnerError(t *testing.T) {
+	s := NewJSONSource[sample](errSource{})
+	if _, err := s.Subscribe(t.Context(), 100, 0); err == nil {
+		t.Error("expected inner error, got nil")
+	}
+}
+
+// TestEncodedSource_Close: Close is forwarded to the inner Source.
+func TestEncodedSource_Close(t *testing.T) {
+	src := &staticSource{}
+	s := NewJSONSource[sample](src)
+	if err := s.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+	if !src.closeCalled {
+		t.Error("Close was not forwarded to inner Source")
+	}
+}
+
+// TestEncodedSource_CtxCancelStopsDecoder: cancelling ctx mid-stream stops
+// the decoder goroutine cleanly, even with messages still buffered upstream.
+// The output channel must close shortly after; otherwise the decoder is
+// leaking a goroutine.
+func TestEncodedSource_CtxCancelStopsDecoder(t *testing.T) {
+	good, _ := json.Marshal(sample{Name: "x"})
+	// Many messages so the decoder is mid-stream when we cancel.
+	msgs := make([]Msg, 100)
+	for i := range msgs {
+		msgs[i] = Msg{Seq: uint64(i + 1), Data: good}
+	}
+	src := &staticSource{msgs: msgs}
+	s := NewJSONSource[sample](src)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	events, err := s.Subscribe(ctx, 100, 0)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	// Read one to ensure the pipeline is live, then cancel and drain.
+	if _, ok := <-events; !ok {
+		t.Fatal("channel closed before any message")
+	}
+	cancel()
+	deadline := time.After(time.Second)
+	for {
+		select {
+		case _, ok := <-events:
+			if !ok {
+				return // expected: channel closed
+			}
+		case <-deadline:
+			t.Fatal("output channel did not close within 1s of ctx cancel")
+		}
 	}
 }
