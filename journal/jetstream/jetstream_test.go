@@ -41,6 +41,21 @@ func TestNewSink_NoErrOnUnreachable(t *testing.T) {
 
 // ── Source (read face) ───────────────────────────────────────────────────────
 
+// TestNewSource_NoErrOnUnreachable proves the lazy-connect contract
+// symmetrically with the Sink: construction must not error when the
+// broker is unreachable. Stream lookup is deferred to first Subscribe.
+func TestNewSource_NoErrOnUnreachable(t *testing.T) {
+	src, err := NewSource(SourceConfig{
+		URL:        "nats://127.0.0.1:1",
+		StreamName: "any",
+		Subject:    "events",
+	})
+	if err != nil {
+		t.Fatalf("NewSource on unreachable URL: %v, want nil", err)
+	}
+	t.Cleanup(func() { _ = src.Close() })
+}
+
 // TestNewSource_MissingFields covers the SourceConfig fast-fail checks
 // symmetrically with the SinkConfig tests above.
 func TestNewSource_MissingFields(t *testing.T) {

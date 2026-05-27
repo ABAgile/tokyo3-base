@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/abagile/tokyo3-base/journal"
@@ -169,22 +170,43 @@ type SourceConfig struct {
 	// browser SSE reconnect with Last-Event-ID, short enough that abandoned
 	// consumers don't accumulate. Set explicitly to override.
 	InactiveThreshold time.Duration
+	// Log, when set, receives structured connection-lifecycle events
+	// (disconnect, reconnect, closed). Symmetric with SinkConfig.Log.
+	Log *slog.Logger
+	// ReconnectWait is the delay between reconnect attempts. 0 ⇒
+	// [DefaultReconnectWait].
+	ReconnectWait time.Duration
 }
 
 // Source reads from NATS JetStream as a journal.Source. One Source per
 // stream-subject pair; concurrent Subscribe calls each create their own
 // ephemeral consumer on the shared NATS connection.
+//
+// Stream lookup is deferred to the first [Source.Subscribe] call so
+// constructing a Source does not block on broker reachability. A
+// missing stream surfaces as a Subscribe error, not as a fatal
+// startup error — the caller decides whether to retry.
 type Source struct {
 	nc                *nats.Conn
 	js                jetstream.JetStream
-	stream            jetstream.Stream
+	streamName        string
 	subject           string
 	inactiveThreshold time.Duration
+
+	streamMu sync.Mutex
+	stream   jetstream.Stream
 }
 
-// NewSource dials NATS, looks up the stream, and returns a ready Source.
-// Returns an error if the connection cannot be established, the stream does
-// not exist, or required configuration is missing.
+// NewSource returns a ready Source. NATS dial failures do NOT cause
+// an error here — the underlying client retries the connection in
+// the background ([DefaultReconnectWait] between attempts, unbounded)
+// so the caller's bootstrap is not gated on broker reachability. The
+// JetStream stream lookup is deferred to the first
+// [Source.Subscribe] call; "stream not found" therefore surfaces
+// there rather than at construction.
+//
+// Configuration shape errors (empty URL/StreamName/Subject) still
+// return synchronously.
 func NewSource(cfg SourceConfig) (*Source, error) {
 	if cfg.URL == "" {
 		return nil, fmt.Errorf("url required")
@@ -199,10 +221,7 @@ func NewSource(cfg SourceConfig) (*Source, error) {
 	if inactive <= 0 {
 		inactive = 5 * time.Minute
 	}
-	var opts []nats.Option
-	if cfg.TLS != nil {
-		opts = append(opts, nats.Secure(cfg.TLS))
-	}
+	opts := connectOptions(cfg.TLS, cfg.Log, cfg.ReconnectWait, "jetstream-source")
 	nc, err := nats.Connect(cfg.URL, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("nats connect: %w", err)
@@ -212,18 +231,32 @@ func NewSource(cfg SourceConfig) (*Source, error) {
 		nc.Close()
 		return nil, fmt.Errorf("jetstream client: %w", err)
 	}
-	stream, err := js.Stream(context.Background(), cfg.StreamName)
-	if err != nil {
-		nc.Close()
-		return nil, fmt.Errorf("jetstream stream %q: %w", cfg.StreamName, err)
-	}
 	return &Source{
 		nc:                nc,
 		js:                js,
-		stream:            stream,
+		streamName:        cfg.StreamName,
 		subject:           cfg.Subject,
 		inactiveThreshold: inactive,
 	}, nil
+}
+
+// ensureStream resolves the configured JetStream stream the first time
+// it's called (memoised under streamMu). Subsequent calls return the
+// cached handle. Failures are not memoised — a transient broker
+// outage on the first Subscribe self-heals when Subscribe is called
+// again after the connection recovers.
+func (s *Source) ensureStream(ctx context.Context) (jetstream.Stream, error) {
+	s.streamMu.Lock()
+	defer s.streamMu.Unlock()
+	if s.stream != nil {
+		return s.stream, nil
+	}
+	stream, err := s.js.Stream(ctx, s.streamName)
+	if err != nil {
+		return nil, fmt.Errorf("jetstream stream %q: %w", s.streamName, err)
+	}
+	s.stream = stream
+	return stream, nil
 }
 
 // Subscribe creates an ephemeral, ack-none consumer with a delivery policy
@@ -238,12 +271,16 @@ func NewSource(cfg SourceConfig) (*Source, error) {
 // cancelled. The channel closes when the inner iterator stops (server
 // disconnect, ctx cancel, or InactiveThreshold expiry on the server side).
 func (s *Source) Subscribe(ctx context.Context, replay int, startFromSeq uint64) (<-chan journal.Msg, error) {
-	info, err := s.stream.Info(ctx)
+	stream, err := s.ensureStream(ctx)
+	if err != nil {
+		return nil, err
+	}
+	info, err := stream.Info(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("stream info: %w", err)
 	}
 	policy, optStart := pickDeliverPolicy(replay, startFromSeq, info.State.LastSeq)
-	cons, err := s.stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+	cons, err := stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
 		FilterSubject:     s.subject,
 		AckPolicy:         jetstream.AckNonePolicy,
 		DeliverPolicy:     policy,
