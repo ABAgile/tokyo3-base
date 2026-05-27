@@ -12,6 +12,12 @@ import (
 	"time"
 )
 
+// deviceSleeper is the channel-based sleep used between device-flow
+// poll attempts. Production defaults to time.After; tests swap it via
+// the helper in export_test.go so the RFC 8628 polling loop runs in
+// microseconds instead of the wire-mandated 1+s/cycle.
+var deviceSleeper = func(d time.Duration) <-chan time.Time { return time.After(d) }
+
 // RunDeviceFlow performs the RFC 8628 device authorization grant.
 // Prints the verification URL + user code to stderr (or io.Discard if
 // stderr is nil), then polls /token at the server-supplied interval
@@ -85,7 +91,7 @@ func RunDeviceFlow(ctx context.Context, issuer, clientID string, stderr io.Write
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(interval):
+		case <-deviceSleeper(interval):
 		}
 		pollForm := url.Values{}
 		pollForm.Set("grant_type", "urn:ietf:params:oauth:grant-type:device_code")

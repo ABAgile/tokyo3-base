@@ -86,6 +86,7 @@ func writeTokenError(w http.ResponseWriter, code, desc string) {
 // success. Exercises the canonical "user approves on phone, CLI keeps
 // polling" sequence and confirms the final Tokens are populated.
 func TestRunDeviceFlow_HappyPath(t *testing.T) {
+	oidcclient.UseInstantDeviceSleeper(t)
 	f := newDeviceFixture(t)
 	f.tokenHandle = func(n int32, w http.ResponseWriter) {
 		if n == 1 {
@@ -116,6 +117,7 @@ func TestRunDeviceFlow_HappyPath(t *testing.T) {
 // the first poll. The CLI must stop polling immediately and surface
 // a clear error rather than waiting for timeout.
 func TestRunDeviceFlow_AccessDenied(t *testing.T) {
+	oidcclient.UseInstantDeviceSleeper(t)
 	f := newDeviceFixture(t)
 	f.tokenHandle = func(_ int32, w http.ResponseWriter) {
 		writeTokenError(w, "access_denied", "user denied")
@@ -136,6 +138,7 @@ func TestRunDeviceFlow_AccessDenied(t *testing.T) {
 // CLI must surface an error mentioning expiry so the user knows to
 // restart rather than retry.
 func TestRunDeviceFlow_ExpiredToken(t *testing.T) {
+	oidcclient.UseInstantDeviceSleeper(t)
 	f := newDeviceFixture(t)
 	f.tokenHandle = func(_ int32, w http.ResponseWriter) {
 		writeTokenError(w, "expired_token", "device code expired")
@@ -156,6 +159,7 @@ func TestRunDeviceFlow_ExpiredToken(t *testing.T) {
 // first poll, then success. The package should honour the backoff
 // (interval bumped) without aborting.
 func TestRunDeviceFlow_SlowDownBackoff(t *testing.T) {
+	oidcclient.UseInstantDeviceSleeper(t)
 	f := newDeviceFixture(t)
 	f.tokenHandle = func(n int32, w http.ResponseWriter) {
 		if n == 1 {
@@ -182,6 +186,7 @@ func TestRunDeviceFlow_SlowDownBackoff(t *testing.T) {
 // terminal — polling forever on an unrecognised code would be worse
 // than failing cleanly.
 func TestRunDeviceFlow_UnknownErrorAborts(t *testing.T) {
+	oidcclient.UseInstantDeviceSleeper(t)
 	f := newDeviceFixture(t)
 	f.tokenHandle = func(_ int32, w http.ResponseWriter) {
 		writeTokenError(w, "server_error", "something bad")
@@ -203,6 +208,7 @@ func TestRunDeviceFlow_UnknownErrorAborts(t *testing.T) {
 // promptly rather than waiting out the expires_in deadline. Critical
 // for CLIs that want clean SIGINT handling.
 func TestRunDeviceFlow_CtxCancelAborts(t *testing.T) {
+	oidcclient.UseInstantDeviceSleeper(t)
 	f := newDeviceFixture(t)
 	f.expiresIn = 60
 	f.tokenHandle = func(_ int32, w http.ResponseWriter) {
@@ -257,6 +263,7 @@ func TestRunDeviceFlow_AuthzEndpointError(t *testing.T) {
 // must be on disk with the expected values, so a subsequent process
 // can LoadConfig / LoadTokens without re-running the flow.
 func TestLogin_DevicePersistsConfigAndTokens(t *testing.T) {
+	oidcclient.UseInstantDeviceSleeper(t)
 	tmp := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", tmp)
 	t.Setenv("HOME", tmp)
