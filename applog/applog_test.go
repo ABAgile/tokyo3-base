@@ -82,12 +82,12 @@ func TestAttrsHandler(t *testing.T) {
 
 func TestAppLogger(t *testing.T) {
 	t.Run("DefaultLevelIsInfo", func(t *testing.T) {
-		_, lv := AppLogger("myapp")
+		_, lv := AppLogger(Config{App: "myapp"})
 		assert.Equal(t, slog.LevelInfo, lv.Level())
 	})
 
 	t.Run("LevelVarGatesEnabled", func(t *testing.T) {
-		logger, lv := AppLogger("myapp")
+		logger, lv := AppLogger(Config{App: "myapp"})
 		lv.Set(slog.LevelWarn)
 		assert.False(t, logger.Enabled(context.Background(), slog.LevelInfo))
 		assert.True(t, logger.Enabled(context.Background(), slog.LevelWarn))
@@ -95,7 +95,7 @@ func TestAppLogger(t *testing.T) {
 	})
 
 	t.Run("LevelVarIsAdjustable", func(t *testing.T) {
-		logger, lv := AppLogger("myapp")
+		logger, lv := AppLogger(Config{App: "myapp"})
 		assert.False(t, logger.Enabled(context.Background(), slog.LevelDebug))
 		lv.Set(slog.LevelDebug)
 		assert.True(t, logger.Enabled(context.Background(), slog.LevelDebug))

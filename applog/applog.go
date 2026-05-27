@@ -13,20 +13,42 @@ import (
 	"github.com/phuslu/log"
 )
 
-// AppLogger constructs a structured JSON logger for the named application.
+// Config carries the structural identity of an [AppLogger]:
 //
-// With no [WriterOption]s, output goes to stdout. Compose writers explicitly:
+//   - App is the binary's short name (e.g., "certd", "ssh-tunneld").
+//     Required. Surfaces as the "app" slog attribute on every log
+//     line and as the NATS subject prefix when [WithAsyncNats] is
+//     in the writer set.
+//   - Instance distinguishes log streams from daemons deployed on
+//     every workload host (cert-agentd, ssh-tunneld). When non-empty:
+//     surfaces as an "instance" slog attribute, and writers that
+//     care about per-host addressing (e.g., [WithAsyncNats] →
+//     subject "app_log.<App>.<Instance>") pick it up too. Empty
+//     preserves the legacy singleton shape for cluster-wide daemons
+//     (certd, authd, ssh-proxyd).
+type Config struct {
+	App      string
+	Instance string
+}
+
+// AppLogger constructs a structured JSON logger for the named
+// application. With no [WriterOption]s, output goes to stdout.
+// Compose writers explicitly:
 //
-//	AppLogger("svc", WithStdout())                    // stdout only
-//	AppLogger("svc", WithAsyncNats(nc))               // async NATS only
-//	AppLogger("svc", WithStdout(), WithAsyncNats(nc)) // both
+//	AppLogger(Config{App: "svc"}, WithStdout())              // stdout only
+//	AppLogger(Config{App: "svc"}, WithAsyncNats(nc))         // async NATS only
+//	AppLogger(Config{App: "svc"},                            // both
+//	    WithStdout(), WithAsyncNats(nc))
+//	AppLogger(Config{App: "ssh-tunneld",                     // per-host: NATS
+//	    Instance: "host-42"}, WithAsyncNats(nc))             // subject suffixed
 //
-// The returned [*slog.LevelVar] controls the effective log level at runtime
-// (default: Info). Adjust it with lv.Set(slog.LevelDebug) without restarting.
-func AppLogger(app string, writerOpts ...WriterOption) (*slog.Logger, *slog.LevelVar) {
+// The returned [*slog.LevelVar] controls the effective log level at
+// runtime (default: Info). Adjust it with lv.Set(slog.LevelDebug)
+// without restarting.
+func AppLogger(cfg Config, writerOpts ...WriterOption) (*slog.Logger, *slog.LevelVar) {
 	var writers []log.Writer
 	for _, opt := range writerOpts {
-		opt(app, &writers)
+		opt(cfg, &writers)
 	}
 
 	var writer log.Writer
@@ -42,7 +64,11 @@ func AppLogger(app string, writerOpts ...WriterOption) (*slog.Logger, *slog.Leve
 
 	phuslu := &log.Logger{Level: log.TraceLevel, Writer: writer}
 	lv := new(slog.LevelVar)
-	return slog.New(&levelHandler{level: lv, inner: phuslu.Slog().Handler()}).With("app", app), lv
+	out := slog.New(&levelHandler{level: lv, inner: phuslu.Slog().Handler()}).With("app", cfg.App)
+	if cfg.Instance != "" {
+		out = out.With("instance", cfg.Instance)
+	}
+	return out, lv
 }
 
 type levelHandler struct {
@@ -66,25 +92,34 @@ func (h *levelHandler) WithGroup(name string) slog.Handler {
 	return &levelHandler{h.level, h.inner.WithGroup(name)}
 }
 
-// WriterOption configures a log destination for [AppLogger].
-// Use [WithStdout] and [WithAsyncNats] to compose the desired combination.
-type WriterOption func(app string, ws *[]log.Writer)
+// WriterOption configures a log destination for [AppLogger]. The
+// closure receives the [Config] so writers can derive
+// identity-dependent details (e.g., [WithAsyncNats] derives the
+// subject from Config.App + Config.Instance).
+type WriterOption func(cfg Config, ws *[]log.Writer)
 
 // WithStdout adds a synchronous stdout writer.
 func WithStdout() WriterOption {
-	return func(_ string, ws *[]log.Writer) {
+	return func(_ Config, ws *[]log.Writer) {
 		*ws = append(*ws, &log.IOWriter{Writer: os.Stdout})
 	}
 }
 
-// WithAsyncNats adds an async NATS writer that publishes to "app_log.<app>".
+// WithAsyncNats adds an async NATS writer that publishes to
+// "app_log.<App>" when Config.Instance is empty, or
+// "app_log.<App>.<Instance>" when set — so per-host daemons can be
+// tailed with NATS subject wildcards like 'app_log.ssh-tunneld.>'.
 // Entries are discarded when the 200-entry channel is full.
 func WithAsyncNats(nc *nats.Conn) WriterOption {
-	return func(app string, ws *[]log.Writer) {
+	return func(cfg Config, ws *[]log.Writer) {
+		subject := "app_log." + cfg.App
+		if cfg.Instance != "" {
+			subject += "." + cfg.Instance
+		}
 		*ws = append(*ws, &log.AsyncWriter{
 			ChannelSize:   200,
 			DiscardOnFull: true,
-			Writer:        &log.IOWriter{Writer: &NatsWriter{Nc: nc, Subject: "app_log." + app}},
+			Writer:        &log.IOWriter{Writer: &NatsWriter{Nc: nc, Subject: subject}},
 		})
 	}
 }

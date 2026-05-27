@@ -9,7 +9,7 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// Default timing knobs for [NATSConfig]. Picked to match the five
+// Default timing knobs for [NATSConfig]. Picked to match the
 // hand-rolled call-sites this package replaces, except for Timeout
 // which moves from 1 s → 5 s: 1 s is tight on multi-AZ deployments
 // where the initial DNS + TCP + TLS round-trip can legitimately
@@ -34,6 +34,10 @@ const (
 // Timeout / DrainTimeout / ReconnectWait override the defaults
 // declared as constants in this file. Leave any field zero to take
 // the default.
+//
+// Per-host daemons set the Instance on the outer [Config] (not
+// here); the NATS subject is derived from Config.App and
+// Config.Instance inside [WithAsyncNats].
 type NATSConfig struct {
 	URL      string // empty disables shipping
 	CertFile string
@@ -77,24 +81,31 @@ type NATSConfig struct {
 //
 //	URL empty   →  INFO "operational log shipping skipped"   reason=no URL configured
 //	dial failed →  WARN "operational log shipping skipped"   reason=dial failure  err=<...>
-//	dialed      →  INFO "operational log shipping configured" subject=app_log.<app>
+//	dialed      →  INFO "operational log shipping configured" subject=app_log.<app>[.<instance>]
+//
+// When loggerCfg.Instance is non-empty the subject suffix and an
+// "instance" log attribute are added — see [Config].
 //
 // The returned [*slog.LevelVar] controls runtime log-level changes
 // (same as [AppLogger]). The drain callback flushes the async
 // writer and closes the NATS connection; defer it from the caller's
 // run loop so SIGTERM doesn't lose buffered entries. drain is
 // always safe to call (no-op when shipping is disabled).
-func AppLoggerWithNATS(app string, cfg NATSConfig, writers ...WriterOption) (*slog.Logger, *slog.LevelVar, func()) {
-	nc, dialErr := dialLogNATS(cfg)
+func AppLoggerWithNATS(loggerCfg Config, natsCfg NATSConfig, writers ...WriterOption) (*slog.Logger, *slog.LevelVar, func()) {
+	nc, dialErr := dialLogNATS(natsCfg)
 	drain := func() {}
 	allWriters := writers
 	if nc != nil {
 		drain = func() { _ = nc.Drain() }
 		allWriters = append(append([]WriterOption(nil), writers...), WithAsyncNats(nc))
 	}
-	log, lv := AppLogger(app, allWriters...)
+	log, lv := AppLogger(loggerCfg, allWriters...)
+	subject := "app_log." + loggerCfg.App
+	if loggerCfg.Instance != "" {
+		subject += "." + loggerCfg.Instance
+	}
 	switch {
-	case cfg.URL == "":
+	case natsCfg.URL == "":
 		log.Info("operational log shipping skipped", "reason", "no URL configured")
 	case dialErr != nil:
 		log.Warn("operational log shipping skipped", "reason", "dial failure", "err", dialErr)
@@ -103,13 +114,13 @@ func AppLoggerWithNATS(app string, cfg NATSConfig, writers ...WriterOption) (*sl
 		// means the connection may still be establishing in the
 		// background; entries get dropped (AsyncWriter is
 		// discard-on-full) until it does.
-		log.Info("operational log shipping configured", "subject", "app_log."+app)
+		log.Info("operational log shipping configured", "subject", subject)
 	}
 	return log, lv, drain
 }
 
 // dialLogNATS wraps [bnats.Dial] with the timing options that the
-// five existing binaries (certd, cert-agentd, authd, ssh-proxyd,
+// existing binaries (certd, cert-agentd, authd, ssh-proxyd,
 // ssh-tunneld) converged on. Returns (nil, nil) when the URL is
 // empty so callers can use the helper unconditionally and skip
 // wiring NATS only when configured.
