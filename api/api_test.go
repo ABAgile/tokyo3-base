@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,17 +30,48 @@ func TestApiError(t *testing.T) {
 	testCases := []struct {
 		name     string
 		code     int
+		body     []byte
 		expected string
 	}{
-		{"ok", 200, "api error: status 200"},
-		{"not found", 404, "api error: status 404"},
-		{"server error", 500, "api error: status 500"},
+		{"ok", 200, nil, "api error: status 200"},
+		{"not found no body", 404, nil, "api error: status 404"},
+		{"server error no body", 500, nil, "api error: status 500"},
+		{"with body surfaces server message", 400, []byte(`{"error":"bad request"}`), `api error: status 400: {"error":"bad request"}`},
+		{"empty body skipped", 500, []byte(""), "api error: status 500"},
+		{"whitespace body skipped", 500, []byte("   \n  "), "api error: status 500"},
+		{"long body truncated", 400, []byte(strings.Repeat("x", 600)), "api error: status 400: " + strings.Repeat("x", 512) + "..."},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.expected, (&ApiError{StatusCode: tc.code}).Error())
+			assert.Equal(t, tc.expected, (&ApiError{StatusCode: tc.code, Body: tc.body}).Error())
 		})
 	}
+}
+
+// TestRestyClient_R_PopulatesApiErrorBody verifies the body the
+// server returned is verbatim accessible on the ApiError. This is
+// the load-bearing contract for callers (cert-agentd, ssh-proxyd)
+// that surface server-side error JSON in their own error chains.
+func TestRestyClient_R_PopulatesApiErrorBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":"policy denied for groups [eng]"}`))
+	}))
+	defer srv.Close()
+
+	rc := NewRestClient(srv.URL)
+	var result struct{}
+	err := rc.R(context.Background(), http.MethodGet, "/", &result)
+	require.Error(t, err)
+
+	var apiErr *ApiError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, http.StatusForbidden, apiErr.StatusCode)
+	assert.Equal(t, `{"error":"policy denied for groups [eng]"}`, string(apiErr.Body))
+	// The error string itself must include the body so log lines are
+	// self-explanatory without a separate body inspection.
+	assert.Contains(t, err.Error(), `policy denied for groups [eng]`)
 }
 
 // ── RestyClient.R ─────────────────────────────────────────────────────────────

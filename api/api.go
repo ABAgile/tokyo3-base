@@ -2,8 +2,10 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-resty/resty/v2"
@@ -86,16 +88,36 @@ func (co *ClientOption) WithTransport(rt http.RoundTripper) RestyClientOption {
 	}
 }
 
+// ApiError is the typed error returned by [RestyClient.R] for non-2xx
+// responses. StatusCode is the HTTP status. Body is the raw response
+// body — captured verbatim so callers can surface server-side error
+// messages in their own error chains without doing a second
+// roundtrip. Body is truncated at 64 KiB to bound memory; servers
+// that need to communicate larger error payloads should use a
+// structured error contract instead.
 type ApiError struct {
 	StatusCode int
+	Body       []byte
 }
 
+// apiErrorBodyTruncate caps the Body inline in the Error() string so
+// a verbose server response doesn't blow out log lines. Full bytes
+// remain available via e.Body for callers that want them.
+const apiErrorBodyTruncate = 512
+
 func (e *ApiError) Error() string {
-	return fmt.Sprintf("api error: status %d", e.StatusCode)
+	body := strings.TrimSpace(string(e.Body))
+	if body == "" {
+		return fmt.Sprintf("api error: status %d", e.StatusCode)
+	}
+	if len(body) > apiErrorBodyTruncate {
+		body = body[:apiErrorBodyTruncate] + "..."
+	}
+	return fmt.Sprintf("api error: status %d: %s", e.StatusCode, body)
 }
 
 func (rc *RestyClient) R(ctx context.Context, method, path string, result any, opts ...RestyRequestOption) error {
-	req := rc.Client.R().SetContext(ctx).SetResult(result).SetError(result)
+	req := rc.Client.R().SetContext(ctx)
 	for _, opt := range opts {
 		opt(req)
 	}
@@ -104,7 +126,21 @@ func (rc *RestyClient) R(ctx context.Context, method, path string, result any, o
 		return fmt.Errorf("api call failed: %w", err)
 	}
 	if resp.IsError() {
-		return &ApiError{StatusCode: resp.StatusCode()}
+		return &ApiError{StatusCode: resp.StatusCode(), Body: resp.Body()}
+	}
+	// Decode the response body into result manually rather than via
+	// Resty's SetResult — that auto-decode hinges on the server
+	// sending Content-Type: application/json, which our internal
+	// test mocks frequently omit and our hand-rolled clients
+	// historically never required. Empty body + result is a no-op
+	// (matches "I don't care about the body" callers passing
+	// &struct{}{}); nil result also short-circuits.
+	body := resp.Body()
+	if len(body) == 0 || result == nil {
+		return nil
+	}
+	if err := json.Unmarshal(body, result); err != nil {
+		return fmt.Errorf("api call failed: decode response: %w", err)
 	}
 	return nil
 }
