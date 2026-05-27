@@ -619,6 +619,265 @@ PEM bytes and just want a `*x509.CertPool` for `RootCAs` / `ClientCAs`.
 
 ---
 
+## auth/ — auth primitives namespace
+
+Reusable auth-related building blocks. Each sub-package is a leaf
+library with minimal dependencies; pick the ones you need. The
+namespace is for grouping only — there's no `auth` package itself.
+
+| Sub-package | Purpose |
+| --- | --- |
+| `auth/oidcclient` | OIDC public-client helper (login, token cache, refresh) — used by SSO CLIs |
+| `auth/creds` | Password hashing (bcrypt) + opaque token generation/digest primitives |
+| `auth/awsclaims` | Constants + claim shape for AWS STS federation JWTs (`https://aws.amazon.com/tags`) |
+| `auth/jwt` | RS256 signer for OIDC ID tokens, AWS federation tokens, OIDC Back-Channel Logout tokens; JWK helpers |
+
+### auth/oidcclient — OIDC public-client helper for CLI tools
+
+Stdlib-only OIDC client used by SSO CLI helpers (credential helpers
+for AWS, SSH cert signers, any future tool that needs a user-bound
+bearer token). Owns the OAuth 2.0 authorization-code-with-PKCE flow,
+the RFC 8628 device authorization grant, refresh-token rotation, and
+an on-disk token cache that all helpers in the installation share.
+
+```go
+import "github.com/abagile/tokyo3-base/auth/oidcclient"
+```
+
+No third-party dependencies — `go install` of a downstream CLI pulls
+only stdlib, so helpers stay statically linkable and fast to
+distribute.
+
+### Cache layout
+
+A single `login` from any helper populates a shared root that every
+other helper reads from. Helper-specific outputs (anything the
+helper persists between calls) live in per-helper subdirectories
+under the same root:
+
+```
+~/.config/auth-sso/
+├── config.json              shared SSO state (issuer + client_id), 0o600
+├── tokens.json              shared OAuth access + refresh + id token, 0o600
+└── <helper>/                per-helper outputs (any files the helper persists)
+```
+
+`<helper>` is whatever `appName` the consuming binary passes to
+`AppCacheDir(name)`. Convention: strip the binary's `auth-` prefix,
+so a binary `auth-foo-creds` writes to `foo-creds/`,
+`auth-bar-tunnel` writes to `bar-tunnel/`, etc. The root directory
+name (`auth-sso`) is hardcoded so every helper agrees on one
+location without configuration.
+
+### Login — `Login`, `LoginOptions`
+
+```go
+func Login(ctx context.Context, cfg Config, opt LoginOptions) (*Tokens, error)
+
+type Config struct {
+    Issuer   string
+    ClientID string
+}
+
+type LoginOptions struct {
+    Port   int       // loopback redirect port for code flow; 0 picks free
+    Device bool      // RFC 8628 device authorization grant
+    Stderr io.Writer // user prompts; nil silences
+}
+```
+
+Runs the chosen OAuth flow, persists Config + Tokens, returns the
+fresh `Tokens`. Code flow is the default for desktops with a browser;
+the device flow (`opt.Device = true`) prints a verification URL +
+short code so the user can approve from any other device — required
+on headless hosts (CI runners, containers, jump boxes).
+
+```go
+tokens, err := oidcclient.Login(ctx,
+    oidcclient.Config{Issuer: "https://id.example.com", ClientID: "tokyo3-cli"},
+    oidcclient.LoginOptions{Stderr: os.Stderr},
+)
+```
+
+S256 PKCE is always used — no client secret needed. The loopback
+redirect URI is built from the listener's actual port; the auth
+server must implement RFC 8252 §7.3 loopback-aware matching so a
+single `http://127.0.0.1/callback` registration accepts any port.
+
+### Token cache — `LoadConfig`, `LoadTokens`, `EnsureFreshTokens`, `Refresh`
+
+```go
+func LoadConfig() (*Config, error)
+func LoadTokens() (*Tokens, error)
+func EnsureFreshTokens(ctx context.Context, cfg Config, accessSkew time.Duration) (*Tokens, error)
+func Refresh(ctx context.Context, issuer, clientID, refreshToken string) (*Tokens, error)
+```
+
+`EnsureFreshTokens` is what CLI `get`-style commands call on every
+invocation: returns cached tokens if the access token has more than
+`accessSkew` remaining, otherwise transparently refreshes via the
+refresh token, persists the rotated pair, and returns the new tokens.
+Refresh-token rotation is the assumed default (the new refresh token
+in the response replaces the old); if the issuer omits the new
+refresh in the response (rotation disabled at the AS), the previous
+value is retained.
+
+```go
+cfg, err := oidcclient.LoadConfig()      // run-login prompt if missing
+if err != nil { /* ... */ }
+tokens, err := oidcclient.EnsureFreshTokens(ctx, *cfg, 30*time.Second)
+// tokens.AccessToken is safe to use for ~accessSkew more time
+```
+
+`LoadTokens` returns a "no SSO cache at <path>; run login to
+authenticate" error when `tokens.json` doesn't exist — CLI helpers
+print this verbatim so the user knows what to do.
+
+### Helper-specific subdirs — `AppCacheDir`
+
+```go
+func CacheDir() (string, error)
+func AppCacheDir(appName string) (string, error)
+```
+
+`CacheDir` returns the shared root (`~/.config/auth-sso/`).
+`AppCacheDir(name)` returns `~/.config/auth-sso/<name>/`, creating it
+0o700 if missing. `name` must match `[A-Za-z0-9_-]+` — the strict
+whitelist rules out `.` and `..` so an operator-supplied helper name
+can't escape the cache root.
+
+```go
+dir, _ := oidcclient.AppCacheDir("foo-creds")
+// dir == ~/.config/auth-sso/foo-creds/
+```
+
+Convention is to name the subdir after the binary minus any `auth-`
+prefix — e.g. a binary `auth-foo-creds` calls
+`AppCacheDir("foo-creds")`.
+
+### Logout
+
+```go
+func Logout(extras ...string) error
+```
+
+Removes `tokens.json` (so the next call requires a fresh login) plus
+any extras the caller names. Extras may be absolute paths or paths
+relative to `CacheDir`; missing files are silently ignored. The
+shared `config.json` is intentionally preserved so the next `login`
+can reuse the cached issuer + client_id.
+
+```go
+// Wipe shared tokens plus this helper's whole subdir:
+oidcclient.Logout("foo-creds")
+```
+
+### Utility — `IDTokenClaims`, `SafeFilename`, `WriteFileAtomic`
+
+```go
+func IDTokenClaims(idToken string) IDTokenSubjectClaims
+func SafeFilename(s string) string
+func WriteFileAtomic(path string, data []byte, mode os.FileMode) error
+```
+
+`IDTokenClaims` parses the JWT payload (no signature check — the
+resource server re-verifies on receipt) so helpers can derive a
+human-readable identifier from `email` or `sub`. `SafeFilename`
+collapses path-meaningful characters to `_` so role slugs or
+principal names can safely be leaf filenames inside `CacheDir`.
+`WriteFileAtomic` is a tempfile-rename helper used internally for the
+config + tokens files; exported because helpers reuse it for their
+own secret-grade writes.
+
+### auth/creds — password hashing and opaque token primitives
+
+The per-credential primitives every auth-shaped tool needs: bcrypt
+for human passwords, a random-token generator + SHA-256 digest for
+opaque bearer credentials. Stdlib + `golang.org/x/crypto/bcrypt`
+only.
+
+```go
+import "github.com/abagile/tokyo3-base/auth/creds"
+
+hash, err := creds.HashPassword("correct-horse-battery-staple")
+ok       := creds.CheckPassword(hash, candidate)
+
+raw,  _ := creds.GenerateRawToken()   // 64-char hex, cryptographically random
+hash    := creds.HashToken(raw)       // SHA-256 digest, store this; emit raw to the user
+```
+
+Bcrypt cost is fixed at 12 (~250ms on modern hardware, matches the
+OWASP-recommended starting point). `GenerateRawToken` returns 32
+bytes of `crypto/rand` output as hex; `HashToken` is plain SHA-256 —
+pair them and store only the digest so a database leak doesn't
+expose the live token.
+
+### auth/awsclaims — AWS STS federation JWT claim shape
+
+Two-symbol package fixing the wire format AWS STS expects on
+`sts:AssumeRoleWithWebIdentity`. Stdlib-only, no third-party
+dependencies — separate from `auth/jwt` so lightweight token
+validators (CLI helpers, audit verifiers) can reuse it without
+pulling in the full signer + JWT library.
+
+```go
+import "github.com/abagile/tokyo3-base/auth/awsclaims"
+
+claims := map[string]any{
+    awsclaims.PrincipalTagsClaim: awsclaims.PrincipalTagsValue{
+        PrincipalTags: map[string][]string{
+            "sub":  {userID},
+            "team": {team},
+        },
+        TransitiveTagKeys: []string{"sub", "team"},
+    },
+}
+```
+
+The claim name (`https://aws.amazon.com/tags`) is fixed by AWS and
+must appear verbatim. `PrincipalTags` values are list-of-strings
+(AWS honours the first element today; the shape is forward-
+compatible). `TransitiveTagKeys` names tags that persist through
+subsequent `sts:AssumeRole` chains — federation sessions rarely
+chain, but marking them transitive keeps audit semantics consistent.
+
+### auth/jwt — RS256 signer + OIDC/federation/logout claim shapes
+
+Stateless RS256 signer for the three JWT shapes an OIDC IdP needs to
+mint: ID tokens (OIDC Core 1.0), AWS STS federation tokens, and
+back-channel logout tokens (OIDC Back-Channel Logout 1.0). Key
+management (load-or-generate from a keystore, JWKS publication) is
+intentionally **not** in this package — callers already know which
+storage layer they're using; the signer just takes the loaded
+`*rsa.PrivateKey` + KID + issuer at construction.
+
+```go
+import "github.com/abagile/tokyo3-base/auth/jwt"
+
+s := jwt.New(privateKey, "kid-abc123", "https://id.example.com", jwt.Config{
+    IDTokenTTL:         1 * time.Hour,        // optional; default 1h
+    FederationTokenTTL: 15 * time.Minute,     // optional; default 15m
+    ACRMFA:             "urn:mace:incommon:iap:silver",  // optional; default
+})
+
+idTok, _   := s.MintIDToken(userID, clientID, email, name, nonce, scopes, true, amr, authTime, sid, groups)
+fedTok, _  := s.MintFederationToken(userID, audience, email, name, groups, amr, authTime, 0, principalTags)
+logTok, _  := s.MintLogoutToken(rpAudience, sub, sid, jti, time.Now())
+```
+
+Defaults are the values an IdP-style operator typically wants;
+override via `Config` when a specific deployment needs different
+numbers. The federation token's `lifetime` argument overrides
+`Config.FederationTokenTTL` per call (some flows want a tighter
+window); pass 0 to fall back to the configured default.
+
+`PublicKeyToJWK(*rsa.PublicKey, kid) JWK` converts a public key into
+the `JWK` shape published at `/.well-known/jwks.json`. Caller
+assembles the `JWKS` document by walking every active key in its
+keystore — this package doesn't know about storage.
+
+---
+
 ## journal/ — Append-only durable event journal
 
 An append-only, ordered, **fail-closed** event journal with symmetric write
