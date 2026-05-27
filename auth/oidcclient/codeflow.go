@@ -124,7 +124,12 @@ func exchangeCode(ctx context.Context, issuer, clientID, redirectURI, code, veri
 	return PostToken(ctx, issuer, form)
 }
 
-func openBrowser(rawURL string) error {
+// openBrowser is a package-level function variable so tests can swap
+// in a mock that drives the loopback callback directly (avoiding
+// exec.Command, which can't be exercised in headless CI). Production
+// callers never touch this; it defaults to the OS-appropriate
+// launcher.
+var openBrowser = func(rawURL string) error {
 	switch runtime.GOOS {
 	case "darwin":
 		return exec.Command("open", rawURL).Start()
