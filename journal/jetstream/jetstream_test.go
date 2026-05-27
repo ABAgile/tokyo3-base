@@ -24,6 +24,21 @@ func TestNewSink_MissingSubject(t *testing.T) {
 	}
 }
 
+// TestNewSink_NoErrOnUnreachable proves the lazy-connect contract:
+// pointing at a port nothing listens on must not return an error.
+// The connection retries in the background; publish-time failures
+// surface there.
+func TestNewSink_NoErrOnUnreachable(t *testing.T) {
+	sink, err := NewSink(SinkConfig{
+		URL:     "nats://127.0.0.1:1",
+		Subject: "events",
+	})
+	if err != nil {
+		t.Fatalf("NewSink on unreachable URL: %v, want nil", err)
+	}
+	t.Cleanup(func() { _ = sink.Close() })
+}
+
 // ── Source (read face) ───────────────────────────────────────────────────────
 
 // TestNewSource_MissingFields covers the SourceConfig fast-fail checks

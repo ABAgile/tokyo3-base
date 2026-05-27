@@ -19,6 +19,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/abagile/tokyo3-base/journal"
@@ -41,7 +42,22 @@ type SinkConfig struct {
 	// or SPIFFE URI SAN (e.g. via verify_and_map). Leave nil for
 	// plaintext (development only).
 	TLS *tls.Config
+	// Log, when set, receives structured connection-lifecycle events
+	// (disconnect, reconnect, closed). Useful in production where the
+	// connection retries in the background and operators want a
+	// log/alert surface for sustained broker outage. Nil ⇒ events are
+	// silently swallowed (the NATS client still retries).
+	Log *slog.Logger
+	// ReconnectWait is the delay between reconnect attempts. 0 ⇒
+	// [DefaultReconnectWait].
+	ReconnectWait time.Duration
 }
+
+// DefaultReconnectWait is the gap between reconnect attempts the
+// underlying NATS client uses when SinkConfig.ReconnectWait is zero.
+// Picked to mirror the NATS client's own default and to avoid
+// flooding a recovering broker.
+const DefaultReconnectWait = 2 * time.Second
 
 // Sink publishes payloads to NATS JetStream synchronously. Implements
 // journal.Sink (defined in the parent package).
@@ -51,9 +67,17 @@ type Sink struct {
 	subject string
 }
 
-// NewSink dials NATS and returns a ready Sink. Returns an error if the
-// connection cannot be established or required configuration is missing.
-// The caller owns the Sink's lifetime and must call Close on shutdown.
+// NewSink returns a ready Sink. NATS dial failures do NOT cause an
+// error here — the underlying client retries the connection in the
+// background ([DefaultReconnectWait] between attempts, unbounded) so
+// the caller's bootstrap is not gated on broker reachability.
+// Configuration shape errors (empty URL/Subject) still return
+// synchronously. The caller owns the Sink's lifetime and must call
+// Close on shutdown.
+//
+// Connection-lifecycle events are logged through SinkConfig.Log when
+// set; sustained "disconnected" state is the operator's signal that
+// audit publishing is currently unavailable.
 func NewSink(cfg SinkConfig) (*Sink, error) {
 	if cfg.URL == "" {
 		return nil, fmt.Errorf("url required")
@@ -61,10 +85,7 @@ func NewSink(cfg SinkConfig) (*Sink, error) {
 	if cfg.Subject == "" {
 		return nil, fmt.Errorf("subject required")
 	}
-	var opts []nats.Option
-	if cfg.TLS != nil {
-		opts = append(opts, nats.Secure(cfg.TLS))
-	}
+	opts := connectOptions(cfg.TLS, cfg.Log, cfg.ReconnectWait, "jetstream-sink")
 	nc, err := nats.Connect(cfg.URL, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("nats connect: %w", err)
@@ -75,6 +96,38 @@ func NewSink(cfg SinkConfig) (*Sink, error) {
 		return nil, fmt.Errorf("jetstream client: %w", err)
 	}
 	return &Sink{nc: nc, js: js, subject: cfg.Subject}, nil
+}
+
+// connectOptions builds the nats.Option list every face here uses.
+// Centralised so Sink and Source share retry semantics without
+// drifting. The "face" arg surfaces in lifecycle logs so operators
+// can tell which connection an event came from.
+func connectOptions(tlsCfg *tls.Config, log *slog.Logger, reconnectWait time.Duration, face string) []nats.Option {
+	if reconnectWait <= 0 {
+		reconnectWait = DefaultReconnectWait
+	}
+	opts := []nats.Option{
+		nats.RetryOnFailedConnect(true),
+		nats.MaxReconnects(-1),
+		nats.ReconnectWait(reconnectWait),
+	}
+	if tlsCfg != nil {
+		opts = append(opts, nats.Secure(tlsCfg))
+	}
+	if log != nil {
+		opts = append(opts,
+			nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
+				log.Warn("nats disconnected", "face", face, "err", err)
+			}),
+			nats.ReconnectHandler(func(nc *nats.Conn) {
+				log.Info("nats reconnected", "face", face, "url", nc.ConnectedUrl())
+			}),
+			nats.ClosedHandler(func(_ *nats.Conn) {
+				log.Warn("nats connection closed", "face", face)
+			}),
+		)
+	}
+	return opts
 }
 
 // Append publishes payload to the configured subject and waits for the
