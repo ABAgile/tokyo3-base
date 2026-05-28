@@ -120,7 +120,7 @@ is an internal detail — application code never imports it.
 
 | Layer | Type | Interface |
 |---|---|---|
-| App logger construction | `AppLogger` | returns `*slog.Logger` + `*slog.LevelVar` |
+| App logger construction | `AppLogger`, `AppLoggerWithNATS` | returns `*slog.Logger` + `*slog.LevelVar` (+ drain for NATS) |
 | Writer composition | `WithStdout`, `WithAsyncNats` | `WriterOption` |
 | Log-call sites | `*slog.Logger` | standard `log/slog` |
 | Message annotation | `AttrsHandler` | `slog.Handler` — wraps any handler |
@@ -129,26 +129,54 @@ is an internal detail — application code never imports it.
 ### `AppLogger` — structured app logger with composable writers
 
 ```go
-func AppLogger(app string, writerOpts ...WriterOption) (*slog.Logger, *slog.LevelVar)
+type Config struct {
+    App      string   // required; "app" attr + NATS subject prefix
+    Instance string   // optional; per-host suffix + "instance" attr
+}
+
+func AppLogger(cfg Config, writerOpts ...WriterOption) (*slog.Logger, *slog.LevelVar)
 ```
 
-Constructs a `*slog.Logger` that emits JSON. With no writer options, output goes to
-stdout. Compose writers explicitly via `WriterOption`:
+Constructs a `*slog.Logger` that emits JSON. With no writer options, output goes
+to stdout. Compose writers explicitly via `WriterOption`:
 
 ```go
-logger, lv := AppLogger("myapp", WithStdout())                   // stdout only
-logger, lv := AppLogger("myapp", WithAsyncNats(nc))              // NATS only
-logger, lv := AppLogger("myapp", WithStdout(), WithAsyncNats(nc)) // both
+logger, lv := AppLogger(Config{App: "myapp"}, WithStdout())                   // stdout only
+logger, lv := AppLogger(Config{App: "myapp"}, WithAsyncNats(nc))              // NATS only
+logger, lv := AppLogger(Config{App: "myapp"}, WithStdout(), WithAsyncNats(nc)) // both
 ```
 
-The returned `*slog.LevelVar` controls the minimum log level at runtime (default:
-`Info`). It is safe for concurrent use:
+Every line carries an `app` attribute matching `Config.App`. The returned
+`*slog.LevelVar` controls the minimum log level at runtime (default: `Info`)
+and is safe for concurrent use:
 
 ```go
 lv.Set(slog.LevelDebug) // takes effect immediately, no restart needed
 ```
 
-Add fixed context fields with standard slog:
+#### `Config.Instance` — per-host daemons
+
+Daemons deployed on every workload host (`cert-agentd`, `ssh-tunneld`) set
+`Instance` to a per-host identifier so log streams can be addressed
+individually. When non-empty:
+
+- `WithAsyncNats` publishes to `app_log.<App>.<Instance>` instead of the
+  legacy singleton subject — operators can `nats sub 'app_log.cert-agentd.>'`
+  for the fleet or `app_log.cert-agentd.host-42` for one machine.
+- Every log line gains an `"instance"` attribute alongside `"app"` — so
+  attribute-based consumers can filter without parsing subjects.
+
+```go
+logger, _ := AppLogger(Config{
+    App:      "cert-agentd",
+    Instance: envutil.Or("CERT_AGENTD_INSTANCE", envutil.HostnameOrEmpty()),
+}, WithStdout(), WithAsyncNats(nc))
+```
+
+Singleton daemons (one replica per cluster) leave `Instance` empty and keep
+the legacy `app_log.<App>` subject.
+
+Add additional fixed context fields with standard slog:
 
 ```go
 logger = logger.With("site", "tokyo", "module", "api")
@@ -159,7 +187,58 @@ logger = logger.With("site", "tokyo", "module", "api")
 | Option | Description |
 |---|---|
 | `WithStdout()` | Synchronous stdout writer |
-| `WithAsyncNats(nc)` | Async NATS writer; publishes to `app_log.<app>`, 200-entry buffer, discards on full |
+| `WithAsyncNats(nc)` | Async NATS writer; publishes to `app_log.<App>` (or `app_log.<App>.<Instance>` if `Instance` set), 200-entry buffer, discards on full |
+
+### `AppLoggerWithNATS` — combine logger + self-healing NATS shipping
+
+```go
+type NATSConfig struct {
+    URL      string         // empty disables shipping (logger falls back to stdout-only)
+    CertFile string         // mTLS material — paths forwarded to nats.Dial
+    KeyFile  string
+    CAFile   string
+
+    Timeout       time.Duration // initial dial; 0 → 5s
+    DrainTimeout  time.Duration // graceful drain on shutdown; 0 → 2s
+    ReconnectWait time.Duration // reconnect backoff; 0 → 2s
+}
+
+func AppLoggerWithNATS(loggerCfg Config, natsCfg NATSConfig, writers ...WriterOption) (
+    *slog.Logger, *slog.LevelVar, func(),
+)
+```
+
+One call constructs the logger, dials NATS (when configured), wires the
+async writer, and returns a drain callback the caller defers. Dial uses
+self-healing semantics — `RetryOnFailedConnect(true)`, `MaxReconnects(-1)`,
+configurable `ReconnectWait` — so a broker that's down at boot doesn't fail
+process startup. Entries drop on the floor (200-entry buffer) while
+disconnected and resume on reconnect.
+
+Three startup outcomes are distinguishable for operators grepping boot logs:
+
+```
+URL empty   →  INFO "operational log shipping skipped"   reason=no URL configured
+dial failed →  WARN "operational log shipping skipped"   reason=dial failure  err=<...>
+dialed      →  INFO "operational log shipping configured" subject=app_log.<App>[.<Instance>]
+```
+
+The returned drain is always non-nil — safe to defer unconditionally; it's a
+no-op when shipping is disabled.
+
+```go
+log, _, drain := AppLoggerWithNATS(
+    Config{App: "certd"},
+    NATSConfig{
+        URL:      os.Getenv("CERTD_NATS_URL"),
+        CertFile: os.Getenv("CERTD_NATS_CERT"),
+        KeyFile:  os.Getenv("CERTD_NATS_KEY"),
+        CAFile:   envutil.First("CERTD_NATS_CA", "CERTD_WORKLOAD_CA"),
+    },
+    WithStdout(),
+)
+defer drain()
+```
 
 ### `AttrsHandler` / `NewAttrsLogger` — human-readable message annotation
 
@@ -227,6 +306,37 @@ StackFrame(0, "github.com/acme/myapp", "github.com/acme/shared")
 
 ```
 ---
+
+## envutil/ — cmd/ main.go boilerplate helpers
+
+Tiny dependency-free helpers every cmd/main.go in the suite needs: env-var
+fallback chains, a fail-fast "required" check, a hostname default for
+per-host identifiers, and a safe close-if-Closer wrapper.
+
+```go
+import "github.com/abagile/tokyo3-base/envutil"
+```
+
+| Function | Purpose |
+|---|---|
+| `Or(key, fallback string) string` | Env var with a default. Empty/unset → fallback. |
+| `First(keys ...string) string` | First non-empty value among the named env vars (fallback chains). |
+| `MustEnv(key string) string` | Required env var. Writes `"<key> is required"` to stderr and `os.Exit(2)` when unset — matches Go's `flag.Parse` convention for usage/config errors. |
+| `HostnameOrEmpty() string` | `os.Hostname()` on success, `""` on error. Default for per-host identifier env vars like `CERT_AGENTD_INSTANCE`. |
+| `CloseIfCloser(v any)` | Calls `Close()` on `v` when it implements `io.Closer`, no-op otherwise. Safely closes polymorphic resources (e.g., `audit.Sink` that may be a real sink with a `Close` or a NoopSink with none). |
+
+```go
+addr      := envutil.Or("MYDAEMON_ADDR", ":8080")
+caFile    := envutil.First("MYDAEMON_NATS_CA", "MYDAEMON_WORKLOAD_CA")
+issuer    := envutil.MustEnv("MYDAEMON_ISSUER")
+instance  := envutil.Or("MYDAEMON_INSTANCE", envutil.HostnameOrEmpty())
+
+sink, _ := openAuditSink(log)
+defer envutil.CloseIfCloser(sink)
+```
+
+---
+
 ## api/ — HTTP client utilities
 
 Thin option-driven wrapper over [go-resty/resty](https://github.com/go-resty/resty/v2) with bearer-token management, structured request logging, and context-scoped log annotation.
@@ -266,7 +376,7 @@ rc := api.NewRestClient("https://api.example.com",
 func (rc *RestyClient) R(ctx context.Context, method, path string, result any, opts ...RestyRequestOption) error
 ```
 
-Executes a request and unmarshals the response body into `result` on success. Returns `*ApiError` on HTTP error status.
+Executes a request and unmarshals the response body into `result` on success. Returns `*ApiError` on HTTP error status; the response body is decoded with `encoding/json` directly (no Content-Type heuristics) so test mocks that omit `Content-Type: application/json` work unchanged.
 
 ```go
 var out MyResponse
@@ -276,9 +386,31 @@ err := rc.R(ctx, http.MethodGet, "/v1/orders/{id}", &out,
 )
 var apiErr *api.ApiError
 if errors.As(err, &apiErr) {
-    // apiErr.StatusCode holds the HTTP status
+    // apiErr.StatusCode holds the HTTP status;
+    // apiErr.Body holds the raw response body verbatim (capped at 64 KiB).
 }
 ```
+
+#### `ApiError` shape
+
+```go
+type ApiError struct {
+    StatusCode int
+    Body       []byte
+}
+```
+
+`Error()` surfaces the body inline (truncated at 512 chars; full bytes
+available via the field) so server-side error messages reach operator logs
+without a second roundtrip:
+
+```
+api error: status 403: {"error":"policy denied for groups [eng]"}
+```
+
+JSON-decode failures on success-path responses surface as
+`"api call failed: decode response: <err>"` so callers can distinguish them
+from transport errors.
 
 #### Request options (`RO`)
 
@@ -616,6 +748,98 @@ http.DefaultClient.Transport = &http.Transport{TLSClientConfig: cfg}
 
 `CertPoolFromPEM` is the lower-level building block when you already have
 PEM bytes and just want a `*x509.CertPool` for `RootCAs` / `ClientCAs`.
+
+### tls/reloader — hot-reload client cert + multi-pool trust
+
+```go
+import "github.com/abagile/tokyo3-base/tls/reloader"
+```
+
+For **client-side** mTLS where the workload cert+key and one or more CA
+trust pools rotate from under a running daemon — typical of cert-agentd
+renewing its own SPIFFE cert in-process, or ssh-tunneld picking up an
+external rotator's drop-in.
+
+```go
+type Config struct {
+    CertPath, KeyPath string
+    Pools             map[string]string  // name → CA bundle path
+    PollCert          bool               // true ⇒ also mtime-poll cert+key
+    Log               *slog.Logger
+}
+
+type Reloader struct { /* ... */ }
+
+func New(cfg Config) (*Reloader, error)
+func (r *Reloader) Refresh() error                                       // explicit cert re-read
+func (r *Reloader) GetClientCertificate(*tls.CertificateRequestInfo) (*tls.Certificate, error)
+func (r *Reloader) LeafExpiry() time.Time                                // leaf cert NotAfter
+func (r *Reloader) TLSConfig(poolName string, opts ...TLSConfigOption) *tls.Config
+func (r *Reloader) RunPoll(ctx context.Context, interval time.Duration) error
+func (r *Reloader) VerifyConnection(poolName string) func(tls.ConnectionState) error
+
+func WithServerName(name string) TLSConfigOption
+```
+
+`Reloader.TLSConfig(poolName)` returns a `*tls.Config` whose
+`GetClientCertificate` and `VerifyConnection` callbacks read live in-memory
+state — rotated material applies on the next TLS handshake without
+rebuilding the http.Client. `InsecureSkipVerify: true` is set on purpose;
+the standard verifier freezes `RootCAs` at config-construction, so
+hot-reload uses `VerifyConnection` against a per-handshake pool snapshot
+instead.
+
+Two reload disciplines, picked per use case:
+
+- **Explicit refresh** (`PollCert: false`): caller invokes `r.Refresh()`
+  from wherever a new cert lands — typically a renewer's `OnRenewed`
+  callback. Suits binaries that mint their own certs in-process.
+- **mtime polling** (`PollCert: true`): `RunPoll` watches the cert+key
+  files' mtimes and re-reads when they advance. Suits binaries whose
+  cert is rotated by an external agent.
+
+CA pools are always mtime-polled by `RunPoll` regardless of `PollCert` —
+they don't have a single explicit-refresh trigger like the cert+key pair
+does. Each pool is registered with a caller-chosen name in `Config.Pools`
+(`"ca"`, `"proxy"`, `"certd"`, …); the same name flows through
+`TLSConfig(name)` to address per-pool tls.Configs from one Reloader.
+
+```go
+// single-pool, explicit-refresh (cert-agentd pattern):
+r, _ := reloader.New(reloader.Config{
+    CertPath: "/etc/workload/cert.pem",
+    KeyPath:  "/etc/workload/key.pem",
+    Pools:    map[string]string{"ca": "/etc/workload/ca.pem"},
+    Log:      log,
+})
+client, _ := certd.NewClient(certdURL, r.TLSConfig("ca"))
+// after a successful renewal:
+r.Refresh()
+go func() { errCh <- r.RunPoll(ctx, reloader.DefaultPollInterval) }()
+
+// multi-pool, passive mtime pickup (ssh-tunneld pattern):
+r, _ := reloader.New(reloader.Config{
+    CertPath: certPath, KeyPath: keyPath,
+    Pools: map[string]string{
+        "proxy": proxyCAPath,
+        "certd": certdCAPath,
+    },
+    PollCert: true,
+    Log:      log,
+})
+proxyTLS := r.TLSConfig("proxy", reloader.WithServerName("proxy.internal"))
+certdTLS := r.TLSConfig("certd")
+go func() { errCh <- r.RunPoll(ctx, reloader.DefaultPollInterval) }()
+```
+
+`RunPoll` blocks until ctx cancel — the caller owns the goroutine lifecycle
+(matches `http.Server.ListenAndServe`'s discipline). Read failures during
+RunPoll keep the previous in-memory state live and emit a warn log so a
+corrupt drop-in never opens a trust window.
+
+Pairs with `tls.CertLoader` above on the **server** side; together they
+cover both directions of hot-reload for daemons that act as both client and
+server.
 
 ---
 
