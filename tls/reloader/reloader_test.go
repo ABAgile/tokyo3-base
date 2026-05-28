@@ -70,6 +70,14 @@ func writePEMCertKey(t *testing.T, certPath, keyPath, cn string, serial int64) *
 // keeps each test self-contained.
 func newOne(t *testing.T, cn string) (*reloader.Reloader, string, string) {
 	t.Helper()
+	return newOneLogged(t, cn, nil)
+}
+
+// newOneLogged is newOne with an explicit logger so tests that want
+// to assert on emitted log lines can capture them. Pass nil to get
+// the default (slog.Default).
+func newOneLogged(t *testing.T, cn string, log *slog.Logger) (*reloader.Reloader, string, string) {
+	t.Helper()
 	dir := t.TempDir()
 	certPath := filepath.Join(dir, "c.pem")
 	keyPath := filepath.Join(dir, "k.pem")
@@ -78,6 +86,7 @@ func newOne(t *testing.T, cn string) (*reloader.Reloader, string, string) {
 		CertPath: certPath,
 		KeyPath:  keyPath,
 		Pools:    map[string]string{"ca": certPath},
+		Log:      log,
 	})
 	if err != nil {
 		t.Fatalf("reloader.New: %v", err)
@@ -387,6 +396,73 @@ func TestVerifyConnection_RejectsEmptyPeerCerts(t *testing.T) {
 	err := verify(tls.ConnectionState{})
 	if err == nil || !strings.Contains(err.Error(), "no certificates") {
 		t.Errorf("err = %v, want no-certificates message", err)
+	}
+}
+
+// ── WarnIfNearExpiry / ExpiryAttrs ────────────────────────────────────────────
+
+// TestWarnIfNearExpiry_EmitsWarnWhenWithinThreshold builds a
+// short-lived cert and confirms the warn line surfaces with the
+// expected attrs.
+func TestWarnIfNearExpiry_EmitsWarnWhenWithinThreshold(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "c.pem")
+	keyPath := filepath.Join(dir, "k.pem")
+	// writePEMCertKey produces a cert with NotAfter = now + 1h, so a
+	// 24-hour threshold definitely fires.
+	writePEMCertKey(t, certPath, keyPath, "short-lived", 1)
+
+	var buf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	r, err := reloader.New(reloader.Config{
+		CertPath: certPath, KeyPath: keyPath,
+		Pools: map[string]string{"ca": certPath},
+		Log:   log,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	r.WarnIfNearExpiry(24*time.Hour, "test cert is near expiry")
+
+	got := buf.String()
+	if !strings.Contains(got, `"test cert is near expiry"`) {
+		t.Errorf("missing warn message:\n%s", got)
+	}
+	if !strings.Contains(got, `"remaining":`) {
+		t.Errorf("missing remaining attr:\n%s", got)
+	}
+	if !strings.Contains(got, `"not_after":`) {
+		t.Errorf("missing not_after attr:\n%s", got)
+	}
+}
+
+// TestWarnIfNearExpiry_SkipsWhenBeyondThreshold: a freshly-minted
+// cert is well outside a 1-second threshold; no warn fires.
+func TestWarnIfNearExpiry_SkipsWhenBeyondThreshold(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	r, _, _ := newOneLogged(t, "fresh", log)
+	r.WarnIfNearExpiry(1*time.Second, "should not appear")
+	if strings.Contains(buf.String(), "should not appear") {
+		t.Errorf("unexpected warn:\n%s", buf.String())
+	}
+}
+
+// TestExpiryAttrs_YieldsRemainingDuration verifies the closure
+// returns the expected attr name + a positive duration for a
+// freshly-loaded cert.
+func TestExpiryAttrs_YieldsRemainingDuration(t *testing.T) {
+	r, _, _ := newOne(t, "live-cert")
+	attrs := r.ExpiryAttrs("workload_cert_remaining")()
+	if len(attrs) != 2 {
+		t.Fatalf("attrs len = %d, want 2", len(attrs))
+	}
+	if attrs[0] != "workload_cert_remaining" {
+		t.Errorf("attr name = %v, want workload_cert_remaining", attrs[0])
+	}
+	d, ok := attrs[1].(time.Duration)
+	if !ok || d <= 0 {
+		t.Errorf("attr value = %v (%T), want positive duration", attrs[1], attrs[1])
 	}
 }
 

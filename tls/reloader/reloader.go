@@ -258,6 +258,49 @@ func (r *Reloader) LeafExpiry() time.Time {
 	return r.notAfter
 }
 
+// WarnIfNearExpiry emits a Warn on the reloader's configured logger
+// when the leaf cert is within threshold of expiry. Use at startup
+// to alert operators that the workload identity is already in its
+// renewal window (typical threshold: 24 h). No-op when the cert
+// hasn't loaded yet ([LeafExpiry] is zero).
+//
+// msg is the human-readable warn message. The line additionally
+// carries "remaining" (duration to expiry, rounded to the nearest
+// second) and "not_after" (the leaf's NotAfter) structured attrs so
+// alerting rules can fire on either field without parsing the
+// message text.
+func (r *Reloader) WarnIfNearExpiry(threshold time.Duration, msg string) {
+	exp := r.LeafExpiry()
+	if exp.IsZero() {
+		return
+	}
+	if remaining := time.Until(exp); remaining < threshold {
+		r.log.Warn(msg,
+			"remaining", remaining.Round(time.Second),
+			"not_after", exp)
+	}
+}
+
+// ExpiryAttrs returns a closure that yields
+// [attrName, time-until-leaf-expiry-rounded-to-seconds] on every
+// call — the shape that retry-surface error-attrs hooks (e.g.,
+// revcheck.Config.RefreshErrorAttrs, hostcert.Config.SignErrorAttrs,
+// renew.Config.SignErrorAttrs) want so failure logs always carry the
+// remaining-validity field. Operators can grep one consistent attr
+// across every retry surface to see cert exhaustion approaching.
+//
+// The closure returns nil when the cert hasn't loaded yet — the
+// underlying logger then skips emitting the attr cleanly.
+func (r *Reloader) ExpiryAttrs(attrName string) func() []any {
+	return func() []any {
+		exp := r.LeafExpiry()
+		if exp.IsZero() {
+			return nil
+		}
+		return []any{attrName, time.Until(exp).Round(time.Second)}
+	}
+}
+
 // PoolNames returns the registered pool names, sorted-stable across
 // calls is not guaranteed (Go map iteration is randomised). Exposed
 // for diagnostics + tests; production callers typically know their

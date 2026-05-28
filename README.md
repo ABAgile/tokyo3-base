@@ -748,6 +748,9 @@ http.DefaultClient.Transport = &http.Transport{TLSClientConfig: cfg}
 
 `CertPoolFromPEM` is the lower-level building block when you already have
 PEM bytes and just want a `*x509.CertPool` for `RootCAs` / `ClientCAs`.
+`CertPoolFromFile(path)` is the path-taking variant — reads the PEM
+file and rejects bundles with zero certificates so a typo'd path
+doesn't silently disable trust.
 
 ### tls/reloader — hot-reload client cert + multi-pool trust
 
@@ -836,6 +839,36 @@ go func() { errCh <- r.RunPoll(ctx, reloader.DefaultPollInterval) }()
 (matches `http.Server.ListenAndServe`'s discipline). Read failures during
 RunPoll keep the previous in-memory state live and emit a warn log so a
 corrupt drop-in never opens a trust window.
+
+#### Expiry helpers
+
+```go
+func (r *Reloader) WarnIfNearExpiry(threshold time.Duration, msg string)
+func (r *Reloader) ExpiryAttrs(attrName string) func() []any
+```
+
+`WarnIfNearExpiry` emits a single startup-time Warn on the reloader's
+logger when the leaf cert is within `threshold` of expiry (typical
+threshold: `24*time.Hour`). The line carries `remaining` and
+`not_after` structured attrs so alerting rules can fire on either
+field without parsing message text. No-op until the cert has loaded.
+
+`ExpiryAttrs(attrName)` returns a closure that yields
+`[attrName, time-until-leaf-expiry-rounded-to-seconds]` on every
+call — the shape that retry-surface error-attrs hooks like
+`revcheck.Config.RefreshErrorAttrs`, `hostcert.Config.SignErrorAttrs`,
+and `renew.Config.SignErrorAttrs` want. Operators grep one
+consistent attr across every retry surface to see cert exhaustion
+approaching.
+
+```go
+r.WarnIfNearExpiry(24*time.Hour, "workload mTLS cert near expiry")
+
+renewer, _ := renew.New(renew.Config{
+    SignErrorAttrs: r.ExpiryAttrs("mtls_cert_remaining"),
+    // ...
+})
+```
 
 Pairs with `tls.CertLoader` above on the **server** side; together they
 cover both directions of hot-reload for daemons that act as both client and
@@ -1344,6 +1377,41 @@ covers a browser reconnect window without leaking abandoned consumers.
 The reader's NATS credential needs CONSUME rights on the subject; no
 stream-management rights, again because this package does not provision
 streams.
+
+#### Convenience: `NewAuditSink[T]` / `NewAuditSource`
+
+```go
+func NewAuditSink[T any](cfg AuditSinkConfig) (*journal.EncodedSink[T], error)
+func NewAuditSource(cfg AuditSourceConfig)   (journal.Source, error)
+```
+
+The same wiring every daemon's `openAuditSink` / `openAuditSource`
+spelled out by hand: dial NATS, build TLS config from PEM file paths,
+wrap the byte-level Sink in `journal.NewJSONSink[T]`, and emit the
+standard "URL not set — sink is no-op" / "<PREFIX>_CERT not set —
+without mTLS" / "audit sink: NATS JetStream with mTLS" warn/info log
+lines. Operators reading boot logs see one consistent set of
+messages across the whole suite.
+
+```go
+sink, err := jetstream.NewAuditSink[audit.Entry](jetstream.AuditSinkConfig{
+    URL:       os.Getenv("CERTD_NATS_URL"),
+    CertFile:  os.Getenv("CERTD_NATS_CERT"),
+    KeyFile:   os.Getenv("CERTD_NATS_KEY"),
+    CAFile:    envutil.First("CERTD_NATS_CA", "CERTD_WORKLOAD_CA"),
+    Subject:   audit.Subject,
+    EnvPrefix: "CERTD_NATS",
+    Log:       log,
+})
+```
+
+`EnvPrefix` is the env-var family name that appears in the no-op /
+no-mTLS warns (e.g. `"CERTD_NATS_URL not set — audit sink is no-op"`).
+URL empty returns a typed sink wrapping `journal.NoopSink` — safe to
+`Append` against; drops every entry. `NewAuditSource` mirrors the
+shape for the read side and returns `journal.NoopSource{}` when URL
+is empty (downstream UI renders empty, mirroring the no-broker
+dev story).
 
 ### `journal/sse` — generic Server-Sent-Events handler
 

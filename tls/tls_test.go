@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -414,5 +415,46 @@ func TestFromFiles_BadCertContent(t *testing.T) {
 func TestFromPEM_BadCertContent(t *testing.T) {
 	if _, err := FromPEM("not a cert", "not a key", ""); err == nil {
 		t.Error("expected error parsing garbage cert/key PEM, got nil")
+	}
+}
+
+func TestCertPoolFromFile_LoadsValidBundle(t *testing.T) {
+	dir := t.TempDir()
+	caPath := filepath.Join(dir, "ca.pem")
+	cert, err := SelfSignedCert()
+	if err != nil {
+		t.Fatalf("SelfSignedCert: %v", err)
+	}
+	if err := os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]}), 0o644); err != nil {
+		t.Fatalf("write bundle: %v", err)
+	}
+	pool, err := CertPoolFromFile(caPath)
+	if err != nil {
+		t.Fatalf("CertPoolFromFile: %v", err)
+	}
+	if pool == nil {
+		t.Fatal("pool is nil")
+	}
+}
+
+func TestCertPoolFromFile_RejectsMissingFile(t *testing.T) {
+	_, err := CertPoolFromFile("/no/such/path/ca.pem")
+	if err == nil {
+		t.Fatal("expected error for missing file")
+	}
+	if !strings.Contains(err.Error(), "/no/such/path/ca.pem") {
+		t.Errorf("err = %v, want path in message", err)
+	}
+}
+
+func TestCertPoolFromFile_RejectsBundleWithoutPEM(t *testing.T) {
+	dir := t.TempDir()
+	bad := filepath.Join(dir, "junk.pem")
+	if err := os.WriteFile(bad, []byte("not a pem"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_, err := CertPoolFromFile(bad)
+	if err == nil || !strings.Contains(err.Error(), "no valid certificates") {
+		t.Errorf("err = %v, want no-PEM rejection", err)
 	}
 }

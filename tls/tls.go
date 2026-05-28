@@ -142,6 +142,23 @@ func CertPoolFromPEM(pemData []byte) (*x509.CertPool, error) {
 	return pool, nil
 }
 
+// CertPoolFromFile reads a PEM bundle from path and returns it as a
+// new *x509.CertPool. Returns an error when the file is missing,
+// unreadable, or contains zero PEM-encoded certificates — the
+// zero-certs case is the load-bearing safety check, catching typo'd
+// paths that would otherwise silently disable trust.
+func CertPoolFromFile(path string) (*x509.CertPool, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	pool, err := CertPoolFromPEM(b)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return pool, nil
+}
+
 // FromFiles builds a *tls.Config from PEM file paths.
 // certFile and keyFile must both be set or both empty.
 // caFile is optional; if non-empty its PEM certs populate RootCAs.
