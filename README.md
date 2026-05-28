@@ -807,6 +807,23 @@ does. Each pool is registered with a caller-chosen name in `Config.Pools`
 (`"ca"`, `"proxy"`, `"certd"`, …); the same name flows through
 `TLSConfig(name)` to address per-pool tls.Configs from one Reloader.
 
+An empty path in `Config.Pools` is a sentinel for "load from
+`x509.SystemCertPool()`" — useful for dev paths that connect to a
+public-CA-signed endpoint without pinning trust. System pools are
+snapshot at construction; they can't be hot-reloaded and `RunPoll`
+skips them silently:
+
+```go
+r, _ := reloader.New(reloader.Config{
+    CertPath: certPath, KeyPath: keyPath,
+    Pools: map[string]string{
+        "ca": os.Getenv("CERTD_CA_BUNDLE"),  // "" → OS trust store
+    },
+    PollCert: true,
+    Log:      log,
+})
+```
+
 ```go
 // single-pool, explicit-refresh (cert-agentd pattern):
 r, _ := reloader.New(reloader.Config{

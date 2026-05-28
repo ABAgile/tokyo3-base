@@ -135,6 +135,91 @@ func TestNew_RequiresAtLeastOnePool(t *testing.T) {
 	}
 }
 
+// TestNew_EmptyPathLoadsSystemPool exercises the sentinel: a pool
+// entry whose value is "" snapshots [x509.SystemCertPool] at
+// construction and is exempt from mtime polling. Used by daemons
+// that need a "trust the OS bundle" dev path alongside a normal
+// file-based pool.
+func TestNew_EmptyPathLoadsSystemPool(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "c.pem")
+	keyPath := filepath.Join(dir, "k.pem")
+	writePEMCertKey(t, certPath, keyPath, "client", 1)
+
+	var buf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	r, err := reloader.New(reloader.Config{
+		CertPath: certPath, KeyPath: keyPath,
+		Pools: map[string]string{"sys": ""},
+		Log:   log,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// The pool must be loaded — VerifyConnection should not return
+	// the "no CA bundle loaded" error when called with peer certs.
+	verify := r.VerifyConnection("sys")
+	// Calling with an empty ConnectionState yields "no certificates"
+	// (the next safety check) — confirming the pool itself loaded.
+	err = verify(tls.ConnectionState{})
+	if err == nil || !strings.Contains(err.Error(), "no certificates") {
+		t.Errorf("expected 'no certificates' (proves pool loaded), got: %v", err)
+	}
+
+	// And the construction-time log line was emitted with name=sys.
+	if !strings.Contains(buf.String(), `"CA pool: system trust store"`) {
+		t.Errorf("missing system-pool log:\n%s", buf.String())
+	}
+	if !strings.Contains(buf.String(), `"name":"sys"`) {
+		t.Errorf("system-pool log missing name=sys:\n%s", buf.String())
+	}
+}
+
+// TestRunPoll_SkipsSystemPool: a pool registered with empty path
+// must not trigger any os.Stat / file-read during RunPoll. A
+// non-existent file path would yield warn lines on every tick if the
+// helper didn't short-circuit; the system pool case should be silent.
+func TestRunPoll_SkipsSystemPool(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "c.pem")
+	keyPath := filepath.Join(dir, "k.pem")
+	writePEMCertKey(t, certPath, keyPath, "client", 1)
+
+	var buf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	r, err := reloader.New(reloader.Config{
+		CertPath: certPath, KeyPath: keyPath,
+		Pools: map[string]string{"sys": ""},
+		Log:   log,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Clear the buffer so we only assert on RunPoll's contributions.
+	buf.Reset()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- r.RunPoll(ctx, 20*time.Millisecond) }()
+	// Wait for a couple of ticks.
+	time.Sleep(120 * time.Millisecond)
+	cancel()
+	<-done
+
+	// No warn lines (no file to fail on), no info lines (no swap to
+	// log). The pool stays snapshot.
+	if strings.Contains(buf.String(), `"level":"WARN"`) {
+		t.Errorf("RunPoll emitted warn for system pool:\n%s", buf.String())
+	}
+	if strings.Contains(buf.String(), `"CA bundle reloaded"`) {
+		t.Errorf("RunPoll re-loaded system pool:\n%s", buf.String())
+	}
+}
+
 func TestNew_RejectsEmptyPoolName(t *testing.T) {
 	_, err := reloader.New(reloader.Config{
 		CertPath: "/tmp/c", KeyPath: "/tmp/k",

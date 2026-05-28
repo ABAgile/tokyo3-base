@@ -90,10 +90,14 @@ type Reloader struct {
 
 // caBundle holds one CA pool's in-memory state. Path is stable from
 // construction; pool + mtime swap atomically on mtime-advance.
+// isSystem marks the pool as loaded from [x509.SystemCertPool] at
+// construction — those pools have no file to poll and refreshPool
+// short-circuits to a no-op.
 type caBundle struct {
-	path  string
-	pool  *x509.CertPool
-	mtime time.Time
+	path     string
+	pool     *x509.CertPool
+	mtime    time.Time
+	isSystem bool
 }
 
 // New constructs a Reloader and loads cert+key + every named pool
@@ -101,6 +105,12 @@ type caBundle struct {
 // malformed at construction time — the reloader doesn't support
 // partial initial loads (a daemon that can't trust upstream certs
 // shouldn't start).
+//
+// An empty pool path in [Config.Pools] is a sentinel for
+// "load from [x509.SystemCertPool]" — useful for development paths
+// that connect to a public-CA-signed endpoint without pinning trust.
+// System pools are snapshot at construction; they cannot be
+// hot-reloaded and [RunPoll] skips them.
 func New(cfg Config) (*Reloader, error) {
 	if cfg.CertPath == "" || cfg.KeyPath == "" {
 		return nil, errors.New("reloader: CertPath and KeyPath are required")
@@ -117,9 +127,6 @@ func New(cfg Config) (*Reloader, error) {
 		if name == "" {
 			return nil, errors.New("reloader: pool name must be non-empty")
 		}
-		if path == "" {
-			return nil, fmt.Errorf("reloader: pool %q has empty path", name)
-		}
 		pools[name] = &caBundle{path: path}
 	}
 	r := &Reloader{
@@ -130,6 +137,18 @@ func New(cfg Config) (*Reloader, error) {
 		return nil, err
 	}
 	for name, b := range r.pools {
+		if b.path == "" {
+			sys, err := x509.SystemCertPool()
+			if err != nil {
+				return nil, fmt.Errorf("pool %q: load system pool: %w", name, err)
+			}
+			r.mu.Lock()
+			b.pool = sys
+			b.isSystem = true
+			r.mu.Unlock()
+			r.log.Info("CA pool: system trust store", "name", name)
+			continue
+		}
 		if err := r.refreshPool(name, b); err != nil {
 			return nil, fmt.Errorf("initial pool %q: %w", name, err)
 		}
@@ -195,8 +214,12 @@ func (r *Reloader) refreshCert(forced bool) error {
 
 // refreshPool re-reads a CA pool when its file's mtime has advanced
 // past the cached value (or on first load). Pool swap is atomic.
-// Logs at info on every actual swap.
+// Logs at info on every actual swap. No-op for system pools — they
+// have no file to poll and were snapshot at construction.
 func (r *Reloader) refreshPool(name string, b *caBundle) error {
+	if b.isSystem {
+		return nil
+	}
 	stat, err := os.Stat(b.path)
 	if err != nil {
 		return fmt.Errorf("stat %s: %w", b.path, err)
