@@ -12,6 +12,22 @@
 go get github.com/abagile/tokyo3-base
 ```
 
+## Packages
+
+- [db/ — PostgreSQL / pgx utilities](#db--postgresql--pgx-utilities)
+- [applog/ — Application logging helpers](#applog--application-logging-helpers)
+- [envutil/ — cmd/ main.go boilerplate helpers](#envutil--cmd-maingo-boilerplate-helpers)
+- [version/ — build version resolution](#version--build-version-resolution)
+- [debug/ — opt-in diagnostics server](#debug--opt-in-diagnostics-server)
+- [cli/ — daemon startup composition](#cli--daemon-startup-composition)
+- [api/ — HTTP client utilities](#api--http-client-utilities)
+- [api/google — Google Maps / Places client](#apigoogle--google-maps--places-client)
+- [crypto/ — AES-256-GCM and envelope encryption](#crypto--aes-256-gcm-and-envelope-encryption)
+- [nats/ — NATS dial helper](#nats--nats-dial-helper)
+- [tls/ — TLS config and self-signed cert helpers](#tls--tls-config-and-self-signed-cert-helpers)
+- [auth/ — auth primitives namespace](#auth--auth-primitives-namespace)
+- [journal/ — Append-only durable event journal](#journal--append-only-durable-event-journal)
+
 ---
 ## db/ — PostgreSQL / pgx utilities
 
@@ -106,6 +122,8 @@ row := Row{Name: []byte("alice"), Score: &score, Tag: "vip"}
 model, err := CopyDeref(row, &Model{})
 // model → Model{Name: "alice", Score: 42, Tag: "vip"}
 ```
+
+[↑ Back to top](#packages)
 
 ---
 
@@ -305,6 +323,8 @@ StackFrame(0)
 StackFrame(0, "github.com/acme/myapp", "github.com/acme/shared")
 
 ```
+[↑ Back to top](#packages)
+
 ---
 
 ## envutil/ — cmd/ main.go boilerplate helpers
@@ -334,6 +354,177 @@ instance  := envutil.Or("MYDAEMON_INSTANCE", envutil.HostnameOrEmpty())
 sink, _ := openAuditSink(log)
 defer envutil.CloseIfCloser(sink)
 ```
+
+[↑ Back to top](#packages)
+
+---
+
+## version/ — build version resolution
+
+```go
+import "github.com/abagile/tokyo3-base/version"
+
+func Resolve(injected string) string
+```
+
+Maps an ldflags-injected `main.Version` to an effective version string,
+falling back to `runtime/debug.BuildInfo` so `go install …@vX.Y.Z` and
+source-tree builds still report something useful without a Make-driven
+inject. Keep `var Version = "dev"` in `main` (the linker target stays
+`main.Version`) and call `version.Resolve(Version)`.
+
+Resolution order:
+
+1. `injected`, when the linker set it to anything other than `"dev"`.
+2. `BuildInfo.Main.Version` when it's a real module version (e.g.
+   `v1.2.3`) — what `go install pkg@vX.Y.Z` records.
+3. `dev-<vcs.revision[:7]>[-dirty] (<vcs.time>)` from the VCS settings the
+   toolchain stamps into source-tree builds; the commit time is appended
+   when present, rendered in the local time zone.
+4. `"dev"` — last resort (e.g. `go run` outside a module).
+
+```go
+var Version = "dev" // -ldflags "-X main.Version=v1.2.3"
+fmt.Printf("%s %s\n", appName, version.Resolve(Version))
+// tagged install → "v1.2.3"
+// local build    → "dev-1a2b3c4 (2026-05-31T17:30:00+08:00)"
+```
+
+> A Docker image built from a source copy with no `.git` and no ldflags
+> reports `"dev"` — stamp the tag via a `VERSION` build-arg + `-X
+> main.Version` so released images carry their version.
+
+[↑ Back to top](#packages)
+
+---
+
+## debug/ — opt-in diagnostics server
+
+```go
+import "github.com/abagile/tokyo3-base/debug"
+
+type Config struct {
+    Addr       string        // listen addr, e.g. "127.0.0.1:6060"; empty = disabled
+    Log        *slog.Logger  // defaults to slog.Default()
+    StatsEvery time.Duration // runtime-stats interval; default 30s
+}
+
+func Start(ctx context.Context, cfg Config)
+func Handler() http.Handler
+```
+
+Serves Go runtime profiles (goroutine, heap, threadcreate, allocs, block,
+mutex, CPU, trace) plus a periodic goroutine / OS-thread / heap log line,
+for chasing leaks and stalls. A no-op when `Addr` is empty, so importing
+it is inert until a daemon opts in.
+
+Unlike `net/http/pprof`, it registers **nothing** on
+`http.DefaultServeMux`: the handlers are built directly from
+`runtime/pprof` + `runtime/trace` and served on the package's own mux — so
+importing it can never quietly attach profiling to a binary that serves
+the default mux. `Handler()` exposes that mux for mounting on an existing
+admin server.
+
+```go
+debug.Start(ctx, debug.Config{Addr: os.Getenv("CERTD_DEBUG_ADDR"), Log: log})
+
+// curl http://127.0.0.1:6060/debug/pprof/goroutine?debug=1     # counts by stack
+// curl http://127.0.0.1:6060/debug/pprof/threadcreate?debug=1  # OS threads ≈ cgroup pids.current
+```
+
+A steadily climbing `goroutines` in the stats line confirms a goroutine
+leak; climbing `os_threads` with flat goroutines points instead at threads
+stuck in blocking syscalls/cgo.
+
+> **Unauthenticated** — bind `Addr` to loopback or a private interface;
+> never expose it publicly.
+
+[↑ Back to top](#packages)
+
+---
+
+## cli/ — daemon startup composition
+
+```go
+import "github.com/abagile/tokyo3-base/cli"
+
+type App struct {
+    Name      string  // short binary name → slog "app" attr + app_log subject
+    EnvPrefix string  // env-var prefix, e.g. "CERTD"
+    Instance  string  // optional per-host id (fleet agents) → app_log.<Name>.<Instance>
+}
+
+func (a App) Setup(parent context.Context) Runtime
+func (a App) NATS() NATS
+```
+
+Composes the bootstrap prelude every daemon repeats — application logger
+(with NATS log shipping), a `SIGINT`/`SIGTERM`-cancelled context, and the
+opt-in diagnostics server — depending on `applog`, `debug`, and `envutil`
+but **not** a command framework. Each binary keeps its own cobra (or
+other) command tree and calls `Setup` from inside its serve command.
+`Setup` is additive: a daemon with non-standard env keys can skip it and
+wire the pieces directly.
+
+```go
+func runServe(ctx context.Context) error {
+    rt := cli.App{Name: "certd", EnvPrefix: "CERTD"}.Setup(ctx)
+    defer rt.Shutdown()
+    log := rt.Log
+    // ... build the server, serve until rt.Ctx.Done() ...
+}
+```
+
+```go
+type Runtime struct {
+    Log       *slog.Logger
+    Ctx       context.Context // cancelled on signal or parent cancel
+    NATS      NATS            // resolved NATS material (WORKLOAD_* fallback)
+    EnvPrefix string
+    Shutdown  func()          // defer it: releases the signal hook + drains the logger
+}
+```
+
+### WORKLOAD identity convention
+
+A daemon's mesh mTLS identity is `<PREFIX>_WORKLOAD_CERT` / `_WORKLOAD_KEY`
+/ `_WORKLOAD_CA`. NATS connections reuse it: each of
+`<PREFIX>_NATS_CERT/KEY/CA` falls back to the matching `WORKLOAD_*`, so a
+daemon that already has a workload identity ships logs (and audit) over
+mTLS without a second set of env vars. Set `<PREFIX>_NATS_*` only to
+override NATS with a distinct identity.
+
+```go
+type NATS struct { URL, CertFile, KeyFile, CAFile string }
+```
+
+`App.NATS()` resolves that material (callable independently of `Setup`);
+`Runtime.NATS` carries the same resolution so audit and other NATS clients
+draw from one source of truth.
+
+### Audit sink/source
+
+```go
+func AuditSink[T any](rt Runtime, subject string) (*journal.EncodedSink[T], error)
+func AuditSource(rt Runtime, stream, subject string) (journal.Source, error)
+```
+
+Build a daemon's primary audit publisher (typed by the app's Entry `T`)
+and own-stream reader from the resolved NATS material — the common case
+collapses to one generic call. A daemon that attaches to additional
+streams (e.g. certd tailing ssh-proxy's audit) wires those directly.
+No-op (no error) when no broker URL is configured.
+
+```go
+sink, _ := cli.AuditSink[audit.Entry](rt, audit.Subject)
+src,  _ := cli.AuditSource(rt, audit.StreamName, audit.Subject)
+```
+
+These are free functions, not methods on a generic `App`, so a daemon that
+publishes no audit (e.g. cert-agentd) uses a plain `App` with no spurious
+type parameter.
+
+[↑ Back to top](#packages)
 
 ---
 
@@ -475,6 +666,8 @@ func SanitizeHeaders(h map[string][]string) map[string][]string
 
 Redacts `Authorization` and `Cookie` values (case-insensitive). Used internally by the logger; also available for custom middleware.
 
+[↑ Back to top](#packages)
+
 ---
 ## api/google — Google Maps / Places client
 
@@ -501,6 +694,8 @@ type Addresser interface {
 ```
 
 City is extracted by priority: `locality` is preferred over `administrative_area_level_1`. `AddressComponent.Name()` transparently unifies the field-name difference between the two APIs (`long_name` in Geocoding, `longText` in Places).
+
+[↑ Back to top](#packages)
 
 ---
 
@@ -624,6 +819,8 @@ ct, wrappedDEK, _ := bcrypto.EncryptEnvelope(ctx, kp, plaintext)
 cache.Invalidate(projectID)
 ```
 
+[↑ Back to top](#packages)
+
 ---
 
 ## nats/ — NATS dial helper
@@ -665,6 +862,8 @@ nc, err := nats.Dial(
 Pairs with `journal/jetstream` (which dials internally via the same
 shape) and with `WithAsyncNats` from `log.go` (which takes an
 externally-owned `*nats.Conn`).
+
+[↑ Back to top](#packages)
 
 ---
 
@@ -890,6 +1089,8 @@ renewer, _ := renew.New(renew.Config{
 Pairs with `tls.CertLoader` above on the **server** side; together they
 cover both directions of hot-reload for daemons that act as both client and
 server.
+
+[↑ Back to top](#packages)
 
 ---
 
@@ -1149,6 +1350,8 @@ window); pass 0 to fall back to the configured default.
 the `JWK` shape published at `/.well-known/jwks.json`. Caller
 assembles the `JWKS` document by walking every active key in its
 keystore — this package doesn't know about storage.
+
+[↑ Back to top](#packages)
 
 ---
 
@@ -1477,3 +1680,4 @@ The Data is forwarded byte-for-byte from `Msg.Data`, so producers using
 `journal.NewJSONSink[T]` already publish wire-ready JSON — no transcoding
 on the read side. Browsers parse the `data:` payload as their own JSON.
 
+[↑ Back to top](#packages)

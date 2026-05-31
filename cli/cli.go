@@ -8,6 +8,22 @@
 // command tree and calls [App.Setup] from inside its serve command.
 // Setup is additive: a daemon with non-standard env keys can skip it
 // and wire the pieces directly.
+//
+// # WORKLOAD identity convention
+//
+// A daemon's mTLS identity on the platform mesh is <PREFIX>_WORKLOAD_CERT
+// / _WORKLOAD_KEY / _WORKLOAD_CA. NATS connections reuse it: each of the
+// <PREFIX>_NATS_CERT/KEY/CA keys falls back to the matching WORKLOAD_* so
+// a daemon that already has a workload identity ships logs (and audit)
+// over mTLS without a second set of env vars. Set <PREFIX>_NATS_* only to
+// override NATS with a distinct identity.
+//
+// [AuditSink] and [AuditSource] build a daemon's primary audit publisher
+// and reader from that resolved material, so the common case is a single
+// generic call sharing the logger's connection identity. A daemon that
+// also reads other streams (e.g. certd tailing ssh-proxy's audit) wires
+// those directly — subject, stream, and any extra sources stay
+// app-specific.
 package cli
 
 import (
@@ -20,6 +36,8 @@ import (
 	"github.com/abagile/tokyo3-base/applog"
 	"github.com/abagile/tokyo3-base/debug"
 	"github.com/abagile/tokyo3-base/envutil"
+	"github.com/abagile/tokyo3-base/journal"
+	"github.com/abagile/tokyo3-base/journal/jetstream"
 )
 
 // App identifies a daemon for startup wiring.
@@ -28,8 +46,9 @@ type App struct {
 	// slog "app" attribute and the app_log NATS subject. Required.
 	Name string
 	// EnvPrefix is the binary's env-var prefix (e.g. "CERTD"). The
-	// standard <PREFIX>_NATS_URL/CERT/KEY/CA and <PREFIX>_DEBUG_ADDR
-	// keys are derived from it. Required.
+	// standard <PREFIX>_NATS_URL/CERT/KEY/CA, <PREFIX>_WORKLOAD_CERT/KEY/CA
+	// (the NATS mTLS fallback), and <PREFIX>_DEBUG_ADDR keys are derived
+	// from it. Required.
 	EnvPrefix string
 	// Instance is an optional per-host identifier for fleet daemons
 	// (cert-agentd, ssh-tunneld); when set, ops logs ship to
@@ -39,47 +58,114 @@ type App struct {
 	Instance string
 }
 
+// NATS is the resolved NATS connection material: the broker URL plus the
+// mTLS files, with cert/key/CA each falling back to the binary's
+// WORKLOAD_* identity when a NATS-specific override isn't set.
+type NATS struct {
+	URL      string
+	CertFile string
+	KeyFile  string
+	CAFile   string
+}
+
+// NATS resolves the daemon's NATS material from the environment:
+// <PREFIX>_NATS_URL, and <PREFIX>_NATS_CERT/KEY/CA each falling back to
+// <PREFIX>_WORKLOAD_CERT/KEY/CA. Safe to call independently of [App.Setup]
+// — e.g. to wire an audit sink/source from the same source of truth.
+func (a App) NATS() NATS {
+	p := a.EnvPrefix
+	return NATS{
+		URL:      os.Getenv(p + "_NATS_URL"),
+		CertFile: envutil.First(p+"_NATS_CERT", p+"_WORKLOAD_CERT"),
+		KeyFile:  envutil.First(p+"_NATS_KEY", p+"_WORKLOAD_KEY"),
+		CAFile:   envutil.First(p+"_NATS_CA", p+"_WORKLOAD_CA"),
+	}
+}
+
 // Runtime is what [App.Setup] returns: a configured logger, a context
-// cancelled on SIGINT/SIGTERM (or when the parent cancels), and a
-// Shutdown to defer.
+// cancelled on SIGINT/SIGTERM (or when the parent cancels), the resolved
+// NATS material, and a Shutdown to defer.
 type Runtime struct {
-	Log      *slog.Logger
-	Ctx      context.Context
-	Shutdown func()
+	Log  *slog.Logger
+	Ctx  context.Context
+	NATS NATS
+	// EnvPrefix echoes App.EnvPrefix so the audit helpers (and any
+	// bespoke NATS wiring) can derive <PREFIX>_NATS-keyed labels.
+	EnvPrefix string
+	Shutdown  func()
 }
 
 // Setup performs the standard daemon bootstrap:
 //
 //   - builds the app logger, shipping operational logs to NATS when
-//     <PREFIX>_NATS_URL is set (subject app_log.<Name>[.<Instance>])
+//     <PREFIX>_NATS_URL is set (subject app_log.<Name>[.<Instance>]),
+//     authenticating with the resolved [App.NATS] material
 //   - derives a context cancelled on SIGINT/SIGTERM from parent
 //   - starts the diagnostics server when <PREFIX>_DEBUG_ADDR is set
 //
-// Defer the returned Runtime.Shutdown to release the signal hook and
-// drain the logger.
+// The resolved NATS material is returned in Runtime.NATS so callers can
+// wire audit sink/source and other NATS clients from it. Defer the
+// returned Runtime.Shutdown to release the signal hook and drain the
+// logger.
 func (a App) Setup(parent context.Context) Runtime {
-	p := a.EnvPrefix
+	n := a.NATS()
 	log, _, drainLog := applog.AppLoggerWithNATS(
 		applog.Config{App: a.Name, Instance: a.Instance},
 		applog.NATSConfig{
-			URL:      os.Getenv(p + "_NATS_URL"),
-			CertFile: os.Getenv(p + "_NATS_CERT"),
-			KeyFile:  os.Getenv(p + "_NATS_KEY"),
-			CAFile:   envutil.First(p+"_NATS_CA", p+"_WORKLOAD_CA"),
+			URL:      n.URL,
+			CertFile: n.CertFile,
+			KeyFile:  n.KeyFile,
+			CAFile:   n.CAFile,
 		},
 		applog.WithStdout(),
 	)
 
 	ctx, stop := signal.NotifyContext(parent, syscall.SIGINT, syscall.SIGTERM)
 
-	debug.Start(ctx, debug.Config{Addr: os.Getenv(p + "_DEBUG_ADDR"), Log: log})
+	debug.Start(ctx, debug.Config{Addr: os.Getenv(a.EnvPrefix + "_DEBUG_ADDR"), Log: log})
 
 	return Runtime{
-		Log: log,
-		Ctx: ctx,
+		Log:       log,
+		Ctx:       ctx,
+		NATS:      n,
+		EnvPrefix: a.EnvPrefix,
 		Shutdown: func() {
 			stop()
 			drainLog()
 		},
 	}
+}
+
+// AuditSink builds the daemon's primary audit publisher, encoding the
+// app's Entry type T, from the resolved NATS material in rt — so it
+// shares the logger's connection identity and the WORKLOAD_* fallback.
+// subject is the app's audit subject (e.g. "ca.audit.events"). With no
+// NATS URL configured it returns a no-op sink (dev/no-broker path).
+func AuditSink[T any](rt Runtime, subject string) (*journal.EncodedSink[T], error) {
+	return jetstream.NewAuditSink[T](jetstream.AuditSinkConfig{
+		URL:       rt.NATS.URL,
+		CertFile:  rt.NATS.CertFile,
+		KeyFile:   rt.NATS.KeyFile,
+		CAFile:    rt.NATS.CAFile,
+		Subject:   subject,
+		EnvPrefix: rt.EnvPrefix + "_NATS",
+		Log:       rt.Log,
+	})
+}
+
+// AuditSource builds a reader for the daemon's own audit stream from the
+// same resolved NATS material. A daemon reading additional streams (a
+// different broker, prefix, or stream) wires those directly. With no
+// NATS URL configured it returns a no-op source.
+func AuditSource(rt Runtime, stream, subject string) (journal.Source, error) {
+	return jetstream.NewAuditSource(jetstream.AuditSourceConfig{
+		URL:        rt.NATS.URL,
+		CertFile:   rt.NATS.CertFile,
+		KeyFile:    rt.NATS.KeyFile,
+		CAFile:     rt.NATS.CAFile,
+		StreamName: stream,
+		Subject:    subject,
+		EnvPrefix:  rt.EnvPrefix + "_NATS",
+		Log:        rt.Log,
+	})
 }
