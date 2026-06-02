@@ -6,6 +6,7 @@ import (
 	"time"
 
 	bnats "github.com/abagile/tokyo3-base/nats"
+	btls "github.com/abagile/tokyo3-base/tls"
 	"github.com/nats-io/nats.go"
 )
 
@@ -70,6 +71,10 @@ type NATSConfig struct {
 //   - Async writer is discard-on-full (200-entry buffer) so a
 //     stalled NATS publish can't apply backpressure on a hot
 //     logging path.
+//   - When mTLS material is configured, the leaf is reloaded from
+//     disk on every handshake, so a cert-agentd rotation of the
+//     short-TTL workload cert is picked up on the next reconnect
+//     without restarting the daemon.
 //
 // Dial-time errors (malformed URL, missing TLS material) are NOT
 // fatal — they're logged on the returned logger as a Warn and
@@ -140,13 +145,35 @@ func dialLogNATS(cfg NATSConfig) (*nats.Conn, error) {
 	if reconnectWait == 0 {
 		reconnectWait = DefaultNATSReconnectWait
 	}
-	nc, err := bnats.Dial(cfg.URL, cfg.CertFile, cfg.KeyFile, cfg.CAFile,
+	timing := []nats.Option{
 		nats.Timeout(timeout),
 		nats.DrainTimeout(drainTimeout),
 		nats.RetryOnFailedConnect(true),
 		nats.MaxReconnects(-1),
 		nats.ReconnectWait(reconnectWait),
+	}
+
+	// mTLS path: hand NATS a tls.Config that reloads the leaf on every
+	// handshake, so the short-TTL workload cert cert-agentd rotates in
+	// place is re-read on each reconnect rather than frozen at dial.
+	// nats.Secure leads the timing opts (empty file args → bnats.Dial
+	// adds no TLS of its own, leaving ours authoritative). Anything
+	// short of a cert+key pair falls through to bnats.Dial's own
+	// handling: server-auth TLS when only CAFile is set, plaintext
+	// when nothing is.
+	var (
+		nc  *nats.Conn
+		err error
 	)
+	if cfg.CertFile != "" && cfg.KeyFile != "" {
+		tlsCfg, terr := btls.ReloadingClientConfig(cfg.CertFile, cfg.KeyFile, cfg.CAFile)
+		if terr != nil {
+			return nil, fmt.Errorf("log shipping: %w", terr)
+		}
+		nc, err = bnats.Dial(cfg.URL, "", "", "", append([]nats.Option{nats.Secure(tlsCfg)}, timing...)...)
+	} else {
+		nc, err = bnats.Dial(cfg.URL, cfg.CertFile, cfg.KeyFile, cfg.CAFile, timing...)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("log shipping: %w", err)
 	}

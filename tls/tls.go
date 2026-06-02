@@ -52,8 +52,26 @@ func NewCertLoader(certFile, keyFile string) *CertLoader {
 	return &CertLoader{certFile: certFile, keyFile: keyFile}
 }
 
-// GetCertificate satisfies tls.Config.GetCertificate.
+// GetCertificate satisfies tls.Config.GetCertificate (server side).
 func (c *CertLoader) GetCertificate(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	return c.current()
+}
+
+// GetClientCertificate satisfies tls.Config.GetClientCertificate
+// (client side). Wire it into a client tls.Config so a long-lived
+// connection (e.g. NATS) presents the freshly rotated leaf on every
+// handshake — the stat-and-reload logic is shared with
+// GetCertificate, so a short-TTL workload cert swapped in place by an
+// external rotator is picked up on the next (re)connect without a
+// process restart.
+func (c *CertLoader) GetClientCertificate(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+	return c.current()
+}
+
+// current returns the loaded cert, reloading from disk when the cert
+// file's mtime has advanced. Shared by GetCertificate and
+// GetClientCertificate.
+func (c *CertLoader) current() (*tls.Certificate, error) {
 	fi, statErr := os.Stat(c.certFile)
 
 	c.mu.RLock()
@@ -192,6 +210,45 @@ func FromFiles(certFile, keyFile, caFile string) (*tls.Config, error) {
 		cfg.RootCAs = pool
 	}
 
+	return cfg, nil
+}
+
+// ReloadingClientConfig builds a *tls.Config for an mTLS client whose
+// leaf cert+key are reloaded from disk on every handshake (via
+// [CertLoader.GetClientCertificate]), while the CA trust pool is read
+// once from caFile at construction. It targets long-lived clients —
+// chiefly the NATS log/audit connection — whose short-TTL workload
+// cert is rotated in place by an external agent (cert-agentd): each
+// reconnect re-handshakes and picks up the current leaf, so shipping
+// survives rotation without a restart.
+//
+// certFile and keyFile are required (this is the mTLS path; use
+// [FromFiles] for the optional/plaintext case). The pair is loaded
+// once up front so a missing or malformed cert fails the dial loudly
+// rather than at the first handshake. caFile is optional — empty
+// leaves RootCAs nil (system roots). The CA is deliberately not
+// hot-reloaded: roots are long-lived, only the leaf churns, and a
+// static pool keeps standard server verification (no
+// InsecureSkipVerify) intact.
+func ReloadingClientConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
+	if certFile == "" || keyFile == "" {
+		return nil, fmt.Errorf("client cert and key must both be provided")
+	}
+	loader := NewCertLoader(certFile, keyFile)
+	if _, err := loader.GetClientCertificate(nil); err != nil {
+		return nil, err
+	}
+	cfg := &tls.Config{
+		GetClientCertificate: loader.GetClientCertificate,
+		MinVersion:           tls.VersionTLS12,
+	}
+	if caFile != "" {
+		pool, err := CertPoolFromFile(caFile)
+		if err != nil {
+			return nil, err
+		}
+		cfg.RootCAs = pool
+	}
 	return cfg, nil
 }
 

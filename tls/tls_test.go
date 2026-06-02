@@ -458,3 +458,115 @@ func TestCertPoolFromFile_RejectsBundleWithoutPEM(t *testing.T) {
 		t.Errorf("err = %v, want no-PEM rejection", err)
 	}
 }
+
+// TestCertLoader_GetClientCertificate verifies the client-side
+// callback shares CertLoader's load logic: it returns a cert and
+// picks up an in-place rotation when the cert file's mtime advances.
+func TestCertLoader_GetClientCertificate(t *testing.T) {
+	certFile, keyFile, _ := writeCertKeyFiles(t)
+	loader := NewCertLoader(certFile, keyFile)
+
+	first, err := loader.GetClientCertificate(&tls.CertificateRequestInfo{})
+	if err != nil {
+		t.Fatalf("first GetClientCertificate: %v", err)
+	}
+	if first == nil || len(first.Certificate) == 0 {
+		t.Fatal("expected non-nil certificate")
+	}
+
+	// Write a fresh pair over the same paths, advance mtime, expect reload.
+	newCert, newKey, _ := writeCertKeyFiles(t)
+	overwrite(t, certFile, newCert)
+	overwrite(t, keyFile, newKey)
+	future := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(certFile, future, future); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := loader.GetClientCertificate(&tls.CertificateRequestInfo{})
+	if err != nil {
+		t.Fatalf("second GetClientCertificate: %v", err)
+	}
+	if second == first {
+		t.Error("expected reloaded cert pointer after mtime advance")
+	}
+}
+
+func TestReloadingClientConfig_RequiresCertAndKey(t *testing.T) {
+	if _, err := ReloadingClientConfig("", "", ""); err == nil {
+		t.Fatal("expected error when cert and key are empty")
+	}
+	certFile, _, _ := writeCertKeyFiles(t)
+	if _, err := ReloadingClientConfig(certFile, "", ""); err == nil {
+		t.Fatal("expected error when key is missing")
+	}
+}
+
+func TestReloadingClientConfig_FailsClosedOnMissingCert(t *testing.T) {
+	if _, err := ReloadingClientConfig("/no/such/cert.pem", "/no/such/key.pem", ""); err == nil {
+		t.Fatal("expected error for nonexistent cert/key (eager load)")
+	}
+}
+
+// TestReloadingClientConfig_WiresCallbackAndCA confirms the returned
+// config carries no static Certificates (the callback is the source
+// of truth), populates RootCAs from caFile, and reloads the leaf when
+// the cert file is rotated in place.
+func TestReloadingClientConfig_WiresCallbackAndCA(t *testing.T) {
+	certFile, keyFile, caPEM := writeCertKeyFiles(t)
+	dir := t.TempDir()
+	caFile := filepath.Join(dir, "ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0o600); err != nil {
+		t.Fatalf("write ca: %v", err)
+	}
+
+	cfg, err := ReloadingClientConfig(certFile, keyFile, caFile)
+	if err != nil {
+		t.Fatalf("ReloadingClientConfig: %v", err)
+	}
+	if len(cfg.Certificates) != 0 {
+		t.Error("expected no static Certificates; the callback supplies the leaf")
+	}
+	if cfg.GetClientCertificate == nil {
+		t.Fatal("GetClientCertificate not wired")
+	}
+	if cfg.RootCAs == nil {
+		t.Error("RootCAs not populated from caFile")
+	}
+	if cfg.MinVersion != tls.VersionTLS12 {
+		t.Errorf("MinVersion = %x, want TLS 1.2", cfg.MinVersion)
+	}
+
+	first, err := cfg.GetClientCertificate(&tls.CertificateRequestInfo{})
+	if err != nil {
+		t.Fatalf("callback first call: %v", err)
+	}
+
+	newCert, newKey, _ := writeCertKeyFiles(t)
+	overwrite(t, certFile, newCert)
+	overwrite(t, keyFile, newKey)
+	future := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(certFile, future, future); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := cfg.GetClientCertificate(&tls.CertificateRequestInfo{})
+	if err != nil {
+		t.Fatalf("callback after rotation: %v", err)
+	}
+	if second == first {
+		t.Error("expected callback to surface the rotated leaf")
+	}
+}
+
+// overwrite copies the contents of src into dst (both PEM file paths).
+func overwrite(t *testing.T, dst, src string) {
+	t.Helper()
+	data, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatalf("read %s: %v", src, err)
+	}
+	if err := os.WriteFile(dst, data, 0o600); err != nil {
+		t.Fatalf("write %s: %v", dst, err)
+	}
+}

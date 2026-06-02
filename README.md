@@ -212,7 +212,7 @@ logger = logger.With("site", "tokyo", "module", "api")
 ```go
 type NATSConfig struct {
     URL      string         // empty disables shipping (logger falls back to stdout-only)
-    CertFile string         // mTLS material — paths forwarded to nats.Dial
+    CertFile string         // mTLS material — leaf reloaded per handshake (rotation-safe)
     KeyFile  string
     CAFile   string
 
@@ -232,6 +232,17 @@ self-healing semantics — `RetryOnFailedConnect(true)`, `MaxReconnects(-1)`,
 configurable `ReconnectWait` — so a broker that's down at boot doesn't fail
 process startup. Entries drop on the floor (200-entry buffer) while
 disconnected and resume on reconnect.
+
+When mTLS material is configured, the NATS client presents a freshly reloaded
+leaf on every handshake — via
+[`tls.ReloadingClientConfig`](#reloadingclientconfig--rotation-safe-mtls-client-config)
+— so shipping survives a short-TTL workload cert that an external agent
+(cert-agentd) rotates in place: each reconnect re-reads the cert from disk
+instead of clinging to the copy loaded at boot (which would eventually expire
+and break the handshake). The CA bundle is read once — roots are long-lived,
+only the leaf churns. The extra cost is one `os.Stat` per handshake (at connect
+and reconnect, not per publish), so it's always on; with no cert+key the
+connection is plaintext (dev) or server-auth TLS when only `CAFile` is set.
 
 Three startup outcomes are distinguishable for operators grepping boot logs:
 
@@ -884,14 +895,16 @@ import "github.com/abagile/tokyo3-base/tls"
 type CertLoader struct { /* ... */ }
 
 func NewCertLoader(certFile, keyFile string) *CertLoader
-func (c *CertLoader) GetCertificate(_ *tls.ClientHelloInfo) (*tls.Certificate, error)
+func (c *CertLoader) GetCertificate(_ *tls.ClientHelloInfo) (*tls.Certificate, error)        // server side
+func (c *CertLoader) GetClientCertificate(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) // client side
 ```
 
-`GetCertificate` is shaped to slot directly into `tls.Config.GetCertificate`.
-On every handshake the loader stat-checks the cert file; if the mtime has
-advanced since the last load it reloads the pair and serves the new cert
-from then on. Concurrent stale callers are coalesced through a
-double-checked write lock. When a reload fails (e.g. cert written, key
+`GetCertificate` slots into `tls.Config.GetCertificate` (server) and
+`GetClientCertificate` into `tls.Config.GetClientCertificate` (client); both
+share one stat-and-reload path. On every handshake the loader stat-checks the
+cert file; if the mtime has advanced since the last load it reloads the pair
+and serves the new cert from then on. Concurrent stale callers are coalesced
+through a double-checked write lock. When a reload fails (e.g. cert written, key
 not yet during a rotation) the previously cached cert is returned so
 in-flight handshakes are unaffected.
 
@@ -950,6 +963,41 @@ PEM bytes and just want a `*x509.CertPool` for `RootCAs` / `ClientCAs`.
 `CertPoolFromFile(path)` is the path-taking variant — reads the PEM
 file and rejects bundles with zero certificates so a typo'd path
 doesn't silently disable trust.
+
+### ReloadingClientConfig — rotation-safe mTLS client config
+
+```go
+func ReloadingClientConfig(certFile, keyFile, caFile string) (*tls.Config, error)
+```
+
+`FromFiles` loads the leaf into `tls.Config.Certificates` **once** at build
+time — fine for a long-lived server cert, but a trap for a *client* whose
+short-TTL workload cert is rotated in place: the connection keeps presenting
+the boot-time copy and breaks on the first reconnect after it expires.
+`ReloadingClientConfig` closes that gap by wiring `CertLoader.GetClientCertificate`
+into `GetClientCertificate`, so every handshake (and every reconnect) re-reads
+the current leaf from disk. The CA bundle is read once — roots are long-lived,
+only the leaf churns, so standard server verification stays intact (no
+`InsecureSkipVerify`). `certFile`/`keyFile` are required and eagerly loaded so a
+bad path fails the call rather than the first silent handshake; `caFile` is
+optional (empty ⇒ system roots).
+
+```go
+// e.g. a NATS log/audit client whose cert cert-agentd rotates every ~10 min
+cfg, err := tls.ReloadingClientConfig(
+    "/certs/workload.crt",
+    "/certs/workload.key",
+    "/certs/ca.crt",
+)
+if err != nil { /* ... */ }
+nc, err := nats.Connect(url, nats.Secure(cfg))
+```
+
+The `applog` NATS shipping helper drives this for you whenever
+`NATSConfig.CertFile`/`KeyFile` are set; reach for `ReloadingClientConfig`
+directly when wiring a bespoke long-lived mTLS client. For the server side, or when the CA pool also
+needs hot-reload, use [`CertLoader`](#certloader--hot-reload-certkey-on-disk-change)
+or [`tls/reloader`](#tlsreloader--hot-reload-client-cert--multi-pool-trust).
 
 ### tls/reloader — hot-reload client cert + multi-pool trust
 

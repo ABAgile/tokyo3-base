@@ -1,6 +1,15 @@
 package applog
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -101,6 +110,93 @@ func TestDialLogNATS_UnreachableURL_RetriesInBackground(t *testing.T) {
 	// but calling it must not panic.
 	_ = nc.Drain()
 	nc.Close()
+}
+
+// TestDialLogNATS_MTLS_MissingFiles: cert/key paths that don't exist
+// must fail closed at config-build time — the eager load in
+// ReloadingClientConfig surfaces a bad path before the dial rather
+// than at the first (silent) handshake.
+func TestDialLogNATS_MTLS_MissingFiles(t *testing.T) {
+	nc, err := dialLogNATS(NATSConfig{
+		URL:      "nats://127.0.0.1:1",
+		CertFile: "/no/such/cert.pem",
+		KeyFile:  "/no/such/key.pem",
+	})
+	if err == nil {
+		t.Fatalf("expected error for missing mTLS files; nc=%v", nc)
+	}
+	if !strings.Contains(err.Error(), "log shipping") {
+		t.Errorf("err = %v, want it wrapped with \"log shipping\"", err)
+	}
+}
+
+// TestDialLogNATS_MTLS_QueuesConn: with a valid cert+key+CA the helper
+// builds the reloading TLS config and dials. The broker is
+// unreachable, but RetryOnFailedConnect means a non-nil conn is queued
+// without error — proving the mTLS branch reaches nats.Connect.
+func TestDialLogNATS_MTLS_QueuesConn(t *testing.T) {
+	certFile, keyFile, caFile := writeMTLSCertFiles(t)
+	nc, err := dialLogNATS(NATSConfig{
+		URL:      "nats://127.0.0.1:1",
+		CertFile: certFile,
+		KeyFile:  keyFile,
+		CAFile:   caFile,
+		Timeout:  500 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("mTLS dial should not error on unreachable broker: %v", err)
+	}
+	if nc == nil {
+		t.Fatal("nc is nil — expected a conn queued for reconnect")
+	}
+	_ = nc.Drain()
+	nc.Close()
+}
+
+// writeMTLSCertFiles generates a self-signed ECDSA cert/key pair on
+// disk plus a CA file (the same self-signed cert) and returns their
+// paths. Enough for ReloadingClientConfig's eager load + CA pool.
+func writeMTLSCertFiles(t *testing.T) (certFile, keyFile, caFile string) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		t.Fatalf("generate serial: %v", err)
+	}
+	now := time.Now()
+	tmpl := &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: "test"},
+		NotBefore:    now.Add(-time.Minute),
+		NotAfter:     now.Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		DNSNames:     []string{"localhost"},
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create cert: %v", err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatalf("marshal key: %v", err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+
+	dir := t.TempDir()
+	certFile = filepath.Join(dir, "cert.pem")
+	keyFile = filepath.Join(dir, "key.pem")
+	caFile = filepath.Join(dir, "ca.pem")
+	for path, data := range map[string][]byte{certFile: certPEM, keyFile: keyPEM, caFile: certPEM} {
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+	return certFile, keyFile, caFile
 }
 
 // TestAppLoggerWithNATS_InstanceSuffixesSubjectAndLogs verifies the
