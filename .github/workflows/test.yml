@@ -24,10 +24,12 @@ jobs:
       - run: |
           which staticcheck || go install honnef.co/go/tools/cmd/staticcheck@latest
           which gopls       || go install golang.org/x/tools/gopls@latest
+          which govulncheck || go install golang.org/x/vuln/cmd/govulncheck@latest
 
       - run: go vet ./...
       - run: staticcheck ./...
       - run: find . -type f -name "*.go" -print0 | xargs -0 -n 100 gopls check -severity=hint
+      - run: govulncheck ./...
 
       - run: go test ./... -coverprofile=coverage.out
 

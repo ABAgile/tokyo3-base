@@ -1,6 +1,6 @@
 module github.com/abagile/tokyo3-base
 
-go 1.26.3
+go 1.26.4
 
 require (
 	github.com/ColeBurch/pgx-govalues-decimal v0.1.0
@@ -11,7 +11,7 @@ require (
 	github.com/nats-io/nats.go v1.50.0
 	github.com/phuslu/log v1.0.124
 	github.com/stretchr/testify v1.11.1
-	golang.org/x/crypto v0.50.0
+	golang.org/x/crypto v0.52.0
 	golang.org/x/sync v0.20.0
 )
 
@@ -25,8 +25,8 @@ require (
 	github.com/nats-io/nkeys v0.4.15 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
-	golang.org/x/net v0.53.0 // indirect
-	golang.org/x/sys v0.43.0 // indirect
-	golang.org/x/text v0.36.0 // indirect
+	golang.org/x/net v0.55.0 // indirect
+	golang.org/x/sys v0.45.0 // indirect
+	golang.org/x/text v0.37.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
