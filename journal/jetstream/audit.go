@@ -1,6 +1,7 @@
 package jetstream
 
 import (
+	"crypto/tls"
 	"fmt"
 	"log/slog"
 
@@ -18,7 +19,13 @@ import (
 // "CERTD_NATS_URL not set — audit sink is no-op; not for production").
 // Required.
 //
-// CertFile / KeyFile / CAFile are passed straight through to
+// CertFile / KeyFile / CAFile name the connection's TLS material.
+// With a full cert+key pair the leaf is reloaded from disk on every
+// handshake and the CA pool re-read on mtime change (via
+// [btls.ReloadingClientConfig], matching the log shipper), so a
+// cert-agentd rotation of the short-TTL workload cert — or of the CA
+// bundle — is picked up on the next reconnect without a daemon
+// restart; CA-only falls back to one-shot server-auth TLS via
 // [btls.FromFiles]. Each binary owns the env-var fallback chain that
 // produces these paths — keeping that policy in cmd/ lets daemons
 // share NATS material with other transports without this package
@@ -58,7 +65,7 @@ func NewAuditSink[T any](cfg AuditSinkConfig) (*journal.EncodedSink[T], error) {
 		}
 		return journal.NewJSONSink[T](journal.NoopSink{}), nil
 	}
-	tlsCfg, err := btls.FromFiles(cfg.CertFile, cfg.KeyFile, cfg.CAFile)
+	tlsCfg, err := auditTLS(cfg.CertFile, cfg.KeyFile, cfg.CAFile)
 	if err != nil {
 		return nil, fmt.Errorf("nats audit TLS: %w", err)
 	}
@@ -123,7 +130,7 @@ func NewAuditSource(cfg AuditSourceConfig) (journal.Source, error) {
 		}
 		return journal.NoopSource{}, nil
 	}
-	tlsCfg, err := btls.FromFiles(cfg.CertFile, cfg.KeyFile, cfg.CAFile)
+	tlsCfg, err := auditTLS(cfg.CertFile, cfg.KeyFile, cfg.CAFile)
 	if err != nil {
 		return nil, fmt.Errorf("nats audit source TLS: %w", err)
 	}
@@ -131,4 +138,20 @@ func NewAuditSource(cfg AuditSourceConfig) (journal.Source, error) {
 		URL: cfg.URL, StreamName: cfg.StreamName, Subject: cfg.Subject,
 		TLS: tlsCfg, Log: cfg.Log,
 	})
+}
+
+// auditTLS builds the NATS connection's TLS config. A full cert+key
+// pair gets a config whose leaf is reloaded from disk on every
+// handshake and whose CA pool is re-read on mtime change — the same
+// contract dialLogNATS gives the log shipper — so both channels
+// survive in-place rotation of the workload cert and the CA bundle.
+// Anything short of a pair falls through to one-shot
+// [btls.FromFiles]: server-auth TLS when only CAFile is set, nil
+// (plaintext) when no material is configured, and the mismatched
+// cert-without-key cases keep FromFiles' fail-closed errors.
+func auditTLS(certFile, keyFile, caFile string) (*tls.Config, error) {
+	if certFile != "" && keyFile != "" {
+		return btls.ReloadingClientConfig(certFile, keyFile, caFile)
+	}
+	return btls.FromFiles(certFile, keyFile, caFile)
 }

@@ -239,10 +239,11 @@ leaf on every handshake — via
 — so shipping survives a short-TTL workload cert that an external agent
 (cert-agentd) rotates in place: each reconnect re-reads the cert from disk
 instead of clinging to the copy loaded at boot (which would eventually expire
-and break the handshake). The CA bundle is read once — roots are long-lived,
-only the leaf churns. The extra cost is one `os.Stat` per handshake (at connect
-and reconnect, not per publish), so it's always on; with no cert+key the
-connection is plaintext (dev) or server-auth TLS when only `CAFile` is set.
+and break the handshake). The CA bundle hot-reloads too — server verification
+runs against a pool re-read when the file's mtime advances, so a CA rotation
+also lands without a restart. The extra cost is an `os.Stat` per handshake (at
+connect and reconnect, not per publish), so it's always on; with no cert+key
+the connection is plaintext (dev) or server-auth TLS when only `CAFile` is set.
 
 Three startup outcomes are distinguishable for operators grepping boot logs:
 
@@ -976,11 +977,16 @@ short-TTL workload cert is rotated in place: the connection keeps presenting
 the boot-time copy and breaks on the first reconnect after it expires.
 `ReloadingClientConfig` closes that gap by wiring `CertLoader.GetClientCertificate`
 into `GetClientCertificate`, so every handshake (and every reconnect) re-reads
-the current leaf from disk. The CA bundle is read once — roots are long-lived,
-only the leaf churns, so standard server verification stays intact (no
-`InsecureSkipVerify`). `certFile`/`keyFile` are required and eagerly loaded so a
-bad path fails the call rather than the first silent handshake; `caFile` is
-optional (empty ⇒ system roots).
+the current leaf from disk. The CA bundle hot-reloads the same way: when
+`caFile` is set, server verification runs through `CALoader.VerifyConnection`
+against a pool that's re-read when the file's mtime advances (the config
+carries `InsecureSkipVerify` because the standard verifier freezes `RootCAs`
+at construction — `VerifyConnection` provides equivalent chain + hostname
+verification against the live pool, the same shape `tls/reloader` uses). A
+failed re-read keeps the previous pool live, so a corrupt drop-in never opens
+a trust window. `certFile`/`keyFile` are required and eagerly loaded so a bad
+path fails the call rather than the first silent handshake; `caFile` is
+optional (empty ⇒ system roots, standard verification).
 
 ```go
 // e.g. a NATS log/audit client whose cert cert-agentd rotates every ~10 min
@@ -995,9 +1001,10 @@ nc, err := nats.Connect(url, nats.Secure(cfg))
 
 The `applog` NATS shipping helper drives this for you whenever
 `NATSConfig.CertFile`/`KeyFile` are set; reach for `ReloadingClientConfig`
-directly when wiring a bespoke long-lived mTLS client. For the server side, or when the CA pool also
-needs hot-reload, use [`CertLoader`](#certloader--hot-reload-certkey-on-disk-change)
-or [`tls/reloader`](#tlsreloader--hot-reload-client-cert--multi-pool-trust).
+directly when wiring a bespoke long-lived mTLS client. For the server side
+use [`CertLoader`](#certloader--hot-reload-certkey-on-disk-change); for
+multi-pool trust or poll-driven refresh, use
+[`tls/reloader`](#tlsreloader--hot-reload-client-cert--multi-pool-trust).
 
 ### tls/reloader — hot-reload client cert + multi-pool trust
 
@@ -1680,6 +1687,15 @@ URL empty returns a typed sink wrapping `journal.NoopSink` — safe to
 shape for the read side and returns `journal.NoopSource{}` when URL
 is empty (downstream UI renders empty, mirroring the no-broker
 dev story).
+
+With a full cert+key pair, the connection's TLS config reloads the
+leaf from disk on every handshake and re-reads the CA pool when its
+file's mtime advances (via
+[`tls.ReloadingClientConfig`](#reloadingclientconfig--rotation-safe-mtls-client-config),
+same contract as the log shipper), so audit publishing and reads
+survive in-place rotation of both the short-TTL workload cert and
+the CA bundle without a daemon restart. CA-only stays one-shot
+server-auth TLS; no material stays plaintext (dev).
 
 ### `journal/sse` — generic Server-Sent-Events handler
 

@@ -510,8 +510,9 @@ func TestReloadingClientConfig_FailsClosedOnMissingCert(t *testing.T) {
 
 // TestReloadingClientConfig_WiresCallbackAndCA confirms the returned
 // config carries no static Certificates (the callback is the source
-// of truth), populates RootCAs from caFile, and reloads the leaf when
-// the cert file is rotated in place.
+// of truth), verifies servers against the live CA pool (via
+// VerifyConnection + InsecureSkipVerify, not a frozen RootCAs), and
+// reloads the leaf when the cert file is rotated in place.
 func TestReloadingClientConfig_WiresCallbackAndCA(t *testing.T) {
 	certFile, keyFile, caPEM := writeCertKeyFiles(t)
 	dir := t.TempDir()
@@ -530,8 +531,11 @@ func TestReloadingClientConfig_WiresCallbackAndCA(t *testing.T) {
 	if cfg.GetClientCertificate == nil {
 		t.Fatal("GetClientCertificate not wired")
 	}
-	if cfg.RootCAs == nil {
-		t.Error("RootCAs not populated from caFile")
+	if cfg.RootCAs != nil {
+		t.Error("RootCAs set — a frozen pool defeats CA hot-reload")
+	}
+	if cfg.VerifyConnection == nil || !cfg.InsecureSkipVerify {
+		t.Error("VerifyConnection + InsecureSkipVerify not wired for live-pool verification")
 	}
 	if cfg.MinVersion != tls.VersionTLS12 {
 		t.Errorf("MinVersion = %x, want TLS 1.2", cfg.MinVersion)
@@ -568,5 +572,107 @@ func overwrite(t *testing.T, dst, src string) {
 	}
 	if err := os.WriteFile(dst, data, 0o600); err != nil {
 		t.Fatalf("write %s: %v", dst, err)
+	}
+}
+
+func TestReloadingClientConfig_FailsClosedOnMissingCA(t *testing.T) {
+	certFile, keyFile, _ := writeCertKeyFiles(t)
+	if _, err := ReloadingClientConfig(certFile, keyFile, "/no/such/ca.pem"); err == nil {
+		t.Fatal("expected error for nonexistent CA file (eager load)")
+	}
+}
+
+// TestCALoader_VerifyConnection_LivePool proves the CA pool is read
+// live: a peer that verifies against the initial bundle must stop
+// verifying after the bundle is rotated to a different CA in place —
+// the exact behavior a frozen RootCAs cannot provide.
+func TestCALoader_VerifyConnection_LivePool(t *testing.T) {
+	certA, _, caAPEM := writeCertKeyFiles(t)
+	_, _, caBPEM := writeCertKeyFiles(t)
+
+	dir := t.TempDir()
+	caFile := filepath.Join(dir, "ca.pem")
+	if err := os.WriteFile(caFile, caAPEM, 0o600); err != nil {
+		t.Fatalf("write ca: %v", err)
+	}
+
+	pemData, err := os.ReadFile(certA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, _ := pem.Decode(pemData)
+	peer, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("parse peer cert: %v", err)
+	}
+	cs := tls.ConnectionState{
+		PeerCertificates: []*x509.Certificate{peer},
+		ServerName:       "localhost",
+	}
+
+	loader := NewCALoader(caFile)
+	if err := loader.VerifyConnection(cs); err != nil {
+		t.Fatalf("verify against original CA: %v", err)
+	}
+
+	// Rotate the bundle to an unrelated CA; bump mtime for coarse
+	// filesystems. The same peer must now fail verification.
+	if err := os.WriteFile(caFile, caBPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(caFile, future, future); err != nil {
+		t.Fatal(err)
+	}
+	if err := loader.VerifyConnection(cs); err == nil {
+		t.Error("peer still verifies after CA rotation — pool is frozen, not live")
+	}
+}
+
+// TestCALoader_KeepsPoolAcrossFailedReload: a corrupt drop-in (or a
+// rotation caught mid-write) must not open a trust window or kill
+// reconnects — the previous pool stays live.
+func TestCALoader_KeepsPoolAcrossFailedReload(t *testing.T) {
+	certA, _, caAPEM := writeCertKeyFiles(t)
+	dir := t.TempDir()
+	caFile := filepath.Join(dir, "ca.pem")
+	if err := os.WriteFile(caFile, caAPEM, 0o600); err != nil {
+		t.Fatalf("write ca: %v", err)
+	}
+
+	loader := NewCALoader(caFile)
+	if _, err := loader.Pool(); err != nil {
+		t.Fatalf("initial load: %v", err)
+	}
+
+	if err := os.WriteFile(caFile, []byte("not pem"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(caFile, future, future); err != nil {
+		t.Fatal(err)
+	}
+
+	pool, err := loader.Pool()
+	if err != nil || pool == nil {
+		t.Fatalf("Pool after corrupt drop-in: pool=%v err=%v, want previous pool kept", pool, err)
+	}
+
+	// The kept pool must still verify the original peer.
+	pemData, err := os.ReadFile(certA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, _ := pem.Decode(pemData)
+	peer, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs := tls.ConnectionState{
+		PeerCertificates: []*x509.Certificate{peer},
+		ServerName:       "localhost",
+	}
+	if err := loader.VerifyConnection(cs); err != nil {
+		t.Errorf("verify with kept pool: %v", err)
 	}
 }

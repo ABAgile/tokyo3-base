@@ -4,7 +4,8 @@
 // CertLoader stat-checks the cert file on every handshake and reloads when the
 // mtime changes; assign GetCertificate to tls.Config.GetCertificate so a
 // rotation tool (cert-manager, SPIFFE/SPIRE-in-disk-mode, ACME, manual) can
-// replace cert/key files without a server restart.
+// replace cert/key files without a server restart. CALoader is its trust-side
+// sibling for CA bundles, wired via tls.Config.VerifyConnection.
 //
 // SelfSignedCert generates an ephemeral cert covering localhost and
 // *.localhost — useful as a fallback when no cert files are configured.
@@ -23,6 +24,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
 	"net"
@@ -213,23 +215,113 @@ func FromFiles(certFile, keyFile, caFile string) (*tls.Config, error) {
 	return cfg, nil
 }
 
+// CALoader hot-reloads a CA bundle from disk when the file's mtime
+// changes, mirroring [CertLoader] for the trust side: wire
+// (*CALoader).VerifyConnection into tls.Config.VerifyConnection (with
+// InsecureSkipVerify set, since the standard verifier freezes RootCAs
+// at config construction) so a CA rotation dropped in place is
+// honored on the next handshake without a process restart.
+//
+// If a reload fails (rotation in progress, corrupt drop-in), the
+// previously loaded pool is kept so a bad write never opens a trust
+// window or kills in-flight reconnects.
+type CALoader struct {
+	caFile  string
+	mu      sync.RWMutex
+	pool    *x509.CertPool
+	modTime time.Time
+}
+
+// NewCALoader creates a CALoader. The bundle is loaded lazily on
+// first use; call [CALoader.Pool] eagerly to fail fast on a missing
+// or malformed file.
+func NewCALoader(caFile string) *CALoader {
+	return &CALoader{caFile: caFile}
+}
+
+// Pool returns the loaded CA pool, re-reading the file when its
+// mtime has advanced. Shared by VerifyConnection and eager startup
+// checks.
+func (l *CALoader) Pool() (*x509.CertPool, error) {
+	fi, statErr := os.Stat(l.caFile)
+
+	l.mu.RLock()
+	upToDate := l.pool != nil && statErr == nil && !fi.ModTime().After(l.modTime)
+	if upToDate {
+		pool := l.pool
+		l.mu.RUnlock()
+		return pool, nil
+	}
+	l.mu.RUnlock()
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// Double-check under write lock.
+	if l.pool != nil && statErr == nil && !fi.ModTime().After(l.modTime) {
+		return l.pool, nil
+	}
+
+	pool, err := CertPoolFromFile(l.caFile)
+	if err != nil {
+		// Keep the previous pool live across a failed reload.
+		if l.pool != nil {
+			return l.pool, nil
+		}
+		return nil, err
+	}
+	l.pool = pool
+	if statErr == nil {
+		l.modTime = fi.ModTime()
+	}
+	return l.pool, nil
+}
+
+// VerifyConnection runs full chain + hostname verification against
+// the current pool snapshot. Same verification shape as
+// reloader.Reloader.VerifyConnection: roots from the live pool,
+// intermediates from the peer chain, DNSName from the connection's
+// SNI.
+func (l *CALoader) VerifyConnection(cs tls.ConnectionState) error {
+	pool, err := l.Pool()
+	if err != nil {
+		return fmt.Errorf("ca bundle: %w", err)
+	}
+	if len(cs.PeerCertificates) == 0 {
+		return errors.New("peer presented no certificates")
+	}
+	opts := x509.VerifyOptions{
+		Roots:         pool,
+		DNSName:       cs.ServerName,
+		Intermediates: x509.NewCertPool(),
+	}
+	for _, cert := range cs.PeerCertificates[1:] {
+		opts.Intermediates.AddCert(cert)
+	}
+	_, err = cs.PeerCertificates[0].Verify(opts)
+	return err
+}
+
 // ReloadingClientConfig builds a *tls.Config for an mTLS client whose
 // leaf cert+key are reloaded from disk on every handshake (via
-// [CertLoader.GetClientCertificate]), while the CA trust pool is read
-// once from caFile at construction. It targets long-lived clients —
-// chiefly the NATS log/audit connection — whose short-TTL workload
-// cert is rotated in place by an external agent (cert-agentd): each
-// reconnect re-handshakes and picks up the current leaf, so shipping
-// survives rotation without a restart.
+// [CertLoader.GetClientCertificate]) and whose CA trust pool is
+// re-read from caFile when its mtime advances (via
+// [CALoader.VerifyConnection]). It targets long-lived clients —
+// chiefly the NATS log/audit connection — whose TLS material is
+// rotated in place by an external agent (cert-agentd): each reconnect
+// re-handshakes and picks up the current leaf and roots, so shipping
+// survives both leaf and CA rotation without a restart.
 //
 // certFile and keyFile are required (this is the mTLS path; use
-// [FromFiles] for the optional/plaintext case). The pair is loaded
-// once up front so a missing or malformed cert fails the dial loudly
-// rather than at the first handshake. caFile is optional — empty
-// leaves RootCAs nil (system roots). The CA is deliberately not
-// hot-reloaded: roots are long-lived, only the leaf churns, and a
-// static pool keeps standard server verification (no
-// InsecureSkipVerify) intact.
+// [FromFiles] for the optional/plaintext case). Both the pair and the
+// CA bundle are loaded once up front so missing or malformed material
+// fails the dial loudly rather than at the first handshake. caFile is
+// optional — empty leaves RootCAs nil (system roots, standard
+// verification). When caFile is set the config carries
+// InsecureSkipVerify with [CALoader.VerifyConnection] providing
+// equivalent chain + hostname verification against the live pool —
+// the standard verifier freezes RootCAs at construction, which is
+// exactly what hot-reload must avoid.
 func ReloadingClientConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
 	if certFile == "" || keyFile == "" {
 		return nil, fmt.Errorf("client cert and key must both be provided")
@@ -243,11 +335,12 @@ func ReloadingClientConfig(certFile, keyFile, caFile string) (*tls.Config, error
 		MinVersion:           tls.VersionTLS12,
 	}
 	if caFile != "" {
-		pool, err := CertPoolFromFile(caFile)
-		if err != nil {
+		ca := NewCALoader(caFile)
+		if _, err := ca.Pool(); err != nil {
 			return nil, err
 		}
-		cfg.RootCAs = pool
+		cfg.InsecureSkipVerify = true //nolint:gosec // VerifyConnection provides equivalent verification against the live pool.
+		cfg.VerifyConnection = ca.VerifyConnection
 	}
 	return cfg, nil
 }

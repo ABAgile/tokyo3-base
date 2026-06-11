@@ -72,9 +72,10 @@ type NATSConfig struct {
 //     stalled NATS publish can't apply backpressure on a hot
 //     logging path.
 //   - When mTLS material is configured, the leaf is reloaded from
-//     disk on every handshake, so a cert-agentd rotation of the
-//     short-TTL workload cert is picked up on the next reconnect
-//     without restarting the daemon.
+//     disk on every handshake and the CA pool is re-read when its
+//     file's mtime advances, so a cert-agentd rotation of the
+//     short-TTL workload cert — or of the CA bundle — is picked up
+//     on the next reconnect without restarting the daemon.
 //
 // Dial-time errors (malformed URL, missing TLS material) are NOT
 // fatal — they're logged on the returned logger as a Warn and
@@ -154,8 +155,9 @@ func dialLogNATS(cfg NATSConfig) (*nats.Conn, error) {
 	}
 
 	// mTLS path: hand NATS a tls.Config that reloads the leaf on every
-	// handshake, so the short-TTL workload cert cert-agentd rotates in
-	// place is re-read on each reconnect rather than frozen at dial.
+	// handshake and re-reads the CA pool on mtime change, so material
+	// cert-agentd rotates in place is re-read on each reconnect rather
+	// than frozen at dial.
 	// nats.Secure leads the timing opts (empty file args → bnats.Dial
 	// adds no TLS of its own, leaving ours authoritative). Anything
 	// short of a cert+key pair falls through to bnats.Dial's own
