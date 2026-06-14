@@ -24,7 +24,7 @@ go get github.com/abagile/tokyo3-base
 - [api/google — Google Maps / Places client](#apigoogle--google-maps--places-client)
 - [crypto/ — AES-256-GCM and envelope encryption](#crypto--aes-256-gcm-and-envelope-encryption)
 - [nats/ — NATS dial helper](#nats--nats-dial-helper)
-- [tls/ — TLS config and self-signed cert helpers](#tls--tls-config-and-self-signed-cert-helpers)
+- [tls/ — stateless TLS helpers](#tls--stateless-tls-helpers)
 - [auth/ — auth primitives namespace](#auth--auth-primitives-namespace)
 - [journal/ — Append-only durable event journal](#journal--append-only-durable-event-journal)
 
@@ -235,7 +235,7 @@ disconnected and resume on reconnect.
 
 When mTLS material is configured, the NATS client presents a freshly reloaded
 leaf on every handshake — via
-[`tls.ReloadingClientConfig`](#reloadingclientconfig--rotation-safe-mtls-client-config)
+[`reloader.ClientConfig`](#clientconfig--single-pool-rotation-safe-mtls-client-config)
 — so shipping survives a short-TTL workload cert that an external agent
 (cert-agentd) rotates in place: each reconnect re-reads the cert from disk
 instead of clinging to the copy loaded at boot (which would eventually expire
@@ -879,47 +879,20 @@ externally-owned `*nats.Conn`).
 
 ---
 
-## tls/ — TLS config and self-signed cert helpers
+## tls/ — stateless TLS helpers
 
-Helpers for the boring parts of running a TLS server or client without
-inventing your own PKI: hot-reload a cert/key pair on rotation, build
-`*tls.Config` from PEM files or strings, and ship a self-signed dev
-fallback that covers `localhost`, `*.localhost`, and loopback IPs.
+Pure helpers for the boring parts of running a TLS server or client
+without inventing your own PKI: build `*tls.Config` from PEM files or
+strings, parse a trust pool, verify a peer chain, and ship a self-signed
+dev fallback covering `localhost`, `*.localhost`, and loopback IPs.
+Everything here reads its inputs once and returns — no caching, no
+goroutines. For material that rotates under a running process (leaf
+reloaded per handshake, CA pool re-read on change), see
+[`tls/reloader`](#tlsreloader--hot-reload-loaders--multi-pool-orchestrator).
 
 ```go
 import "github.com/abagile/tokyo3-base/tls"
 ```
-
-### CertLoader — hot-reload cert/key on disk change
-
-```go
-type CertLoader struct { /* ... */ }
-
-func NewCertLoader(certFile, keyFile string) *CertLoader
-func (c *CertLoader) GetCertificate(_ *tls.ClientHelloInfo) (*tls.Certificate, error)        // server side
-func (c *CertLoader) GetClientCertificate(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) // client side
-```
-
-`GetCertificate` slots into `tls.Config.GetCertificate` (server) and
-`GetClientCertificate` into `tls.Config.GetClientCertificate` (client); both
-share one stat-and-reload path. On every handshake the loader stat-checks the
-cert file; if the mtime has advanced since the last load it reloads the pair
-and serves the new cert from then on. Concurrent stale callers are coalesced
-through a double-checked write lock. When a reload fails (e.g. cert written, key
-not yet during a rotation) the previously cached cert is returned so
-in-flight handshakes are unaffected.
-
-```go
-loader := tls.NewCertLoader("/etc/tls/server.crt", "/etc/tls/server.key")
-srv := &http.Server{
-    Addr:      ":443",
-    TLSConfig: &tls.Config{GetCertificate: loader.GetCertificate},
-}
-srv.ListenAndServeTLS("", "")  // empty paths — cert comes from GetCertificate
-```
-
-Pairs naturally with cert-manager, ACME tooling, SPIFFE/SPIRE in disk
-mode, or any rotation tool that overwrites the cert/key files in place.
 
 ### SelfSignedCert — ephemeral dev fallback
 
@@ -937,9 +910,11 @@ resolve cleanly.
 ### Building `*tls.Config`
 
 ```go
-func CertPoolFromPEM(pemData []byte)                 (*x509.CertPool, error)
-func FromFiles      (certFile, keyFile, caFile string) (*tls.Config,  error)
-func FromPEM        (certPEM,  keyPEM,  caPEM  string) (*tls.Config,  error)
+func CertPoolFromPEM (pemData []byte)                   (*x509.CertPool, error)
+func CertPoolFromFile(path string)                      (*x509.CertPool, error)
+func FromFiles       (certFile, keyFile, caFile string) (*tls.Config,   error)
+func FromPEM         (certPEM,  keyPEM,  caPEM  string) (*tls.Config,   error)
+func VerifyPeerChain (roots *x509.CertPool, cs tls.ConnectionState) error
 ```
 
 `FromFiles` and `FromPEM` are symmetrical: one takes paths, the other
@@ -965,32 +940,98 @@ PEM bytes and just want a `*x509.CertPool` for `RootCAs` / `ClientCAs`.
 file and rejects bundles with zero certificates so a typo'd path
 doesn't silently disable trust.
 
-### ReloadingClientConfig — rotation-safe mTLS client config
+`VerifyPeerChain` runs chain + hostname verification of a peer against a
+root pool (roots as anchors, intermediates from the rest of the peer
+chain, SNI as the DNS name). Standalone it's a one-shot check; it's also
+the verification primitive the hot-reload loaders in `tls/reloader` pair
+with `InsecureSkipVerify` to verify against a live, swappable pool.
+
+### tls/reloader — hot-reload loaders + multi-pool orchestrator
 
 ```go
-func ReloadingClientConfig(certFile, keyFile, caFile string) (*tls.Config, error)
+import "github.com/abagile/tokyo3-base/tls/reloader"
 ```
 
-`FromFiles` loads the leaf into `tls.Config.Certificates` **once** at build
-time — fine for a long-lived server cert, but a trap for a *client* whose
-short-TTL workload cert is rotated in place: the connection keeps presenting
-the boot-time copy and breaks on the first reconnect after it expires.
-`ReloadingClientConfig` closes that gap by wiring `CertLoader.GetClientCertificate`
-into `GetClientCertificate`, so every handshake (and every reconnect) re-reads
-the current leaf from disk. The CA bundle hot-reloads the same way: when
-`caFile` is set, server verification runs through `CALoader.VerifyConnection`
-against a pool that's re-read when the file's mtime advances (the config
-carries `InsecureSkipVerify` because the standard verifier freezes `RootCAs`
-at construction — `VerifyConnection` provides equivalent chain + hostname
-verification against the live pool, the same shape `tls/reloader` uses). A
-failed re-read keeps the previous pool live, so a corrupt drop-in never opens
-a trust window. `certFile`/`keyFile` are required and eagerly loaded so a bad
-path fails the call rather than the first silent handshake; `caFile` is
-optional (empty ⇒ system roots, standard verification).
+Everything stateful: TLS material that rotates under a running process
+without a restart. Three tiers, low to high — the loaders, the
+single-pool client shortcut, and the named multi-pool orchestrator.
+
+#### CertLoader / CALoader — the reloading primitives
+
+```go
+type CertLoader struct {
+    OnSwap  func(cert *tls.Certificate, mtime time.Time)  // optional observation hooks
+    OnError func(err error)
+    /* ... */
+}
+
+func NewCertLoader(certFile, keyFile string) *CertLoader
+func (c *CertLoader) GetCertificate(_ *tls.ClientHelloInfo) (*tls.Certificate, error)        // server side
+func (c *CertLoader) GetClientCertificate(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) // client side
+func (c *CertLoader) Reload() error                                                          // forced, bypasses the mtime gate
+
+type CALoader struct {
+    OnSwap  func(raw []byte, mtime time.Time)  // raw PEM, for fingerprinting
+    OnError func(err error)
+    /* ... */
+}
+
+func NewCALoader(caFile string) *CALoader
+func (l *CALoader) Pool() (*x509.CertPool, error)
+func (l *CALoader) VerifyConnection(cs tls.ConnectionState) error
+```
+
+`CertLoader.GetCertificate` slots into `tls.Config.GetCertificate` (server)
+and `GetClientCertificate` into `tls.Config.GetClientCertificate` (client);
+both share one stat-and-reload path. On every handshake the loader
+stat-checks the cert file; if the mtime has advanced it reloads the pair
+and serves the new cert from then on. Concurrent stale callers are coalesced
+through a double-checked write lock. When a reload fails (e.g. cert written,
+key not yet during a rotation) the previously cached cert is returned so
+in-flight handshakes are unaffected. `Reload()` re-reads regardless of mtime
+— for rotators whose write may not advance the mtime past the cached value
+(same-second coalescing).
+
+`CALoader` is the trust-side sibling: wire `VerifyConnection` into
+`tls.Config.VerifyConnection` (with `InsecureSkipVerify`, since the standard
+verifier freezes `RootCAs` at construction) so a CA bundle dropped in place
+is honored on the next handshake. The `OnSwap`/`OnError` hooks on both are
+observation seams the `Reloader` orchestrator uses for swap/failure logging;
+a failed re-read keeps the previous cert/pool live so a corrupt drop-in
+never opens a trust window.
+
+```go
+// server cert that cert-manager / SPIFFE / ACME rotates in place:
+loader := reloader.NewCertLoader("/etc/tls/server.crt", "/etc/tls/server.key")
+srv := &http.Server{
+    Addr:      ":443",
+    TLSConfig: &tls.Config{GetCertificate: loader.GetCertificate},
+}
+srv.ListenAndServeTLS("", "")  // empty paths — cert comes from GetCertificate
+```
+
+#### ClientConfig — single-pool rotation-safe mTLS client config
+
+```go
+func ClientConfig(certFile, keyFile, caFile string) (*tls.Config, error)
+```
+
+`tls.FromFiles` loads the leaf into `tls.Config.Certificates` **once** at
+build time — fine for a long-lived server cert, but a trap for a *client*
+whose short-TTL workload cert is rotated in place: the connection keeps
+presenting the boot-time copy and breaks on the first reconnect after it
+expires. `ClientConfig` closes that gap by composing the two loaders — the
+leaf reloads per handshake via `CertLoader.GetClientCertificate`, and the CA
+pool re-reads on mtime change via `CALoader.VerifyConnection` (the config
+carries `InsecureSkipVerify`; verification runs against the live pool). A
+failed re-read keeps the previous pool live. `certFile`/`keyFile` are
+required and eagerly loaded so a bad path fails the call rather than the
+first silent handshake; `caFile` is optional (empty ⇒ system roots,
+standard verification).
 
 ```go
 // e.g. a NATS log/audit client whose cert cert-agentd rotates every ~10 min
-cfg, err := tls.ReloadingClientConfig(
+cfg, err := reloader.ClientConfig(
     "/certs/workload.crt",
     "/certs/workload.key",
     "/certs/ca.crt",
@@ -1000,17 +1041,12 @@ nc, err := nats.Connect(url, nats.Secure(cfg))
 ```
 
 The `applog` NATS shipping helper drives this for you whenever
-`NATSConfig.CertFile`/`KeyFile` are set; reach for `ReloadingClientConfig`
-directly when wiring a bespoke long-lived mTLS client. For the server side
-use [`CertLoader`](#certloader--hot-reload-certkey-on-disk-change); for
-multi-pool trust or poll-driven refresh, use
-[`tls/reloader`](#tlsreloader--hot-reload-client-cert--multi-pool-trust).
+`NATSConfig.CertFile`/`KeyFile` are set; reach for `ClientConfig` directly
+when wiring a bespoke long-lived single-pool mTLS client. For named
+multi-pool trust, expiry telemetry, and poll/refresh disciplines, use the
+`Reloader` orchestrator below.
 
-### tls/reloader — hot-reload client cert + multi-pool trust
-
-```go
-import "github.com/abagile/tokyo3-base/tls/reloader"
-```
+#### Reloader — named multi-pool orchestrator
 
 For **client-side** mTLS where the workload cert+key and one or more CA
 trust pools rotate from under a running daemon — typical of cert-agentd
@@ -1046,16 +1082,23 @@ the standard verifier freezes `RootCAs` at config-construction, so
 hot-reload uses `VerifyConnection` against a per-handshake pool snapshot
 instead.
 
-Two reload disciplines, picked per use case:
+The mechanics are the primitives above — one `CertLoader` for the pair,
+one `CALoader` per file-backed pool — so material whose file mtime has
+advanced is also picked up lazily at the next handshake, with swap and
+failure logging wired through the loaders' `OnSwap`/`OnError` hooks. On
+top of that, two refresh disciplines, picked per use case:
 
 - **Explicit refresh** (`PollCert: false`): caller invokes `r.Refresh()`
   from wherever a new cert lands — typically a renewer's `OnRenewed`
-  callback. Suits binaries that mint their own certs in-process.
-- **mtime polling** (`PollCert: true`): `RunPoll` watches the cert+key
-  files' mtimes and re-reads when they advance. Suits binaries whose
-  cert is rotated by an external agent.
+  callback. Suits binaries that mint their own certs in-process;
+  `Refresh` bypasses the mtime gate, covering same-second writes that
+  per-handshake pickup would miss.
+- **mtime polling** (`PollCert: true`): `RunPoll` probes the cert+key
+  files' mtimes on a fixed cadence. Suits binaries whose cert is
+  rotated by an external agent; the poll bounds how long a rotation
+  waits for the next handshake and gives failures a warn cadence.
 
-CA pools are always mtime-polled by `RunPoll` regardless of `PollCert` —
+CA pools are always mtime-probed by `RunPoll` regardless of `PollCert` —
 they don't have a single explicit-refresh trigger like the cert+key pair
 does. Each pool is registered with a caller-chosen name in `Config.Pools`
 (`"ca"`, `"proxy"`, `"certd"`, …); the same name flows through
@@ -1691,7 +1734,7 @@ dev story).
 With a full cert+key pair, the connection's TLS config reloads the
 leaf from disk on every handshake and re-reads the CA pool when its
 file's mtime advances (via
-[`tls.ReloadingClientConfig`](#reloadingclientconfig--rotation-safe-mtls-client-config),
+[`reloader.ClientConfig`](#clientconfig--single-pool-rotation-safe-mtls-client-config),
 same contract as the log shipper), so audit publishing and reads
 survive in-place rotation of both the short-TTL workload cert and
 the CA bundle without a daemon restart. CA-only stays one-shot

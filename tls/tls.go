@@ -1,19 +1,20 @@
-// TLS helpers: hot-reload from disk, self-signed dev fallback, PEM parsing,
-// and *tls.Config builders for client connections.
+// Package tls holds stateless TLS helpers: *tls.Config builders, PEM
+// parsing, a self-signed dev fallback, and peer-chain verification.
+// Everything here reads its inputs once and returns — no caching, no
+// goroutines, no lifecycle.
 //
-// CertLoader stat-checks the cert file on every handshake and reloads when the
-// mtime changes; assign GetCertificate to tls.Config.GetCertificate so a
-// rotation tool (cert-manager, SPIFFE/SPIRE-in-disk-mode, ACME, manual) can
-// replace cert/key files without a server restart. CALoader is its trust-side
-// sibling for CA bundles, wired via tls.Config.VerifyConnection.
+// FromFiles / FromPEM build a *tls.Config from PEM material on disk or
+// already in memory; both return (nil, nil) when given no inputs so
+// callers can switch transparently between TLS and plaintext.
+// CertPoolFromPEM / CertPoolFromFile parse a trust pool. SelfSignedCert
+// generates an ephemeral cert covering localhost and *.localhost, a
+// fallback when no cert files are configured. VerifyPeerChain runs
+// chain + hostname verification of a peer against a root pool.
 //
-// SelfSignedCert generates an ephemeral cert covering localhost and
-// *.localhost — useful as a fallback when no cert files are configured.
-//
-// FromFiles / FromPEM build a *tls.Config from PEM
-// material on disk or already in memory; both return (nil, nil) when given no
-// inputs so callers can switch transparently between TLS and plaintext.
-
+// For TLS material that rotates under a running process — the leaf
+// reloaded per handshake, the CA pool re-read on change — use the
+// hot-reloading loaders and orchestrator in [tls/reloader], which
+// compose these helpers.
 package tls
 
 import (
@@ -29,85 +30,8 @@ import (
 	"math/big"
 	"net"
 	"os"
-	"sync"
 	"time"
 )
-
-// CertLoader hot-reloads a cert/key pair from disk when the cert file's mtime
-// changes. Assign (*CertLoader).GetCertificate to tls.Config.GetCertificate
-// for transparent rotation without server restart.
-//
-// If a reload fails (e.g. rotation in progress, key not yet written), the
-// previously loaded certificate is returned so in-flight handshakes are
-// unaffected.
-type CertLoader struct {
-	certFile string
-	keyFile  string
-	mu       sync.RWMutex
-	cert     *tls.Certificate
-	modTime  time.Time
-}
-
-// NewCertLoader creates a CertLoader. The cert/key are loaded lazily on first
-// handshake.
-func NewCertLoader(certFile, keyFile string) *CertLoader {
-	return &CertLoader{certFile: certFile, keyFile: keyFile}
-}
-
-// GetCertificate satisfies tls.Config.GetCertificate (server side).
-func (c *CertLoader) GetCertificate(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	return c.current()
-}
-
-// GetClientCertificate satisfies tls.Config.GetClientCertificate
-// (client side). Wire it into a client tls.Config so a long-lived
-// connection (e.g. NATS) presents the freshly rotated leaf on every
-// handshake — the stat-and-reload logic is shared with
-// GetCertificate, so a short-TTL workload cert swapped in place by an
-// external rotator is picked up on the next (re)connect without a
-// process restart.
-func (c *CertLoader) GetClientCertificate(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) {
-	return c.current()
-}
-
-// current returns the loaded cert, reloading from disk when the cert
-// file's mtime has advanced. Shared by GetCertificate and
-// GetClientCertificate.
-func (c *CertLoader) current() (*tls.Certificate, error) {
-	fi, statErr := os.Stat(c.certFile)
-
-	c.mu.RLock()
-	upToDate := c.cert != nil && statErr == nil && !fi.ModTime().After(c.modTime)
-	if upToDate {
-		cert := c.cert
-		c.mu.RUnlock()
-		return cert, nil
-	}
-	c.mu.RUnlock()
-
-	// Cert is stale or not yet loaded — acquire write lock and reload.
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Double-check under write lock.
-	if c.cert != nil && statErr == nil && !fi.ModTime().After(c.modTime) {
-		return c.cert, nil
-	}
-
-	newCert, err := tls.LoadX509KeyPair(c.certFile, c.keyFile)
-	if err != nil {
-		// Rotation in progress (cert written, key not yet) — keep serving old cert.
-		if c.cert != nil {
-			return c.cert, nil
-		}
-		return nil, fmt.Errorf("load cert pair: %w", err)
-	}
-	c.cert = &newCert
-	if statErr == nil {
-		c.modTime = fi.ModTime()
-	}
-	return c.cert, nil
-}
 
 // SelfSignedCert generates an ephemeral ECDSA P-256 self-signed certificate
 // valid for one year. SANs cover localhost, *.localhost (single-label
@@ -168,181 +92,50 @@ func CertPoolFromPEM(pemData []byte) (*x509.CertPool, error) {
 // zero-certs case is the load-bearing safety check, catching typo'd
 // paths that would otherwise silently disable trust.
 func CertPoolFromFile(path string) (*x509.CertPool, error) {
-	b, err := os.ReadFile(path)
+	pemData, err := readPEM(path)
 	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", path, err)
+		return nil, err
 	}
-	pool, err := CertPoolFromPEM(b)
+	pool, err := CertPoolFromPEM([]byte(pemData))
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return pool, nil
 }
 
-// FromFiles builds a *tls.Config from PEM file paths.
-// certFile and keyFile must both be set or both empty.
-// caFile is optional; if non-empty its PEM certs populate RootCAs.
+// FromFiles builds a *tls.Config from PEM file paths — the path-taking
+// counterpart of [FromPEM], to which it delegates all cert-pair and CA-pool
+// handling after reading each file. certFile and keyFile must both be set or
+// both empty. caFile is optional; if non-empty its PEM certs populate RootCAs.
 // Returns nil, nil when all arguments are empty (caller uses plain connection).
 func FromFiles(certFile, keyFile, caFile string) (*tls.Config, error) {
-	if certFile == "" && keyFile == "" && caFile == "" {
-		return nil, nil
-	}
-	cfg := &tls.Config{}
-
-	if certFile != "" || keyFile != "" {
-		if certFile == "" || keyFile == "" {
-			return nil, fmt.Errorf("client cert and key must both be provided")
-		}
-		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-		if err != nil {
-			return nil, fmt.Errorf("load client cert pair: %w", err)
-		}
-		cfg.Certificates = []tls.Certificate{cert}
-	}
-
-	if caFile != "" {
-		data, err := os.ReadFile(caFile)
-		if err != nil {
-			return nil, fmt.Errorf("read ca file: %w", err)
-		}
-		pool, err := CertPoolFromPEM(data)
-		if err != nil {
-			return nil, fmt.Errorf("ca file %q: %w", caFile, err)
-		}
-		cfg.RootCAs = pool
-	}
-
-	return cfg, nil
-}
-
-// CALoader hot-reloads a CA bundle from disk when the file's mtime
-// changes, mirroring [CertLoader] for the trust side: wire
-// (*CALoader).VerifyConnection into tls.Config.VerifyConnection (with
-// InsecureSkipVerify set, since the standard verifier freezes RootCAs
-// at config construction) so a CA rotation dropped in place is
-// honored on the next handshake without a process restart.
-//
-// If a reload fails (rotation in progress, corrupt drop-in), the
-// previously loaded pool is kept so a bad write never opens a trust
-// window or kills in-flight reconnects.
-type CALoader struct {
-	caFile  string
-	mu      sync.RWMutex
-	pool    *x509.CertPool
-	modTime time.Time
-}
-
-// NewCALoader creates a CALoader. The bundle is loaded lazily on
-// first use; call [CALoader.Pool] eagerly to fail fast on a missing
-// or malformed file.
-func NewCALoader(caFile string) *CALoader {
-	return &CALoader{caFile: caFile}
-}
-
-// Pool returns the loaded CA pool, re-reading the file when its
-// mtime has advanced. Shared by VerifyConnection and eager startup
-// checks.
-func (l *CALoader) Pool() (*x509.CertPool, error) {
-	fi, statErr := os.Stat(l.caFile)
-
-	l.mu.RLock()
-	upToDate := l.pool != nil && statErr == nil && !fi.ModTime().After(l.modTime)
-	if upToDate {
-		pool := l.pool
-		l.mu.RUnlock()
-		return pool, nil
-	}
-	l.mu.RUnlock()
-
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	// Double-check under write lock.
-	if l.pool != nil && statErr == nil && !fi.ModTime().After(l.modTime) {
-		return l.pool, nil
-	}
-
-	pool, err := CertPoolFromFile(l.caFile)
+	certPEM, err := readPEM(certFile)
 	if err != nil {
-		// Keep the previous pool live across a failed reload.
-		if l.pool != nil {
-			return l.pool, nil
-		}
 		return nil, err
 	}
-	l.pool = pool
-	if statErr == nil {
-		l.modTime = fi.ModTime()
-	}
-	return l.pool, nil
-}
-
-// VerifyConnection runs full chain + hostname verification against
-// the current pool snapshot. Same verification shape as
-// reloader.Reloader.VerifyConnection: roots from the live pool,
-// intermediates from the peer chain, DNSName from the connection's
-// SNI.
-func (l *CALoader) VerifyConnection(cs tls.ConnectionState) error {
-	pool, err := l.Pool()
+	keyPEM, err := readPEM(keyFile)
 	if err != nil {
-		return fmt.Errorf("ca bundle: %w", err)
-	}
-	if len(cs.PeerCertificates) == 0 {
-		return errors.New("peer presented no certificates")
-	}
-	opts := x509.VerifyOptions{
-		Roots:         pool,
-		DNSName:       cs.ServerName,
-		Intermediates: x509.NewCertPool(),
-	}
-	for _, cert := range cs.PeerCertificates[1:] {
-		opts.Intermediates.AddCert(cert)
-	}
-	_, err = cs.PeerCertificates[0].Verify(opts)
-	return err
-}
-
-// ReloadingClientConfig builds a *tls.Config for an mTLS client whose
-// leaf cert+key are reloaded from disk on every handshake (via
-// [CertLoader.GetClientCertificate]) and whose CA trust pool is
-// re-read from caFile when its mtime advances (via
-// [CALoader.VerifyConnection]). It targets long-lived clients —
-// chiefly the NATS log/audit connection — whose TLS material is
-// rotated in place by an external agent (cert-agentd): each reconnect
-// re-handshakes and picks up the current leaf and roots, so shipping
-// survives both leaf and CA rotation without a restart.
-//
-// certFile and keyFile are required (this is the mTLS path; use
-// [FromFiles] for the optional/plaintext case). Both the pair and the
-// CA bundle are loaded once up front so missing or malformed material
-// fails the dial loudly rather than at the first handshake. caFile is
-// optional — empty leaves RootCAs nil (system roots, standard
-// verification). When caFile is set the config carries
-// InsecureSkipVerify with [CALoader.VerifyConnection] providing
-// equivalent chain + hostname verification against the live pool —
-// the standard verifier freezes RootCAs at construction, which is
-// exactly what hot-reload must avoid.
-func ReloadingClientConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
-	if certFile == "" || keyFile == "" {
-		return nil, fmt.Errorf("client cert and key must both be provided")
-	}
-	loader := NewCertLoader(certFile, keyFile)
-	if _, err := loader.GetClientCertificate(nil); err != nil {
 		return nil, err
 	}
-	cfg := &tls.Config{
-		GetClientCertificate: loader.GetClientCertificate,
-		MinVersion:           tls.VersionTLS12,
+	caPEM, err := readPEM(caFile)
+	if err != nil {
+		return nil, err
 	}
-	if caFile != "" {
-		ca := NewCALoader(caFile)
-		if _, err := ca.Pool(); err != nil {
-			return nil, err
-		}
-		cfg.InsecureSkipVerify = true //nolint:gosec // VerifyConnection provides equivalent verification against the live pool.
-		cfg.VerifyConnection = ca.VerifyConnection
+	return FromPEM(certPEM, keyPEM, caPEM)
+}
+
+// readPEM reads path and returns its contents, or "" when path is empty —
+// the not-configured sentinel [FromPEM] understands, so an unset path maps
+// cleanly to an absent PEM block rather than a read error.
+func readPEM(path string) (string, error) {
+	if path == "" {
+		return "", nil
 	}
-	return cfg, nil
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", path, err)
+	}
+	return string(b), nil
 }
 
 // FromPEM builds a *tls.Config from PEM content strings already in memory.
@@ -366,12 +159,39 @@ func FromPEM(certPEM, keyPEM, caPEM string) (*tls.Config, error) {
 	}
 
 	if caPEM != "" {
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM([]byte(caPEM)) {
-			return nil, fmt.Errorf("no valid certificates in ca PEM")
+		pool, err := CertPoolFromPEM([]byte(caPEM))
+		if err != nil {
+			return nil, err
 		}
 		cfg.RootCAs = pool
 	}
 
 	return cfg, nil
+}
+
+// VerifyPeerChain runs full chain + hostname verification of the
+// peer chain in cs against roots: roots as the trust anchors,
+// intermediates from the rest of the peer chain, DNSName from the
+// connection's SNI. The building block under the hot-reloading
+// verification in [tls/reloader] — both its CALoader and per-pool
+// Reloader verification pair it with InsecureSkipVerify, which
+// disables the standard verifier that would otherwise freeze RootCAs
+// at config construction.
+func VerifyPeerChain(roots *x509.CertPool, cs tls.ConnectionState) error {
+	if roots == nil {
+		return errors.New("no CA pool loaded")
+	}
+	if len(cs.PeerCertificates) == 0 {
+		return errors.New("peer presented no certificates")
+	}
+	opts := x509.VerifyOptions{
+		Roots:         roots,
+		DNSName:       cs.ServerName,
+		Intermediates: x509.NewCertPool(),
+	}
+	for _, cert := range cs.PeerCertificates[1:] {
+		opts.Intermediates.AddCert(cert)
+	}
+	_, err := cs.PeerCertificates[0].Verify(opts)
+	return err
 }

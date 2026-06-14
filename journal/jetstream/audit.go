@@ -7,6 +7,7 @@ import (
 
 	"github.com/abagile/tokyo3-base/journal"
 	btls "github.com/abagile/tokyo3-base/tls"
+	"github.com/abagile/tokyo3-base/tls/reloader"
 )
 
 // AuditSinkConfig configures [NewAuditSink]. URL empty disables
@@ -22,7 +23,7 @@ import (
 // CertFile / KeyFile / CAFile name the connection's TLS material.
 // With a full cert+key pair the leaf is reloaded from disk on every
 // handshake and the CA pool re-read on mtime change (via
-// [btls.ReloadingClientConfig], matching the log shipper), so a
+// [reloader.ClientConfig], matching the log shipper), so a
 // cert-agentd rotation of the short-TTL workload cert — or of the CA
 // bundle — is picked up on the next reconnect without a daemon
 // restart; CA-only falls back to one-shot server-auth TLS via
@@ -151,7 +152,7 @@ func NewAuditSource(cfg AuditSourceConfig) (journal.Source, error) {
 // cert-without-key cases keep FromFiles' fail-closed errors.
 func auditTLS(certFile, keyFile, caFile string) (*tls.Config, error) {
 	if certFile != "" && keyFile != "" {
-		return btls.ReloadingClientConfig(certFile, keyFile, caFile)
+		return reloader.ClientConfig(certFile, keyFile, caFile)
 	}
 	return btls.FromFiles(certFile, keyFile, caFile)
 }

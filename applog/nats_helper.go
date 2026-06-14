@@ -6,7 +6,7 @@ import (
 	"time"
 
 	bnats "github.com/abagile/tokyo3-base/nats"
-	btls "github.com/abagile/tokyo3-base/tls"
+	"github.com/abagile/tokyo3-base/tls/reloader"
 	"github.com/nats-io/nats.go"
 )
 
@@ -168,7 +168,7 @@ func dialLogNATS(cfg NATSConfig) (*nats.Conn, error) {
 		err error
 	)
 	if cfg.CertFile != "" && cfg.KeyFile != "" {
-		tlsCfg, terr := btls.ReloadingClientConfig(cfg.CertFile, cfg.KeyFile, cfg.CAFile)
+		tlsCfg, terr := reloader.ClientConfig(cfg.CertFile, cfg.KeyFile, cfg.CAFile)
 		if terr != nil {
 			return nil, fmt.Errorf("log shipping: %w", terr)
 		}

@@ -114,7 +114,7 @@ func TestDialLogNATS_UnreachableURL_RetriesInBackground(t *testing.T) {
 
 // TestDialLogNATS_MTLS_MissingFiles: cert/key paths that don't exist
 // must fail closed at config-build time — the eager load in
-// ReloadingClientConfig surfaces a bad path before the dial rather
+// reloader.ClientConfig surfaces a bad path before the dial rather
 // than at the first (silent) handshake.
 func TestDialLogNATS_MTLS_MissingFiles(t *testing.T) {
 	nc, err := dialLogNATS(NATSConfig{
@@ -155,7 +155,7 @@ func TestDialLogNATS_MTLS_QueuesConn(t *testing.T) {
 
 // writeMTLSCertFiles generates a self-signed ECDSA cert/key pair on
 // disk plus a CA file (the same self-signed cert) and returns their
-// paths. Enough for ReloadingClientConfig's eager load + CA pool.
+// paths. Enough for reloader.ClientConfig's eager load + CA pool.
 func writeMTLSCertFiles(t *testing.T) (certFile, keyFile, caFile string) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)

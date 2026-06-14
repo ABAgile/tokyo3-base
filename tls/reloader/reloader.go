@@ -13,19 +13,29 @@
 // RootCAs at config-construction time — doesn't compete with
 // VerifyConnection's per-handshake pool snapshot.
 //
-// Two reload disciplines, picked per use case:
+// The mechanics are the base tls package's primitives —
+// [CertLoader] for the pair, one [CALoader] per file-backed
+// pool — so material whose file mtime has advanced is picked up at
+// the next handshake with no polling required. What this package
+// layers on top is orchestration: named multi-pool trust, the
+// system-pool sentinel, fail-fast construction, swap/failure logging
+// via the loaders' hooks, leaf-expiry telemetry, and the two refresh
+// disciplines:
 //
 //   - Explicit refresh: caller invokes [Reloader.Refresh] from
 //     wherever a new cert lands (typically a renewer's OnRenewed
 //     callback). Set [Config.PollCert] = false. Suits cert-agentd
-//     and other binaries that mint their own certs in-process.
+//     and other binaries that mint their own certs in-process —
+//     Refresh bypasses the mtime gate, covering same-second writes
+//     that per-handshake pickup would miss.
 //
-//   - mtime polling: [Reloader.RunPoll] watches the cert+key files'
-//     mtimes and re-reads when they advance. Set [Config.PollCert]
-//     = true. Suits ssh-tunneld and other binaries whose cert is
-//     rotated by an external agent.
+//   - mtime polling: [Reloader.RunPoll] probes the cert+key files'
+//     mtimes on a fixed cadence. Set [Config.PollCert] = true.
+//     Suits ssh-tunneld and other binaries whose cert is rotated by
+//     an external agent; the poll bounds how long a rotation waits
+//     for the next handshake and gives failures a warn cadence.
 //
-// CA bundles are always mtime-polled by RunPoll regardless of
+// CA bundles are always mtime-probed by RunPoll regardless of
 // PollCert; they don't have a single explicit-refresh trigger
 // like the cert+key pair does.
 package reloader
@@ -39,9 +49,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
-	"sync"
 	"time"
+
+	btls "github.com/abagile/tokyo3-base/tls"
 )
 
 // DefaultPollInterval is the mtime-poll cadence for cert + CA bundle
@@ -60,12 +70,13 @@ const DefaultPollInterval = 30 * time.Second
 // [Reloader.TLSConfig].
 //
 // PollCert controls cert+key mtime polling in [Reloader.RunPoll]:
-// false leaves the cert refresh to explicit [Reloader.Refresh]
-// calls (cert-agentd's pattern); true enables passive mtime
-// pickup (ssh-tunneld's pattern).
+// false leaves forced refresh to explicit [Reloader.Refresh]
+// calls (cert-agentd's pattern); true enables cadenced mtime
+// probing (ssh-tunneld's pattern). Either way an mtime-advanced
+// pair is also picked up lazily at the next handshake.
 //
 // Log receives info lines on every successful cert / bundle swap
-// and warn lines on RunPoll read failures (previous state stays
+// and warn lines on reload failures (previous state stays
 // live). nil ⇒ [slog.Default].
 type Config struct {
 	CertPath, KeyPath string
@@ -74,30 +85,25 @@ type Config struct {
 	Log               *slog.Logger
 }
 
-// Reloader owns the in-memory cert + multi-pool state. All public
-// methods are safe for concurrent use.
+// Reloader composes the base tls loaders into named-pool
+// orchestration. All public methods are safe for concurrent use;
+// the pool map is fixed at construction.
 type Reloader struct {
-	certPath, keyPath string
-	pollCert          bool
-	log               *slog.Logger
+	pollCert bool
+	log      *slog.Logger
 
-	mu        sync.RWMutex
-	cert      *tls.Certificate
-	notAfter  time.Time
-	certMtime time.Time
-	pools     map[string]*caBundle
+	loader *CertLoader
+	pools  map[string]*poolEntry
 }
 
-// caBundle holds one CA pool's in-memory state. Path is stable from
-// construction; pool + mtime swap atomically on mtime-advance.
-// isSystem marks the pool as loaded from [x509.SystemCertPool] at
-// construction — those pools have no file to poll and refreshPool
-// short-circuits to a no-op.
-type caBundle struct {
-	path     string
-	pool     *x509.CertPool
-	mtime    time.Time
-	isSystem bool
+// poolEntry is one named trust pool: either a hot-reloading
+// file-backed [CALoader] or a system-pool snapshot taken at
+// construction (loader nil, system set). System pools have no file
+// to probe and RunPoll skips them.
+type poolEntry struct {
+	path   string
+	loader *CALoader
+	system *x509.CertPool
 }
 
 // New constructs a Reloader and loads cert+key + every named pool
@@ -110,7 +116,7 @@ type caBundle struct {
 // "load from [x509.SystemCertPool]" — useful for development paths
 // that connect to a public-CA-signed endpoint without pinning trust.
 // System pools are snapshot at construction; they cannot be
-// hot-reloaded and [RunPoll] skips them.
+// hot-reloaded and [Reloader.RunPoll] skips them.
 func New(cfg Config) (*Reloader, error) {
 	if cfg.CertPath == "" || cfg.KeyPath == "" {
 		return nil, errors.New("reloader: CertPath and KeyPath are required")
@@ -118,40 +124,65 @@ func New(cfg Config) (*Reloader, error) {
 	if len(cfg.Pools) == 0 {
 		return nil, errors.New("reloader: at least one Pool is required")
 	}
+	for name := range cfg.Pools {
+		if name == "" {
+			return nil, errors.New("reloader: pool name must be non-empty")
+		}
+	}
 	log := cfg.Log
 	if log == nil {
 		log = slog.Default()
 	}
-	pools := make(map[string]*caBundle, len(cfg.Pools))
-	for name, path := range cfg.Pools {
-		if name == "" {
-			return nil, errors.New("reloader: pool name must be non-empty")
-		}
-		pools[name] = &caBundle{path: path}
-	}
 	r := &Reloader{
-		certPath: cfg.CertPath, keyPath: cfg.KeyPath,
-		pollCert: cfg.PollCert, log: log, pools: pools,
+		pollCert: cfg.PollCert, log: log,
+		pools: make(map[string]*poolEntry, len(cfg.Pools)),
 	}
-	if err := r.refreshCert(true); err != nil {
-		return nil, err
+
+	r.loader = NewCertLoader(cfg.CertPath, cfg.KeyPath)
+	r.loader.OnSwap = func(cert *tls.Certificate, mtime time.Time) {
+		var notAfter time.Time
+		if cert.Leaf != nil {
+			notAfter = cert.Leaf.NotAfter
+		}
+		log.Info("workload cert reloaded",
+			"path", cfg.CertPath,
+			"mtime", mtime,
+			"not_after", notAfter)
 	}
-	for name, b := range r.pools {
-		if b.path == "" {
+	r.loader.OnError = func(err error) {
+		log.Warn("workload cert reload failed; keeping previous cert",
+			"path", cfg.CertPath, "err", err)
+	}
+	if _, err := r.loader.GetClientCertificate(nil); err != nil {
+		return nil, fmt.Errorf("load %s/%s: %w", cfg.CertPath, cfg.KeyPath, err)
+	}
+
+	for name, path := range cfg.Pools {
+		if path == "" {
 			sys, err := x509.SystemCertPool()
 			if err != nil {
 				return nil, fmt.Errorf("pool %q: load system pool: %w", name, err)
 			}
-			r.mu.Lock()
-			b.pool = sys
-			b.isSystem = true
-			r.mu.Unlock()
-			r.log.Info("CA pool: system trust store", "name", name)
+			r.pools[name] = &poolEntry{system: sys}
+			log.Info("CA pool: system trust store", "name", name)
 			continue
 		}
-		if err := r.refreshPool(name, b); err != nil {
+		loader := NewCALoader(path)
+		loader.OnSwap = func(raw []byte, mtime time.Time) {
+			log.Info("CA bundle reloaded",
+				"name", name,
+				"path", path,
+				"mtime", mtime,
+				"fingerprint", bundleFingerprint(raw))
+		}
+		loader.OnError = func(err error) {
+			log.Warn("CA bundle reload failed; keeping previous pool",
+				"name", name, "path", path, "err", err)
+		}
+		if _, err := loader.Pool(); err != nil {
 			return nil, fmt.Errorf("initial pool %q: %w", name, err)
 		}
+		r.pools[name] = &poolEntry{path: path, loader: loader}
 	}
 	return r, nil
 }
@@ -162,94 +193,7 @@ func New(cfg Config) (*Reloader, error) {
 // the cached value (some filesystems coalesce mtimes within the
 // same second). For passive mtime-driven pickup, prefer RunPoll
 // with [Config.PollCert] = true.
-func (r *Reloader) Refresh() error { return r.refreshCert(true) }
-
-// refreshCert re-reads the cert+key pair. When forced, ignores
-// mtime; otherwise no-ops on unchanged mtime + already-loaded.
-// Logs at info on every actual swap so operators see rotations
-// propagate.
-func (r *Reloader) refreshCert(forced bool) error {
-	if !forced {
-		stat, err := os.Stat(r.certPath)
-		if err != nil {
-			return fmt.Errorf("stat %s: %w", r.certPath, err)
-		}
-		r.mu.RLock()
-		prev := r.certMtime
-		loaded := r.cert != nil
-		r.mu.RUnlock()
-		if !stat.ModTime().After(prev) && loaded {
-			return nil
-		}
-	}
-	cert, err := tls.LoadX509KeyPair(r.certPath, r.keyPath)
-	if err != nil {
-		return fmt.Errorf("load %s/%s: %w", r.certPath, r.keyPath, err)
-	}
-	var notAfter time.Time
-	if len(cert.Certificate) > 0 {
-		leaf, err := x509.ParseCertificate(cert.Certificate[0])
-		if err != nil {
-			return fmt.Errorf("parse leaf %s: %w", r.certPath, err)
-		}
-		cert.Leaf = leaf
-		notAfter = leaf.NotAfter
-	}
-	stat, statErr := os.Stat(r.certPath)
-	var mtime time.Time
-	if statErr == nil {
-		mtime = stat.ModTime()
-	}
-	r.mu.Lock()
-	r.cert = &cert
-	r.notAfter = notAfter
-	r.certMtime = mtime
-	r.mu.Unlock()
-	r.log.Info("workload cert reloaded",
-		"path", r.certPath,
-		"mtime", mtime,
-		"not_after", notAfter)
-	return nil
-}
-
-// refreshPool re-reads a CA pool when its file's mtime has advanced
-// past the cached value (or on first load). Pool swap is atomic.
-// Logs at info on every actual swap. No-op for system pools — they
-// have no file to poll and were snapshot at construction.
-func (r *Reloader) refreshPool(name string, b *caBundle) error {
-	if b.isSystem {
-		return nil
-	}
-	stat, err := os.Stat(b.path)
-	if err != nil {
-		return fmt.Errorf("stat %s: %w", b.path, err)
-	}
-	r.mu.RLock()
-	prev := b.mtime
-	loaded := b.pool != nil
-	r.mu.RUnlock()
-	if !stat.ModTime().After(prev) && loaded {
-		return nil
-	}
-	raw, err := os.ReadFile(b.path)
-	if err != nil {
-		return fmt.Errorf("read %s: %w", b.path, err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(raw) {
-		return fmt.Errorf("%s contains no PEM certs", b.path)
-	}
-	r.mu.Lock()
-	b.pool = pool
-	b.mtime = stat.ModTime()
-	r.mu.Unlock()
-	r.log.Info("CA bundle reloaded",
-		"name", name,
-		"path", b.path,
-		"mtime", stat.ModTime(),
-		"fingerprint", bundleFingerprint(raw))
-	return nil
-}
+func (r *Reloader) Refresh() error { return r.loader.Reload() }
 
 // bundleFingerprint is the first 8 bytes of sha256(pem), hex-encoded.
 // Short enough for human-friendly log diffing across a fleet, long
@@ -260,32 +204,30 @@ func bundleFingerprint(pem []byte) string {
 }
 
 // GetClientCertificate satisfies the [tls.Config.GetClientCertificate]
-// callback signature. Returns the current workload cert; the
-// handshake stack invokes this per dial, so a Refresh (or mtime
-// pickup) between dials propagates automatically.
+// callback signature. Returns the current workload cert, re-reading
+// it when the file's mtime has advanced — so a rotation propagates
+// on the dial that follows it, with Refresh / RunPoll covering the
+// mtime-coalesced and between-dials cases.
 func (r *Reloader) GetClientCertificate(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if r.cert == nil {
-		return nil, errors.New("reloader: no cert loaded yet")
-	}
-	return r.cert, nil
+	return r.loader.GetClientCertificate(nil)
 }
 
 // LeafExpiry returns the loaded cert's NotAfter. Zero value when
 // no cert has been loaded (only happens in test scaffolding —
 // New() returns an error if the initial load fails).
 func (r *Reloader) LeafExpiry() time.Time {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.notAfter
+	cert, err := r.loader.GetClientCertificate(nil)
+	if err != nil || cert.Leaf == nil {
+		return time.Time{}
+	}
+	return cert.Leaf.NotAfter
 }
 
 // WarnIfNearExpiry emits a Warn on the reloader's configured logger
 // when the leaf cert is within threshold of expiry. Use at startup
 // to alert operators that the workload identity is already in its
 // renewal window (typical threshold: 24 h). No-op when the cert
-// hasn't loaded yet ([LeafExpiry] is zero).
+// hasn't loaded yet ([Reloader.LeafExpiry] is zero).
 //
 // msg is the human-readable warn message. The line additionally
 // carries "remaining" (duration to expiry, rounded to the nearest
@@ -329,8 +271,6 @@ func (r *Reloader) ExpiryAttrs(attrName string) func() []any {
 // for diagnostics + tests; production callers typically know their
 // pool names statically.
 func (r *Reloader) PoolNames() []string {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
 	names := make([]string, 0, len(r.pools))
 	for name := range r.pools {
 		names = append(names, name)
@@ -347,32 +287,14 @@ func (r *Reloader) PoolNames() []string {
 // automatically.
 func (r *Reloader) VerifyConnection(poolName string) func(tls.ConnectionState) error {
 	return func(cs tls.ConnectionState) error {
-		r.mu.RLock()
-		b, ok := r.pools[poolName]
-		var pool *x509.CertPool
-		if ok {
-			pool = b.pool
-		}
-		r.mu.RUnlock()
+		e, ok := r.pools[poolName]
 		if !ok {
 			return fmt.Errorf("reloader: pool %q not registered", poolName)
 		}
-		if pool == nil {
-			return errors.New("reloader: no CA bundle loaded")
+		if e.system != nil {
+			return btls.VerifyPeerChain(e.system, cs)
 		}
-		if len(cs.PeerCertificates) == 0 {
-			return errors.New("reloader: peer presented no certificates")
-		}
-		opts := x509.VerifyOptions{
-			Roots:         pool,
-			DNSName:       cs.ServerName,
-			Intermediates: x509.NewCertPool(),
-		}
-		for _, cert := range cs.PeerCertificates[1:] {
-			opts.Intermediates.AddCert(cert)
-		}
-		_, err := cs.PeerCertificates[0].Verify(opts)
-		return err
+		return e.loader.VerifyConnection(cs)
 	}
 }
 
@@ -411,12 +333,13 @@ func (r *Reloader) TLSConfig(poolName string, opts ...TLSConfigOption) *tls.Conf
 	return cfg
 }
 
-// RunPoll ticks every interval and re-reads files whose mtime has
-// advanced. Always polls every CA pool. When [Config.PollCert] is
-// true, also polls the cert+key pair. Read failures keep the
-// previous in-memory state live and emit a warn log so a corrupt
-// drop-in never opens a trust window. Returns when ctx is
-// cancelled.
+// RunPoll ticks every interval and probes files whose mtime may
+// have advanced — always every file-backed CA pool, plus the
+// cert+key pair when [Config.PollCert] is true. The probes are the
+// loaders' own lazy paths, so swap and failure handling (previous
+// state stays live, warn logged) come from the loader hooks wired
+// at construction; the tick just bounds how long a rotation waits
+// for the next handshake. Returns when ctx is cancelled.
 func (r *Reloader) RunPoll(ctx context.Context, interval time.Duration) error {
 	if interval <= 0 {
 		interval = DefaultPollInterval
@@ -429,28 +352,11 @@ func (r *Reloader) RunPoll(ctx context.Context, interval time.Duration) error {
 			return ctx.Err()
 		case <-ticker.C:
 			if r.pollCert {
-				if err := r.refreshCert(false); err != nil {
-					r.log.Warn("workload cert reload failed; keeping previous cert",
-						"path", r.certPath, "err", err)
-				}
+				_, _ = r.loader.GetClientCertificate(nil)
 			}
-			// Snapshot pool names so we don't hold the lock during reload.
-			r.mu.RLock()
-			refreshables := make([]struct {
-				name string
-				b    *caBundle
-			}, 0, len(r.pools))
-			for name, b := range r.pools {
-				refreshables = append(refreshables, struct {
-					name string
-					b    *caBundle
-				}{name, b})
-			}
-			r.mu.RUnlock()
-			for _, e := range refreshables {
-				if err := r.refreshPool(e.name, e.b); err != nil {
-					r.log.Warn("CA bundle reload failed; keeping previous pool",
-						"name", e.name, "path", e.b.path, "err", err)
+			for _, e := range r.pools {
+				if e.loader != nil {
+					_, _ = e.loader.Pool()
 				}
 			}
 		}
