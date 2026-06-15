@@ -20,6 +20,7 @@ go get github.com/abagile/tokyo3-base
 - [version/ — build version resolution](#version--build-version-resolution)
 - [debug/ — opt-in diagnostics server](#debug--opt-in-diagnostics-server)
 - [cli/ — daemon startup composition](#cli--daemon-startup-composition)
+- [guard/ — panic recovery for background work](#guard--panic-recovery-for-background-work)
 - [api/ — HTTP client utilities](#api--http-client-utilities)
 - [api/google — Google Maps / Places client](#apigoogle--google-maps--places-client)
 - [crypto/ — AES-256-GCM and envelope encryption](#crypto--aes-256-gcm-and-envelope-encryption)
@@ -355,16 +356,12 @@ import "github.com/abagile/tokyo3-base/envutil"
 | `First(keys ...string) string` | First non-empty value among the named env vars (fallback chains). |
 | `MustEnv(key string) string` | Required env var. Writes `"<key> is required"` to stderr and `os.Exit(2)` when unset — matches Go's `flag.Parse` convention for usage/config errors. |
 | `HostnameOrEmpty() string` | `os.Hostname()` on success, `""` on error. Default for per-host identifier env vars like `CERT_AGENTD_INSTANCE`. |
-| `CloseIfCloser(v any)` | Calls `Close()` on `v` when it implements `io.Closer`, no-op otherwise. Safely closes polymorphic resources (e.g., `audit.Sink` that may be a real sink with a `Close` or a NoopSink with none). |
 
 ```go
 addr      := envutil.Or("MYDAEMON_ADDR", ":8080")
 caFile    := envutil.First("MYDAEMON_NATS_CA", "MYDAEMON_WORKLOAD_CA")
 issuer    := envutil.MustEnv("MYDAEMON_ISSUER")
 instance  := envutil.Or("MYDAEMON_INSTANCE", envutil.HostnameOrEmpty())
-
-sink, _ := openAuditSink(log)
-defer envutil.CloseIfCloser(sink)
 ```
 
 [↑ Back to top](#packages)
@@ -468,6 +465,8 @@ type App struct {
 
 func (a App) Setup(parent context.Context) Runtime
 func (a App) NATS() NATS
+func (a App) DB() DB
+func (a App) AdminDB() DB
 ```
 
 Composes the bootstrap prelude every daemon repeats — application logger
@@ -492,6 +491,8 @@ type Runtime struct {
     Log       *slog.Logger
     Ctx       context.Context // cancelled on signal or parent cancel
     NATS      NATS            // resolved NATS material (WORKLOAD_* fallback)
+    DB        DB              // resolved runtime Postgres material (no WORKLOAD fallback)
+    AdminDB   DB              // admin/migration material (ADMIN_* → DB_* → blank)
     EnvPrefix string
     Shutdown  func()          // defer it: releases the signal hook + drains the logger
 }
@@ -500,19 +501,36 @@ type Runtime struct {
 ### WORKLOAD identity convention
 
 A daemon's mesh mTLS identity is `<PREFIX>_WORKLOAD_CERT` / `_WORKLOAD_KEY`
-/ `_WORKLOAD_CA`. NATS connections reuse it: each of
+/ `_WORKLOAD_CA`. The **NATS** channel reuses it: each of
 `<PREFIX>_NATS_CERT/KEY/CA` falls back to the matching `WORKLOAD_*`, so a
-daemon that already has a workload identity ships logs (and audit) over
-mTLS without a second set of env vars. Set `<PREFIX>_NATS_*` only to
-override NATS with a distinct identity.
+daemon that already has a workload identity ships logs and audit over mTLS
+without extra cert sets. Set `<PREFIX>_NATS_*` only to override.
+
+The **Postgres** channel splits the fallback. The client **cert/key** are a
+database-role credential, not the workload identity, so
+`<PREFIX>_DB_CERT/KEY` resolve verbatim (unset ⇒ no client cert, the DSN's
+`sslmode` governs TLS). The **CA** is the shared mesh trust root, so
+`<PREFIX>_DB_CA` falls back to `<PREFIX>_WORKLOAD_CA`. The admin/migration
+material adds an `ADMIN_*` tier on top: cert/key `<PREFIX>_ADMIN_DB_* →
+<PREFIX>_DB_*`, and CA `<PREFIX>_ADMIN_DB_CA → <PREFIX>_DB_CA →
+<PREFIX>_WORKLOAD_CA`.
 
 ```go
 type NATS struct { URL, CertFile, KeyFile, CAFile string }
+type DB   struct { URL, CertFile, KeyFile, CAFile string }
 ```
 
-`App.NATS()` resolves that material (callable independently of `Setup`);
+`App.NATS()` resolves the NATS material (callable independently of `Setup`);
 `Runtime.NATS` carries the same resolution so audit and other NATS clients
 draw from one source of truth.
+
+`App.DB()` (DSN `<PREFIX>_DATABASE_URL`, files `<PREFIX>_DB_*`) and
+`App.AdminDB()` (`<PREFIX>_ADMIN_DATABASE_URL` / `_ADMIN_DB_*`, each falling
+back to the runtime value) resolve the Postgres material; `Runtime.DB` /
+`Runtime.AdminDB` carry it. These resolve material only — the caller builds a
+hot-reloading `*tls.Config` from the files via `tls/reloader.ClientConfig`
+and owns the connection (pool tuning, migrations); base has no single
+Postgres-open layer to host those.
 
 ### Audit sink/source
 
@@ -535,6 +553,47 @@ src,  _ := cli.AuditSource(rt, audit.StreamName, audit.Subject)
 These are free functions, not methods on a generic `App`, so a daemon that
 publishes no audit (e.g. cert-agentd) uses a plain `App` with no spurious
 type parameter.
+
+[↑ Back to top](#packages)
+
+---
+
+## guard/ — panic recovery for background work
+
+```go
+func Go(log *slog.Logger, name string, fn func())
+func Tick(log *slog.Logger, name string, fn func())
+func Close(v any)
+```
+
+A single unrecovered panic in any goroutine crashes the whole process, and
+net/http only recovers request handlers — not reapers, sync loops, or
+trackers. `Go` spawns a goroutine that recovers, logs (with a stack trace)
+under `name`, and returns instead of taking the process down. `Tick` is the
+in-loop counterpart: call it synchronously inside a ticker body so one bad
+iteration logs and the loop keeps firing. Pair them — `Go` as the outer
+backstop, `Tick` per iteration. `Close` is the cleanup companion: a
+best-effort `Close()` of a value that may or may not implement `io.Closer`
+(e.g. an audit sink that's a real client or a no-op) — typically deferred.
+
+A zero-dependency leaf (stdlib only), so a lean tool can recover background
+goroutines without pulling the daemon-composition stack in `cli`.
+
+```go
+guard.Go(rt.Log, "audit-tracker", func() { tracker.Run(rt.Ctx) })
+
+for {
+    select {
+    case <-rt.Ctx.Done():
+        return
+    case <-ticker.C:
+        guard.Tick(rt.Log, "reaper", func() { reapOnce(rt.Ctx) })
+    }
+}
+
+sink, _ := openAuditSink(log)
+defer guard.Close(sink)
+```
 
 [↑ Back to top](#packages)
 

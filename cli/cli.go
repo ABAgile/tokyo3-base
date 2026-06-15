@@ -24,6 +24,22 @@
 // also reads other streams (e.g. certd tailing ssh-proxy's audit) wires
 // those directly — subject, stream, and any extra sources stay
 // app-specific.
+//
+// # Postgres material
+//
+// [App.DB] and [App.AdminDB] resolve a daemon's Postgres connection
+// material — the DSN plus the client mTLS files — into the [DB] struct
+// ([Runtime] carries both). The fallback is deliberately split from the
+// NATS convention: the client cert/key are a DATABASE-ROLE credential, not
+// the workload identity, so <PREFIX>_DB_CERT/KEY do NOT fall back to
+// WORKLOAD_* (unset ⇒ no client cert, the DSN's sslmode governs TLS). The
+// CA is the shared mesh trust root, so <PREFIX>_DB_CA DOES fall back to
+// <PREFIX>_WORKLOAD_CA. [App.AdminDB] adds an ADMIN_* tier for a separate
+// DDL credential, each field falling back to the runtime DB value first.
+//
+// These resolve material only — building a *tls.Config (via
+// tls/reloader.ClientConfig) and opening the pool stay caller-side, since
+// there is no single Postgres-open layer across the suite.
 package cli
 
 import (
@@ -82,13 +98,64 @@ func (a App) NATS() NATS {
 	}
 }
 
+// DB is resolved Postgres connection material: the DSN plus the mTLS files.
+type DB struct {
+	URL      string
+	CertFile string
+	KeyFile  string
+	CAFile   string
+}
+
+// DB resolves the daemon's runtime Postgres material: the DSN from
+// <PREFIX>_DATABASE_URL and the client mTLS files from <PREFIX>_DB_CERT/KEY/CA.
+// The fallback is split (see the package doc): the client cert/key are a
+// database-role credential, so they do NOT borrow the WORKLOAD_* identity —
+// an unset cert/key means "no client cert" (the DSN's sslmode governs TLS).
+// The CA is the shared mesh trust root, so CAFile falls back to
+// <PREFIX>_WORKLOAD_CA. Safe to call independently of [App.Setup].
+//
+// This resolves material only — it does not build a *tls.Config or open a
+// connection. The caller turns CertFile/KeyFile/CAFile into a hot-reloading
+// config via tls/reloader.ClientConfig (and owns pool tuning and migrations).
+func (a App) DB() DB {
+	p := a.EnvPrefix
+	return DB{
+		URL:      os.Getenv(p + "_DATABASE_URL"),
+		CertFile: os.Getenv(p + "_DB_CERT"),
+		KeyFile:  os.Getenv(p + "_DB_KEY"),
+		CAFile:   envutil.First(p+"_DB_CA", p+"_WORKLOAD_CA"),
+	}
+}
+
+// AdminDB resolves material for a privileged "admin" connection used for
+// schema migrations (DDL), for daemons that separate that role from their
+// runtime (DML) credential. Each field falls back to the runtime DB value
+// first: <PREFIX>_ADMIN_DATABASE_URL → <PREFIX>_DATABASE_URL, and
+// <PREFIX>_ADMIN_DB_CERT/KEY → <PREFIX>_DB_CERT/KEY (no WORKLOAD_* — an unset
+// cert/key pair means no client cert). The CA continues the shared-root chain
+// <PREFIX>_ADMIN_DB_CA → <PREFIX>_DB_CA → <PREFIX>_WORKLOAD_CA. A single-role
+// daemon leaves the ADMIN_* vars unset and AdminDB mirrors DB.
+func (a App) AdminDB() DB {
+	p := a.EnvPrefix
+	return DB{
+		URL:      envutil.First(p+"_ADMIN_DATABASE_URL", p+"_DATABASE_URL"),
+		CertFile: envutil.First(p+"_ADMIN_DB_CERT", p+"_DB_CERT"),
+		KeyFile:  envutil.First(p+"_ADMIN_DB_KEY", p+"_DB_KEY"),
+		CAFile:   envutil.First(p+"_ADMIN_DB_CA", p+"_DB_CA", p+"_WORKLOAD_CA"),
+	}
+}
+
 // Runtime is what [App.Setup] returns: a configured logger, a context
 // cancelled on SIGINT/SIGTERM (or when the parent cancels), the resolved
-// NATS material, and a Shutdown to defer.
+// NATS / Postgres material, and a Shutdown to defer.
 type Runtime struct {
 	Log  *slog.Logger
 	Ctx  context.Context
 	NATS NATS
+	// DB and AdminDB carry the resolved Postgres material (see [App.DB] and
+	// [App.AdminDB]). AdminDB mirrors DB unless the ADMIN_* vars are set.
+	DB      DB
+	AdminDB DB
 	// EnvPrefix echoes App.EnvPrefix so the audit helpers (and any
 	// bespoke NATS wiring) can derive <PREFIX>_NATS-keyed labels.
 	EnvPrefix string
@@ -128,6 +195,8 @@ func (a App) Setup(parent context.Context) Runtime {
 		Log:       log,
 		Ctx:       ctx,
 		NATS:      n,
+		DB:        a.DB(),
+		AdminDB:   a.AdminDB(),
 		EnvPrefix: a.EnvPrefix,
 		Shutdown: func() {
 			stop()

@@ -1,20 +1,17 @@
 // Package envutil collects the small env-variable and process-helper
 // utilities every cmd/main.go in the suite was duplicating: env-var
-// lookups with fallback semantics, a fail-fast "required" check, a
-// hostname-or-empty default for per-host identifiers, and a safe
-// "close it if it's a closer" wrapper for resources that may or may
-// not implement [io.Closer].
+// lookups with fallback semantics, a fail-fast "required" check, and a
+// hostname-or-empty default for per-host identifiers.
 //
 // These helpers are intentionally tiny and dependency-free — picking
-// them out of cmd/ saves ~25 LOC per binary, gives the small surface
-// one place to evolve (e.g., if the "required" path ever needs to
-// return an error instead of os.Exit), and lets new daemons skip
-// re-writing the same five functions.
+// them out of cmd/ saves LOC per binary, gives the small surface one
+// place to evolve (e.g., if the "required" path ever needs to return an
+// error instead of os.Exit), and lets new daemons skip re-writing the
+// same functions.
 package envutil
 
 import (
 	"fmt"
-	"io"
 	"os"
 )
 
@@ -72,15 +69,4 @@ func HostnameOrEmpty() string {
 		return ""
 	}
 	return h
-}
-
-// CloseIfCloser calls Close on v when v implements [io.Closer].
-// Errors from Close are silently dropped. Use to safely close
-// values that may or may not be closeable behind a polymorphic
-// interface — e.g., audit.Sink can be a real JetStream sink with
-// a Close, or a noop sink with none.
-func CloseIfCloser(v any) {
-	if c, ok := v.(io.Closer); ok {
-		_ = c.Close()
-	}
 }

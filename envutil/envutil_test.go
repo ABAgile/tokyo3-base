@@ -110,31 +110,3 @@ func TestHostnameOrEmpty_ReturnsNonEmpty(t *testing.T) {
 		t.Error("HostnameOrEmpty returned empty; expected a real hostname on this platform")
 	}
 }
-
-func TestCloseIfCloser_CallsCloseOnCloser(t *testing.T) {
-	c := &recordingCloser{}
-	envutil.CloseIfCloser(c)
-	if !c.closed {
-		t.Error("CloseIfCloser did not call Close on a Closer-implementing value")
-	}
-}
-
-func TestCloseIfCloser_NoOpOnNonCloser(t *testing.T) {
-	// Must not panic on values that don't implement io.Closer.
-	envutil.CloseIfCloser("not a closer")
-	envutil.CloseIfCloser(42)
-	envutil.CloseIfCloser(struct{}{})
-}
-
-func TestCloseIfCloser_NilSafe(t *testing.T) {
-	// Untyped nil is the obvious edge case; CloseIfCloser must not
-	// panic dereferencing it.
-	envutil.CloseIfCloser(nil)
-}
-
-type recordingCloser struct{ closed bool }
-
-func (r *recordingCloser) Close() error {
-	r.closed = true
-	return nil
-}
