@@ -14,115 +14,189 @@ go get github.com/abagile/tokyo3-base
 
 ## Packages
 
-- [db/ — PostgreSQL / pgx utilities](#db--postgresql--pgx-utilities)
-- [applog/ — Application logging helpers](#applog--application-logging-helpers)
-- [envutil/ — cmd/ main.go boilerplate helpers](#envutil--cmd-maingo-boilerplate-helpers)
-- [version/ — build version resolution](#version--build-version-resolution)
-- [debug/ — opt-in diagnostics server](#debug--opt-in-diagnostics-server)
-- [cli/ — daemon startup composition](#cli--daemon-startup-composition)
-- [guard/ — panic recovery for background work](#guard--panic-recovery-for-background-work)
 - [api/ — HTTP client utilities](#api--http-client-utilities)
-- [api/google — Google Maps / Places client](#apigoogle--google-maps--places-client)
-- [crypto/ — AES-256-GCM and envelope encryption](#crypto--aes-256-gcm-and-envelope-encryption)
-- [nats/ — NATS dial helper](#nats--nats-dial-helper)
-- [tls/ — stateless TLS helpers](#tls--stateless-tls-helpers)
+  - [api/google — Google Maps / Places client](#apigoogle--google-maps--places-client)
+- [applog/ — Application logging helpers](#applog--application-logging-helpers)
 - [auth/ — auth primitives namespace](#auth--auth-primitives-namespace)
+- [cli/ — daemon startup composition](#cli--daemon-startup-composition)
+- [crypto/ — AES-256-GCM and envelope encryption](#crypto--aes-256-gcm-and-envelope-encryption)
+- [db/ — PostgreSQL / pgx utilities](#db--postgresql--pgx-utilities)
+- [debug/ — opt-in diagnostics server](#debug--opt-in-diagnostics-server)
+- [envutil/ — cmd/ main.go boilerplate helpers](#envutil--cmd-maingo-boilerplate-helpers)
+- [guard/ — panic recovery for background work](#guard--panic-recovery-for-background-work)
+- [httpauth/ — HTTP auth middleware](#httpauth--http-auth-middleware)
 - [journal/ — Append-only durable event journal](#journal--append-only-durable-event-journal)
+- [nats/ — NATS dial helper](#nats--nats-dial-helper)
+- [run/ — component lifecycle coordination](#run--component-lifecycle-coordination)
+- [tls/ — stateless TLS helpers](#tls--stateless-tls-helpers)
+  - [tls/reloader — hot-reload loaders + multi-pool orchestrator](#tlsreloader--hot-reload-loaders--multi-pool-orchestrator)
+- [version/ — build version resolution](#version--build-version-resolution)
 
 ---
-## db/ — PostgreSQL / pgx utilities
 
-### Pool construction
+## api/ — HTTP client utilities
+
+Thin option-driven wrapper over [go-resty/resty](https://github.com/go-resty/resty/v2) with bearer-token management, structured request logging, and context-scoped log annotation.
+
+### Client construction
 
 ```go
-func NewPgxPool(connStr string, opts ...DatabaseConfigOption) (*pgxpool.Pool, error)
+func NewRestClient(baseURL string, opts ...RestyClientOption) *RestyClient
 ```
 
-Creates a `pgxpool.Pool` from a connection string. Options are applied to the parsed config before the pool is created.
-
 ```go
-type DatabaseConfigOption func(*pgxpool.Config)
-```
-
-Functional option type for `NewPgxPool`.
-
-### Options
-
-```go
-func WithDecimalRegister() DatabaseConfigOption
-```
-
-Registers [`govalues/decimal`](https://github.com/govalues/decimal) with the pgx type map on every new connection, enabling transparent encode/decode of `decimal.Decimal` for PostgreSQL `numeric` columns.
-
-```go
-pool, err := NewPgxPool(connStr, WithDecimalRegister())
-```
-
-### Connection string sanitization
-
-```go
-func SantizeDbConn(connStr string) string
-```
-
-Strips `user=` and `password=` key-value pairs from a DSN and collapses surrounding whitespace. Safe for logging.
-
-```go
-SantizeDbConn("host=localhost user=admin password=secret dbname=app")
-// → "host=localhost dbname=app"
-```
-
-### Placeholder conversion
-
-```go
-func ConvertPgPlaceholders(sql string, args ...any) (string, []any, error)
-```
-
-Converts PostgreSQL-style positional placeholders (`$1`, `$2`, …) to `?` placeholders, reordering `args` to match. Useful when targeting drivers that use `?` syntax (e.g. MySQL, SQLite) while authoring queries in PostgreSQL style.
-
-```go
-sql, args, err := ConvertPgPlaceholders(
-    "SELECT * FROM orders WHERE user_id = $1 AND status = $2",
-    userID, status,
+rc := api.NewRestClient("https://api.example.com",
+    api.CO.WithTimeout(10 * time.Second),
+    api.CO.WithHeader("Accept", "application/json"),
+    api.CO.WithRequestLogger(logger),
 )
-// sql  → "SELECT * FROM orders WHERE user_id = ? AND status = ?"
-// args → []any{userID, status}
 ```
 
-Returns an error if a placeholder index is out of range or malformed. Positional args may be repeated (`$1` used twice maps the same argument into both positions).
+#### Client options (`CO`)
 
-### Struct copy with dereferencing
+| Option | Description |
+|---|---|
+| `CO.WithBaseUrl(url)` | Overrides the base URL after construction |
+| `CO.WithTimeout(d)` | Request timeout |
+| `CO.WithRetryCount(n)` | Number of retries on transient errors |
+| `CO.WithHeader(k, v)` | Sets a default request header |
+| `CO.WithHeaders(map)` | Sets multiple default request headers |
+| `CO.WithAuthToken(token)` | Sets `Authorization: Bearer <token>` on every request |
+| `CO.WithBasicAuth(u, p)` | Sets `Authorization: Basic …` on every request |
+| `CO.WithTransport(rt)` | Replaces the underlying `http.RoundTripper` (custom TLS, proxies, test mocks) |
+| `CO.WithDebug(bool)` | Enables resty debug output |
+| `CO.WithRequestLogger(logger)` | Attaches structured request/response logging (see below) |
+
+### Request execution
 
 ```go
-func CopyDeref[T any, U any](src T, dst *U) (*U, error)
+func (rc *RestyClient) R(ctx context.Context, method, path string, result any, opts ...RestyRequestOption) error
 ```
 
-Copies fields from `src` to `dst` by name, with three conversion rules applied in order:
-
-| Source type | Destination type | Behaviour |
-|---|---|---|
-| `[]byte` | `string` | Converts bytes to string |
-| `*T` | `T` | Dereferences pointer; zeroes dst field if nil |
-| `T` | `T` | Direct assignment if types are assignable |
-
-Fields with no matching name in `src`, unexported fields, and fields whose types don't satisfy any rule are silently skipped. `src` may itself be a pointer — it is dereferenced before field matching begins.
+Executes a request and unmarshals the response body into `result` on success. Returns `*ApiError` on HTTP error status; the response body is decoded with `encoding/json` directly (no Content-Type heuristics) so test mocks that omit `Content-Type: application/json` work unchanged.
 
 ```go
-type Row struct {
-    Name  []byte
-    Score *int
-    Tag   string
+var out MyResponse
+err := rc.R(ctx, http.MethodGet, "/v1/orders/{id}", &out,
+    api.RO.WithPathParam("id", orderID),
+    api.RO.WithQueryParam("expand", "items"),
+)
+var apiErr *api.ApiError
+if errors.As(err, &apiErr) {
+    // apiErr.StatusCode holds the HTTP status;
+    // apiErr.Body holds the raw response body verbatim (capped at 64 KiB).
 }
-type Model struct {
-    Name  string
-    Score int
-    Tag   string
+```
+
+#### `ApiError` shape
+
+```go
+type ApiError struct {
+    StatusCode int
+    Body       []byte
+}
+```
+
+`Error()` surfaces the body inline (truncated at 512 chars; full bytes
+available via the field) so server-side error messages reach operator logs
+without a second roundtrip:
+
+```
+api error: status 403: {"error":"policy denied for groups [eng]"}
+```
+
+JSON-decode failures on success-path responses surface as
+`"api call failed: decode response: <err>"` so callers can distinguish them
+from transport errors.
+
+#### Request options (`RO`)
+
+| Option | Description |
+|---|---|
+| `RO.WithQueryParam(k, v)` | Adds a query parameter |
+| `RO.WithQueryParams(map)` | Adds multiple query parameters |
+| `RO.WithPathParam(k, v)` | Substitutes a `{k}` placeholder in the path |
+| `RO.WithPathParams(map)` | Substitutes multiple path placeholders |
+| `RO.WithBody(v)` | Sets the request body (JSON-encoded) |
+| `RO.WithHeader(k, v)` | Sets a per-request header |
+| `RO.WithHeaders(map)` | Sets multiple per-request headers |
+| `RO.WithAuthToken(token)` | Overrides auth token for this request only |
+| `RO.WithBasicAuth(u, p)` | Overrides basic auth for this request only |
+| `RO.WithDebug(bool)` | Enables resty debug for this request only |
+
+### Bearer token management
+
+```go
+type BearerTokenManager struct { ... }
+type BearerTokenRefresher func(context.Context) (string, time.Time, error)
+```
+
+Thread-safe token cache with automatic refresh. Calls `Refresher` when the token is within 5 minutes of expiry (default buffer). Override per call via context:
+
+```go
+tm := &api.BearerTokenManager{
+    Refresher: func(ctx context.Context) (string, time.Time, error) {
+        return fetchTokenFromIDP(ctx) // returns token, expiresAt, err
+    },
 }
 
-score := 42
-row := Row{Name: []byte("alice"), Score: &score, Tag: "vip"}
-model, err := CopyDeref(row, &Model{})
-// model → Model{Name: "alice", Score: 42, Tag: "vip"}
+// use default 5-min buffer
+token, err := tm.GetToken(ctx)
+
+// override buffer — refresh 10 min before expiry
+ctx = api.WithTokenRefreshBuffer(ctx, -10*time.Minute)
+token, err = tm.GetToken(ctx)
 ```
+
+### Request logging
+
+`CO.WithRequestLogger` attaches a `*slog.Logger` that emits one `OUTGOING_REQUEST` line before each call and one `INCOMING_RESPONSE` line after. `Authorization` and `Cookie` headers are redacted automatically.
+
+#### Context log attributes
+
+Arbitrary key-value pairs stored in the context are appended to both log lines — no changes to client configuration required:
+
+```go
+ctx = api.WithLogAttr(ctx, "plan_no", "P-123")
+ctx = api.WithLogAttrs(ctx, map[string]string{"tref": "T-456", "tenant": "acme"})
+
+// OUTGOING_REQUEST: GET /orders |>> plan_no: [P-123] tenant: [acme] tref: [T-456]
+// INCOMING_RESPONSE: GET /orders 200 |>> plan_no: [P-123] tenant: [acme] tref: [T-456]
+```
+
+Each `WithLogAttr` / `WithLogAttrs` call produces a new context; the parent is never mutated. Keys are sorted alphabetically in the log output.
+
+```go
+func SanitizeHeaders(h map[string][]string) map[string][]string
+```
+
+Redacts `Authorization` and `Cookie` values (case-insensitive). Used internally by the logger; also available for custom middleware.
+
+### api/google — Google Maps / Places client
+
+Typed client for the [Geocoding API](https://developers.google.com/maps/documentation/geocoding) and [Places Text Search API](https://developers.google.com/maps/documentation/places/web-service/text-search).
+
+### Address lookup
+
+```go
+svc := google.NewGeocodeService(apiKey, api.CO.WithTimeout(5*time.Second))
+// or
+svc := google.NewPlacesService(apiKey, api.CO.WithTimeout(5*time.Second))
+
+results, err := svc.GetResults(ctx, "Shinjuku, Tokyo")
+// results[0].Address → "1 Chome Shinjuku, Shinjuku City, Tokyo 160-0022, Japan"
+// results[0].City    → "Shinjuku"
+```
+
+Both constructors return `google.Addresser`, making the backend interchangeable and easy to mock in tests:
+
+```go
+type Addresser interface {
+    GetResults(ctx context.Context, address string) ([]AddressResult, error)
+}
+```
+
+City is extracted by priority: `locality` is preferred over `administrative_area_level_1`. `AddressComponent.Name()` transparently unifies the field-name difference between the two APIs (`long_name` in Geocoding, `longText` in Places).
 
 [↑ Back to top](#packages)
 
@@ -336,916 +410,6 @@ StackFrame(0)
 StackFrame(0, "github.com/acme/myapp", "github.com/acme/shared")
 
 ```
-[↑ Back to top](#packages)
-
----
-
-## envutil/ — cmd/ main.go boilerplate helpers
-
-Tiny dependency-free helpers every cmd/main.go in the suite needs: env-var
-fallback chains, a fail-fast "required" check, a hostname default for
-per-host identifiers, and a safe close-if-Closer wrapper.
-
-```go
-import "github.com/abagile/tokyo3-base/envutil"
-```
-
-| Function | Purpose |
-|---|---|
-| `Or(key, fallback string) string` | Env var with a default. Empty/unset → fallback. |
-| `First(keys ...string) string` | First non-empty value among the named env vars (fallback chains). |
-| `MustEnv(key string) string` | Required env var. Writes `"<key> is required"` to stderr and `os.Exit(2)` when unset — matches Go's `flag.Parse` convention for usage/config errors. |
-| `HostnameOrEmpty() string` | `os.Hostname()` on success, `""` on error. Default for per-host identifier env vars like `CERT_AGENTD_INSTANCE`. |
-
-```go
-addr      := envutil.Or("MYDAEMON_ADDR", ":8080")
-caFile    := envutil.First("MYDAEMON_NATS_CA", "MYDAEMON_WORKLOAD_CA")
-issuer    := envutil.MustEnv("MYDAEMON_ISSUER")
-instance  := envutil.Or("MYDAEMON_INSTANCE", envutil.HostnameOrEmpty())
-```
-
-[↑ Back to top](#packages)
-
----
-
-## version/ — build version resolution
-
-```go
-import "github.com/abagile/tokyo3-base/version"
-
-func Resolve(injected string) string
-```
-
-Maps an ldflags-injected `main.Version` to an effective version string,
-falling back to `runtime/debug.BuildInfo` so `go install …@vX.Y.Z` and
-source-tree builds still report something useful without a Make-driven
-inject. Keep `var Version = "dev"` in `main` (the linker target stays
-`main.Version`) and call `version.Resolve(Version)`.
-
-Resolution order:
-
-1. `injected`, when the linker set it to anything other than `"dev"`.
-2. `BuildInfo.Main.Version` when it's a real module version (e.g.
-   `v1.2.3`) — what `go install pkg@vX.Y.Z` records.
-3. `dev-<vcs.revision[:7]>[-dirty] (<vcs.time>)` from the VCS settings the
-   toolchain stamps into source-tree builds; the commit time is appended
-   when present, rendered in the local time zone.
-4. `"dev"` — last resort (e.g. `go run` outside a module).
-
-```go
-var Version = "dev" // -ldflags "-X main.Version=v1.2.3"
-fmt.Printf("%s %s\n", appName, version.Resolve(Version))
-// tagged install → "v1.2.3"
-// local build    → "dev-1a2b3c4 (2026-05-31T17:30:00+08:00)"
-```
-
-> A Docker image built from a source copy with no `.git` and no ldflags
-> reports `"dev"` — stamp the tag via a `VERSION` build-arg + `-X
-> main.Version` so released images carry their version.
-
-[↑ Back to top](#packages)
-
----
-
-## debug/ — opt-in diagnostics server
-
-```go
-import "github.com/abagile/tokyo3-base/debug"
-
-type Config struct {
-    Addr       string        // listen addr, e.g. "127.0.0.1:6060"; empty = disabled
-    Log        *slog.Logger  // defaults to slog.Default()
-    StatsEvery time.Duration // runtime-stats interval; default 30s
-}
-
-func Start(ctx context.Context, cfg Config)
-func Handler() http.Handler
-```
-
-Serves Go runtime profiles (goroutine, heap, threadcreate, allocs, block,
-mutex, CPU, trace) plus a periodic goroutine / OS-thread / heap log line,
-for chasing leaks and stalls. A no-op when `Addr` is empty, so importing
-it is inert until a daemon opts in.
-
-Unlike `net/http/pprof`, it registers **nothing** on
-`http.DefaultServeMux`: the handlers are built directly from
-`runtime/pprof` + `runtime/trace` and served on the package's own mux — so
-importing it can never quietly attach profiling to a binary that serves
-the default mux. `Handler()` exposes that mux for mounting on an existing
-admin server.
-
-```go
-debug.Start(ctx, debug.Config{Addr: os.Getenv("CERTD_DEBUG_ADDR"), Log: log})
-
-// curl http://127.0.0.1:6060/debug/pprof/goroutine?debug=1     # counts by stack
-// curl http://127.0.0.1:6060/debug/pprof/threadcreate?debug=1  # OS threads ≈ cgroup pids.current
-```
-
-A steadily climbing `goroutines` in the stats line confirms a goroutine
-leak; climbing `os_threads` with flat goroutines points instead at threads
-stuck in blocking syscalls/cgo.
-
-> **Unauthenticated** — bind `Addr` to loopback or a private interface;
-> never expose it publicly.
-
-[↑ Back to top](#packages)
-
----
-
-## cli/ — daemon startup composition
-
-```go
-import "github.com/abagile/tokyo3-base/cli"
-
-type App struct {
-    Name      string  // short binary name → slog "app" attr + app_log subject
-    EnvPrefix string  // env-var prefix, e.g. "CERTD"
-    Instance  string  // optional per-host id (fleet agents) → app_log.<Name>.<Instance>
-}
-
-func (a App) Setup(parent context.Context) Runtime
-func (a App) NATS() NATS
-func (a App) DB() DB
-func (a App) AdminDB() DB
-```
-
-Composes the bootstrap prelude every daemon repeats — application logger
-(with NATS log shipping), a `SIGINT`/`SIGTERM`-cancelled context, and the
-opt-in diagnostics server — depending on `applog`, `debug`, and `envutil`
-but **not** a command framework. Each binary keeps its own cobra (or
-other) command tree and calls `Setup` from inside its serve command.
-`Setup` is additive: a daemon with non-standard env keys can skip it and
-wire the pieces directly.
-
-```go
-func runServe(ctx context.Context) error {
-    rt := cli.App{Name: "certd", EnvPrefix: "CERTD"}.Setup(ctx)
-    defer rt.Shutdown()
-    log := rt.Log
-    // ... build the server, serve until rt.Ctx.Done() ...
-}
-```
-
-```go
-type Runtime struct {
-    Log       *slog.Logger
-    Ctx       context.Context // cancelled on signal or parent cancel
-    NATS      NATS            // resolved NATS material (WORKLOAD_* fallback)
-    DB        DB              // resolved runtime Postgres material (no WORKLOAD fallback)
-    AdminDB   DB              // admin/migration material (ADMIN_* → DB_* → blank)
-    EnvPrefix string
-    Shutdown  func()          // defer it: releases the signal hook + drains the logger
-}
-```
-
-### WORKLOAD identity convention
-
-A daemon's mesh mTLS identity is `<PREFIX>_WORKLOAD_CERT` / `_WORKLOAD_KEY`
-/ `_WORKLOAD_CA`. The **NATS** channel reuses it: each of
-`<PREFIX>_NATS_CERT/KEY/CA` falls back to the matching `WORKLOAD_*`, so a
-daemon that already has a workload identity ships logs and audit over mTLS
-without extra cert sets. Set `<PREFIX>_NATS_*` only to override.
-
-The **Postgres** channel splits the fallback. The client **cert/key** are a
-database-role credential, not the workload identity, so
-`<PREFIX>_DB_CERT/KEY` resolve verbatim (unset ⇒ no client cert, the DSN's
-`sslmode` governs TLS). The **CA** is the shared mesh trust root, so
-`<PREFIX>_DB_CA` falls back to `<PREFIX>_WORKLOAD_CA`. The admin/migration
-material adds an `ADMIN_*` tier on top: cert/key `<PREFIX>_ADMIN_DB_* →
-<PREFIX>_DB_*`, and CA `<PREFIX>_ADMIN_DB_CA → <PREFIX>_DB_CA →
-<PREFIX>_WORKLOAD_CA`.
-
-```go
-type NATS struct { URL, CertFile, KeyFile, CAFile string }
-type DB   struct { URL, CertFile, KeyFile, CAFile string }
-```
-
-`App.NATS()` resolves the NATS material (callable independently of `Setup`);
-`Runtime.NATS` carries the same resolution so audit and other NATS clients
-draw from one source of truth.
-
-`App.DB()` (DSN `<PREFIX>_DATABASE_URL`, files `<PREFIX>_DB_*`) and
-`App.AdminDB()` (`<PREFIX>_ADMIN_DATABASE_URL` / `_ADMIN_DB_*`, each falling
-back to the runtime value) resolve the Postgres material; `Runtime.DB` /
-`Runtime.AdminDB` carry it. These resolve material only — the caller builds a
-hot-reloading `*tls.Config` from the files via `tls/reloader.ClientConfig`
-and owns the connection (pool tuning, migrations); base has no single
-Postgres-open layer to host those.
-
-### Audit sink/source
-
-```go
-func AuditSink[T any](rt Runtime, subject string) (*journal.EncodedSink[T], error)
-func AuditSource(rt Runtime, stream, subject string) (journal.Source, error)
-```
-
-Build a daemon's primary audit publisher (typed by the app's Entry `T`)
-and own-stream reader from the resolved NATS material — the common case
-collapses to one generic call. A daemon that attaches to additional
-streams (e.g. certd tailing ssh-proxy's audit) wires those directly.
-No-op (no error) when no broker URL is configured.
-
-```go
-sink, _ := cli.AuditSink[audit.Entry](rt, audit.Subject)
-src,  _ := cli.AuditSource(rt, audit.StreamName, audit.Subject)
-```
-
-These are free functions, not methods on a generic `App`, so a daemon that
-publishes no audit (e.g. cert-agentd) uses a plain `App` with no spurious
-type parameter.
-
-[↑ Back to top](#packages)
-
----
-
-## guard/ — panic recovery for background work
-
-```go
-func Go(log *slog.Logger, name string, fn func())
-func Tick(log *slog.Logger, name string, fn func())
-func Close(v any)
-```
-
-A single unrecovered panic in any goroutine crashes the whole process, and
-net/http only recovers request handlers — not reapers, sync loops, or
-trackers. `Go` spawns a goroutine that recovers, logs (with a stack trace)
-under `name`, and returns instead of taking the process down. `Tick` is the
-in-loop counterpart: call it synchronously inside a ticker body so one bad
-iteration logs and the loop keeps firing. Pair them — `Go` as the outer
-backstop, `Tick` per iteration. `Close` is the cleanup companion: a
-best-effort `Close()` of a value that may or may not implement `io.Closer`
-(e.g. an audit sink that's a real client or a no-op) — typically deferred.
-
-A zero-dependency leaf (stdlib only), so a lean tool can recover background
-goroutines without pulling the daemon-composition stack in `cli`.
-
-```go
-guard.Go(rt.Log, "audit-tracker", func() { tracker.Run(rt.Ctx) })
-
-for {
-    select {
-    case <-rt.Ctx.Done():
-        return
-    case <-ticker.C:
-        guard.Tick(rt.Log, "reaper", func() { reapOnce(rt.Ctx) })
-    }
-}
-
-sink, _ := openAuditSink(log)
-defer guard.Close(sink)
-```
-
-[↑ Back to top](#packages)
-
----
-
-## api/ — HTTP client utilities
-
-Thin option-driven wrapper over [go-resty/resty](https://github.com/go-resty/resty/v2) with bearer-token management, structured request logging, and context-scoped log annotation.
-
-### Client construction
-
-```go
-func NewRestClient(baseURL string, opts ...RestyClientOption) *RestyClient
-```
-
-```go
-rc := api.NewRestClient("https://api.example.com",
-    api.CO.WithTimeout(10 * time.Second),
-    api.CO.WithHeader("Accept", "application/json"),
-    api.CO.WithRequestLogger(logger),
-)
-```
-
-#### Client options (`CO`)
-
-| Option | Description |
-|---|---|
-| `CO.WithBaseUrl(url)` | Overrides the base URL after construction |
-| `CO.WithTimeout(d)` | Request timeout |
-| `CO.WithRetryCount(n)` | Number of retries on transient errors |
-| `CO.WithHeader(k, v)` | Sets a default request header |
-| `CO.WithHeaders(map)` | Sets multiple default request headers |
-| `CO.WithAuthToken(token)` | Sets `Authorization: Bearer <token>` on every request |
-| `CO.WithBasicAuth(u, p)` | Sets `Authorization: Basic …` on every request |
-| `CO.WithTransport(rt)` | Replaces the underlying `http.RoundTripper` (custom TLS, proxies, test mocks) |
-| `CO.WithDebug(bool)` | Enables resty debug output |
-| `CO.WithRequestLogger(logger)` | Attaches structured request/response logging (see below) |
-
-### Request execution
-
-```go
-func (rc *RestyClient) R(ctx context.Context, method, path string, result any, opts ...RestyRequestOption) error
-```
-
-Executes a request and unmarshals the response body into `result` on success. Returns `*ApiError` on HTTP error status; the response body is decoded with `encoding/json` directly (no Content-Type heuristics) so test mocks that omit `Content-Type: application/json` work unchanged.
-
-```go
-var out MyResponse
-err := rc.R(ctx, http.MethodGet, "/v1/orders/{id}", &out,
-    api.RO.WithPathParam("id", orderID),
-    api.RO.WithQueryParam("expand", "items"),
-)
-var apiErr *api.ApiError
-if errors.As(err, &apiErr) {
-    // apiErr.StatusCode holds the HTTP status;
-    // apiErr.Body holds the raw response body verbatim (capped at 64 KiB).
-}
-```
-
-#### `ApiError` shape
-
-```go
-type ApiError struct {
-    StatusCode int
-    Body       []byte
-}
-```
-
-`Error()` surfaces the body inline (truncated at 512 chars; full bytes
-available via the field) so server-side error messages reach operator logs
-without a second roundtrip:
-
-```
-api error: status 403: {"error":"policy denied for groups [eng]"}
-```
-
-JSON-decode failures on success-path responses surface as
-`"api call failed: decode response: <err>"` so callers can distinguish them
-from transport errors.
-
-#### Request options (`RO`)
-
-| Option | Description |
-|---|---|
-| `RO.WithQueryParam(k, v)` | Adds a query parameter |
-| `RO.WithQueryParams(map)` | Adds multiple query parameters |
-| `RO.WithPathParam(k, v)` | Substitutes a `{k}` placeholder in the path |
-| `RO.WithPathParams(map)` | Substitutes multiple path placeholders |
-| `RO.WithBody(v)` | Sets the request body (JSON-encoded) |
-| `RO.WithHeader(k, v)` | Sets a per-request header |
-| `RO.WithHeaders(map)` | Sets multiple per-request headers |
-| `RO.WithAuthToken(token)` | Overrides auth token for this request only |
-| `RO.WithBasicAuth(u, p)` | Overrides basic auth for this request only |
-| `RO.WithDebug(bool)` | Enables resty debug for this request only |
-
-### Bearer token management
-
-```go
-type BearerTokenManager struct { ... }
-type BearerTokenRefresher func(context.Context) (string, time.Time, error)
-```
-
-Thread-safe token cache with automatic refresh. Calls `Refresher` when the token is within 5 minutes of expiry (default buffer). Override per call via context:
-
-```go
-tm := &api.BearerTokenManager{
-    Refresher: func(ctx context.Context) (string, time.Time, error) {
-        return fetchTokenFromIDP(ctx) // returns token, expiresAt, err
-    },
-}
-
-// use default 5-min buffer
-token, err := tm.GetToken(ctx)
-
-// override buffer — refresh 10 min before expiry
-ctx = api.WithTokenRefreshBuffer(ctx, -10*time.Minute)
-token, err = tm.GetToken(ctx)
-```
-
-### Request logging
-
-`CO.WithRequestLogger` attaches a `*slog.Logger` that emits one `OUTGOING_REQUEST` line before each call and one `INCOMING_RESPONSE` line after. `Authorization` and `Cookie` headers are redacted automatically.
-
-#### Context log attributes
-
-Arbitrary key-value pairs stored in the context are appended to both log lines — no changes to client configuration required:
-
-```go
-ctx = api.WithLogAttr(ctx, "plan_no", "P-123")
-ctx = api.WithLogAttrs(ctx, map[string]string{"tref": "T-456", "tenant": "acme"})
-
-// OUTGOING_REQUEST: GET /orders |>> plan_no: [P-123] tenant: [acme] tref: [T-456]
-// INCOMING_RESPONSE: GET /orders 200 |>> plan_no: [P-123] tenant: [acme] tref: [T-456]
-```
-
-Each `WithLogAttr` / `WithLogAttrs` call produces a new context; the parent is never mutated. Keys are sorted alphabetically in the log output.
-
-```go
-func SanitizeHeaders(h map[string][]string) map[string][]string
-```
-
-Redacts `Authorization` and `Cookie` values (case-insensitive). Used internally by the logger; also available for custom middleware.
-
-[↑ Back to top](#packages)
-
----
-## api/google — Google Maps / Places client
-
-Typed client for the [Geocoding API](https://developers.google.com/maps/documentation/geocoding) and [Places Text Search API](https://developers.google.com/maps/documentation/places/web-service/text-search).
-
-### Address lookup
-
-```go
-svc := google.NewGeocodeService(apiKey, api.CO.WithTimeout(5*time.Second))
-// or
-svc := google.NewPlacesService(apiKey, api.CO.WithTimeout(5*time.Second))
-
-results, err := svc.GetResults(ctx, "Shinjuku, Tokyo")
-// results[0].Address → "1 Chome Shinjuku, Shinjuku City, Tokyo 160-0022, Japan"
-// results[0].City    → "Shinjuku"
-```
-
-Both constructors return `google.Addresser`, making the backend interchangeable and easy to mock in tests:
-
-```go
-type Addresser interface {
-    GetResults(ctx context.Context, address string) ([]AddressResult, error)
-}
-```
-
-City is extracted by priority: `locality` is preferred over `administrative_area_level_1`. `AddressComponent.Name()` transparently unifies the field-name difference between the two APIs (`long_name` in Geocoding, `longText` in Places).
-
-[↑ Back to top](#packages)
-
----
-
-## crypto/ — AES-256-GCM and envelope encryption
-
-A subpackage covering symmetric encryption primitives plus an
-envelope-encryption pattern layered on a `KeyProvider` interface, so the
-master key can live wherever the deployment requires (in process, sealed
-file, behind a KMS).
-
-```go
-import bcrypto "github.com/abagile/tokyo3-base/crypto"
-```
-
-Aliasing avoids the stdlib `crypto` collision — pick any name you prefer.
-
-### Direct AEAD primitives
-
-```go
-func Seal(key, plaintext  []byte) ([]byte, error)
-func Open(key, ciphertext []byte) ([]byte, error)
-```
-
-`Seal` encrypts under a 16/24/32-byte AES key using AES-GCM with a fresh
-96-bit random nonce and returns `nonce || ciphertext+tag`. `Open` is the
-inverse. Reach for these when you already have a key and just need to
-seal/unseal short blobs (cookies, session tokens, signed-but-encrypted
-payloads).
-
-> **Nonce-reuse limit**: with random 96-bit nonces a single key is
-> collision-safe up to ~2³² messages (NIST SP 800-38D). Rotate keys
-> before exceeding that, or switch to a deterministic counter nonce.
-
-### Random material and key encoding
-
-```go
-func RandomBytes(n int)               ([]byte, error)
-func GenerateKEK()                    (string, error)   // 32-byte AES-256 key, hex-encoded
-func ParseKEK(hexKey string)          ([]byte, error)   // inverse of GenerateKEK
-```
-
-`RandomBytes` is the single source of cryptographically random bytes used
-internally for keys, DEKs, and nonces. `GenerateKEK` / `ParseKEK` cover
-the common "32-byte AES key as a 64-char hex string" exchange format used
-by env vars and config files; despite the KEK naming, the bytes are just
-an AES-256 key suitable for any role.
-
-### KeyProvider and envelope encryption
-
-For collections of secrets — or any time you want to rotate the master
-key without re-encrypting every value — use envelope encryption: each
-value is encrypted under its own random Data Encryption Key (DEK), and
-the DEK is wrapped under a longer-lived master key via a `KeyProvider`.
-Rotating the master only requires re-wrapping DEKs; the underlying
-ciphertexts stay valid.
-
-```go
-type KeyProvider interface {
-    Wrap  (ctx context.Context, dek         []byte) ([]byte, error)
-    Unwrap(ctx context.Context, wrappedDEK  []byte) ([]byte, error)
-}
-
-func NewLocalKeyProvider(masterKey []byte) *LocalKeyProvider
-
-func EncryptEnvelope(ctx context.Context, kp KeyProvider, plaintext []byte) (encryptedValue, wrappedDEK []byte, err error)
-func DecryptEnvelope(ctx context.Context, kp KeyProvider, wrappedDEK, encryptedValue []byte) ([]byte, error)
-func Rewrap        (ctx context.Context, oldKP, newKP KeyProvider, wrappedDEK []byte) ([]byte, error)
-```
-
-`LocalKeyProvider` wraps DEKs with an in-memory AES-256 master key —
-suitable for development and single-server deployments. For production,
-implement `KeyProvider` against AWS KMS, GCP KMS, HashiCorp Vault Transit,
-or any HSM-backed service; the rest of the API is unchanged.
-
-```go
-hex, _ := bcrypto.GenerateKEK()
-key, _ := bcrypto.ParseKEK(hex)
-kp     := bcrypto.NewLocalKeyProvider(key)
-
-ct, wrappedDEK, _ := bcrypto.EncryptEnvelope(ctx, kp, []byte("postgres://…"))
-pt,             _ := bcrypto.DecryptEnvelope(ctx, kp, wrappedDEK, ct)
-```
-
-Rotating the master key without re-encrypting any values:
-
-```go
-newKP := bcrypto.NewLocalKeyProvider(newKey)
-newWrapped, _ := bcrypto.Rewrap(ctx, kp, newKP, wrappedDEK)
-// persist newWrapped alongside ct; ct stays as-is.
-```
-
-### KeyProviderCache — per-id intermediate-key cache
-
-```go
-type KeyProviderCache struct { /* ... */ }
-
-func NewKeyProviderCache(master KeyProvider, ttl time.Duration) *KeyProviderCache
-func (c *KeyProviderCache) ForKey(ctx context.Context, keyID string, wrappedKey []byte) (KeyProvider, error)
-func (c *KeyProviderCache) Invalidate(keyID string)
-```
-
-For deployments with a tree of envelope keys — the master wraps N
-intermediate keys, each of which wraps many DEKs — `KeyProviderCache`
-unwraps each intermediate at most once per `ttl` and hands the resulting
-KeyProvider out for subsequent operations. Concurrent cold misses for
-the same `keyID` are coalesced into one `master.Unwrap` via
-`golang.org/x/sync/singleflight`, so a thundering herd at startup or
-post-TTL costs one master call, not N. Pass `nil` as `wrappedKey` to get
-the master back directly — handy for callers that mix migrated and
-unmigrated rows.
-
-```go
-cache := bcrypto.NewKeyProviderCache(masterKP, 5*time.Minute)
-
-// On every secret operation: cheap cache hit after the first call per key.
-kp, err := cache.ForKey(ctx, projectID, wrappedProjectKey)
-if err != nil { /* ... */ }
-ct, wrappedDEK, _ := bcrypto.EncryptEnvelope(ctx, kp, plaintext)
-
-// After rotating the underlying key:
-cache.Invalidate(projectID)
-```
-
-[↑ Back to top](#packages)
-
----
-
-## nats/ — NATS dial helper
-
-A one-line wrapper around the boilerplate every NATS-connecting binary
-spells out by hand: load optional mTLS material via `tls.FromFiles`,
-attach `nats.Secure` when the TLS config is non-nil, then `nats.Connect`.
-
-```go
-import (
-    "github.com/abagile/tokyo3-base/nats"
-    "github.com/nats-io/nats.go"
-)
-
-func Dial(url, certFile, keyFile, caFile string, opts ...nats.Option) (*nats.Conn, error)
-```
-
-`certFile`/`keyFile`/`caFile` are forwarded to `tls.FromFiles` — pass
-all three (or all empty) together; empty paths produce a plaintext
-connection (development only).
-
-The variadic `opts ...nats.Option` lets callers tune timeouts, drain
-behaviour, retry policy, reconnect handlers, etc. without bloating the
-signature. They're applied **after** the implicit `nats.Secure` so the
-caller's TLS opinion (if any) wins for everything other than the cert
-material itself.
-
-```go
-nc, err := nats.Dial(
-    os.Getenv("VAULT_NATS_URL"),
-    os.Getenv("VAULT_NATS_CERT"),
-    os.Getenv("VAULT_NATS_KEY"),
-    os.Getenv("VAULT_NATS_CA"),
-    nats.Timeout(1*time.Second),         // fail fast if the broker is unreachable
-    nats.DrainTimeout(500*time.Millisecond), // bound shutdown drain
-)
-```
-
-Pairs with `journal/jetstream` (which dials internally via the same
-shape) and with `WithAsyncNats` from `log.go` (which takes an
-externally-owned `*nats.Conn`).
-
-[↑ Back to top](#packages)
-
----
-
-## tls/ — stateless TLS helpers
-
-Pure helpers for the boring parts of running a TLS server or client
-without inventing your own PKI: build `*tls.Config` from PEM files or
-strings, parse a trust pool, verify a peer chain, and ship a self-signed
-dev fallback covering `localhost`, `*.localhost`, and loopback IPs.
-Everything here reads its inputs once and returns — no caching, no
-goroutines. For material that rotates under a running process (leaf
-reloaded per handshake, CA pool re-read on change), see
-[`tls/reloader`](#tlsreloader--hot-reload-loaders--multi-pool-orchestrator).
-
-```go
-import "github.com/abagile/tokyo3-base/tls"
-```
-
-### SelfSignedCert — ephemeral dev fallback
-
-```go
-func SelfSignedCert() (tls.Certificate, error)
-```
-
-Generates an ECDSA P-256 self-signed cert valid for one year. SANs cover
-`localhost`, `*.localhost` (single-label subdomains like `api.localhost`),
-`127.0.0.1`, and `::1`. Use as the TLS fallback when no cert/key files
-are configured — clients need `--insecure` (curl) or trust-store import
-(browsers), but `https://localhost` and `https://anything.localhost`
-resolve cleanly.
-
-### Building `*tls.Config`
-
-```go
-func CertPoolFromPEM (pemData []byte)                   (*x509.CertPool, error)
-func CertPoolFromFile(path string)                      (*x509.CertPool, error)
-func FromFiles       (certFile, keyFile, caFile string) (*tls.Config,   error)
-func FromPEM         (certPEM,  keyPEM,  caPEM  string) (*tls.Config,   error)
-func VerifyPeerChain (roots *x509.CertPool, cs tls.ConnectionState) error
-```
-
-`FromFiles` and `FromPEM` are symmetrical: one takes paths, the other
-takes already-loaded PEM strings. Both return `(nil, nil)` when given no
-inputs, so call sites can switch transparently between TLS and plaintext.
-`certFile` / `keyFile` (or `certPEM` / `keyPEM`) must be set together; the
-CA input is optional and populates `RootCAs` when provided.
-
-```go
-// mTLS client config from disk
-cfg, err := tls.FromFiles(
-    "/etc/tls/client.crt",
-    "/etc/tls/client.key",
-    "/etc/tls/ca.crt",
-)
-if err != nil { /* ... */ }
-http.DefaultClient.Transport = &http.Transport{TLSClientConfig: cfg}
-```
-
-`CertPoolFromPEM` is the lower-level building block when you already have
-PEM bytes and just want a `*x509.CertPool` for `RootCAs` / `ClientCAs`.
-`CertPoolFromFile(path)` is the path-taking variant — reads the PEM
-file and rejects bundles with zero certificates so a typo'd path
-doesn't silently disable trust.
-
-`VerifyPeerChain` runs chain + hostname verification of a peer against a
-root pool (roots as anchors, intermediates from the rest of the peer
-chain, SNI as the DNS name). Standalone it's a one-shot check; it's also
-the verification primitive the hot-reload loaders in `tls/reloader` pair
-with `InsecureSkipVerify` to verify against a live, swappable pool.
-
-### tls/reloader — hot-reload loaders + multi-pool orchestrator
-
-```go
-import "github.com/abagile/tokyo3-base/tls/reloader"
-```
-
-Everything stateful: TLS material that rotates under a running process
-without a restart. Three tiers, low to high — the loaders, the
-single-pool client shortcut, and the named multi-pool orchestrator.
-
-#### CertLoader / CALoader — the reloading primitives
-
-```go
-type CertLoader struct {
-    OnSwap  func(cert *tls.Certificate, mtime time.Time)  // optional observation hooks
-    OnError func(err error)
-    /* ... */
-}
-
-func NewCertLoader(certFile, keyFile string) *CertLoader
-func (c *CertLoader) GetCertificate(_ *tls.ClientHelloInfo) (*tls.Certificate, error)        // server side
-func (c *CertLoader) GetClientCertificate(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) // client side
-func (c *CertLoader) Reload() error                                                          // forced, bypasses the mtime gate
-
-type CALoader struct {
-    OnSwap  func(raw []byte, mtime time.Time)  // raw PEM, for fingerprinting
-    OnError func(err error)
-    /* ... */
-}
-
-func NewCALoader(caFile string) *CALoader
-func (l *CALoader) Pool() (*x509.CertPool, error)
-func (l *CALoader) VerifyConnection(cs tls.ConnectionState) error
-```
-
-`CertLoader.GetCertificate` slots into `tls.Config.GetCertificate` (server)
-and `GetClientCertificate` into `tls.Config.GetClientCertificate` (client);
-both share one stat-and-reload path. On every handshake the loader
-stat-checks the cert file; if the mtime has advanced it reloads the pair
-and serves the new cert from then on. Concurrent stale callers are coalesced
-through a double-checked write lock. When a reload fails (e.g. cert written,
-key not yet during a rotation) the previously cached cert is returned so
-in-flight handshakes are unaffected. `Reload()` re-reads regardless of mtime
-— for rotators whose write may not advance the mtime past the cached value
-(same-second coalescing).
-
-`CALoader` is the trust-side sibling: wire `VerifyConnection` into
-`tls.Config.VerifyConnection` (with `InsecureSkipVerify`, since the standard
-verifier freezes `RootCAs` at construction) so a CA bundle dropped in place
-is honored on the next handshake. The `OnSwap`/`OnError` hooks on both are
-observation seams the `Reloader` orchestrator uses for swap/failure logging;
-a failed re-read keeps the previous cert/pool live so a corrupt drop-in
-never opens a trust window.
-
-```go
-// server cert that cert-manager / SPIFFE / ACME rotates in place:
-loader := reloader.NewCertLoader("/etc/tls/server.crt", "/etc/tls/server.key")
-srv := &http.Server{
-    Addr:      ":443",
-    TLSConfig: &tls.Config{GetCertificate: loader.GetCertificate},
-}
-srv.ListenAndServeTLS("", "")  // empty paths — cert comes from GetCertificate
-```
-
-#### ClientConfig — single-pool rotation-safe mTLS client config
-
-```go
-func ClientConfig(certFile, keyFile, caFile string) (*tls.Config, error)
-```
-
-`tls.FromFiles` loads the leaf into `tls.Config.Certificates` **once** at
-build time — fine for a long-lived server cert, but a trap for a *client*
-whose short-TTL workload cert is rotated in place: the connection keeps
-presenting the boot-time copy and breaks on the first reconnect after it
-expires. `ClientConfig` closes that gap by composing the two loaders — the
-leaf reloads per handshake via `CertLoader.GetClientCertificate`, and the CA
-pool re-reads on mtime change via `CALoader.VerifyConnection` (the config
-carries `InsecureSkipVerify`; verification runs against the live pool). A
-failed re-read keeps the previous pool live. `certFile`/`keyFile` are
-required and eagerly loaded so a bad path fails the call rather than the
-first silent handshake; `caFile` is optional (empty ⇒ system roots,
-standard verification).
-
-```go
-// e.g. a NATS log/audit client whose cert cert-agentd rotates every ~10 min
-cfg, err := reloader.ClientConfig(
-    "/certs/workload.crt",
-    "/certs/workload.key",
-    "/certs/ca.crt",
-)
-if err != nil { /* ... */ }
-nc, err := nats.Connect(url, nats.Secure(cfg))
-```
-
-The `applog` NATS shipping helper drives this for you whenever
-`NATSConfig.CertFile`/`KeyFile` are set; reach for `ClientConfig` directly
-when wiring a bespoke long-lived single-pool mTLS client. For named
-multi-pool trust, expiry telemetry, and poll/refresh disciplines, use the
-`Reloader` orchestrator below.
-
-#### Reloader — named multi-pool orchestrator
-
-For **client-side** mTLS where the workload cert+key and one or more CA
-trust pools rotate from under a running daemon — typical of cert-agentd
-renewing its own SPIFFE cert in-process, or ssh-tunneld picking up an
-external rotator's drop-in.
-
-```go
-type Config struct {
-    CertPath, KeyPath string
-    Pools             map[string]string  // name → CA bundle path
-    PollCert          bool               // true ⇒ also mtime-poll cert+key
-    Log               *slog.Logger
-}
-
-type Reloader struct { /* ... */ }
-
-func New(cfg Config) (*Reloader, error)
-func (r *Reloader) Refresh() error                                       // explicit cert re-read
-func (r *Reloader) GetClientCertificate(*tls.CertificateRequestInfo) (*tls.Certificate, error)
-func (r *Reloader) LeafExpiry() time.Time                                // leaf cert NotAfter
-func (r *Reloader) TLSConfig(poolName string, opts ...TLSConfigOption) *tls.Config
-func (r *Reloader) RunPoll(ctx context.Context, interval time.Duration) error
-func (r *Reloader) VerifyConnection(poolName string) func(tls.ConnectionState) error
-
-func WithServerName(name string) TLSConfigOption
-```
-
-`Reloader.TLSConfig(poolName)` returns a `*tls.Config` whose
-`GetClientCertificate` and `VerifyConnection` callbacks read live in-memory
-state — rotated material applies on the next TLS handshake without
-rebuilding the http.Client. `InsecureSkipVerify: true` is set on purpose;
-the standard verifier freezes `RootCAs` at config-construction, so
-hot-reload uses `VerifyConnection` against a per-handshake pool snapshot
-instead.
-
-The mechanics are the primitives above — one `CertLoader` for the pair,
-one `CALoader` per file-backed pool — so material whose file mtime has
-advanced is also picked up lazily at the next handshake, with swap and
-failure logging wired through the loaders' `OnSwap`/`OnError` hooks. On
-top of that, two refresh disciplines, picked per use case:
-
-- **Explicit refresh** (`PollCert: false`): caller invokes `r.Refresh()`
-  from wherever a new cert lands — typically a renewer's `OnRenewed`
-  callback. Suits binaries that mint their own certs in-process;
-  `Refresh` bypasses the mtime gate, covering same-second writes that
-  per-handshake pickup would miss.
-- **mtime polling** (`PollCert: true`): `RunPoll` probes the cert+key
-  files' mtimes on a fixed cadence. Suits binaries whose cert is
-  rotated by an external agent; the poll bounds how long a rotation
-  waits for the next handshake and gives failures a warn cadence.
-
-CA pools are always mtime-probed by `RunPoll` regardless of `PollCert` —
-they don't have a single explicit-refresh trigger like the cert+key pair
-does. Each pool is registered with a caller-chosen name in `Config.Pools`
-(`"ca"`, `"proxy"`, `"certd"`, …); the same name flows through
-`TLSConfig(name)` to address per-pool tls.Configs from one Reloader.
-
-An empty path in `Config.Pools` is a sentinel for "load from
-`x509.SystemCertPool()`" — useful for dev paths that connect to a
-public-CA-signed endpoint without pinning trust. System pools are
-snapshot at construction; they can't be hot-reloaded and `RunPoll`
-skips them silently:
-
-```go
-r, _ := reloader.New(reloader.Config{
-    CertPath: certPath, KeyPath: keyPath,
-    Pools: map[string]string{
-        "ca": os.Getenv("CERTD_CA_BUNDLE"),  // "" → OS trust store
-    },
-    PollCert: true,
-    Log:      log,
-})
-```
-
-```go
-// single-pool, explicit-refresh (cert-agentd pattern):
-r, _ := reloader.New(reloader.Config{
-    CertPath: "/etc/workload/cert.pem",
-    KeyPath:  "/etc/workload/key.pem",
-    Pools:    map[string]string{"ca": "/etc/workload/ca.pem"},
-    Log:      log,
-})
-client, _ := certd.NewClient(certdURL, r.TLSConfig("ca"))
-// after a successful renewal:
-r.Refresh()
-go func() { errCh <- r.RunPoll(ctx, reloader.DefaultPollInterval) }()
-
-// multi-pool, passive mtime pickup (ssh-tunneld pattern):
-r, _ := reloader.New(reloader.Config{
-    CertPath: certPath, KeyPath: keyPath,
-    Pools: map[string]string{
-        "proxy": proxyCAPath,
-        "certd": certdCAPath,
-    },
-    PollCert: true,
-    Log:      log,
-})
-proxyTLS := r.TLSConfig("proxy", reloader.WithServerName("proxy.internal"))
-certdTLS := r.TLSConfig("certd")
-go func() { errCh <- r.RunPoll(ctx, reloader.DefaultPollInterval) }()
-```
-
-`RunPoll` blocks until ctx cancel — the caller owns the goroutine lifecycle
-(matches `http.Server.ListenAndServe`'s discipline). Read failures during
-RunPoll keep the previous in-memory state live and emit a warn log so a
-corrupt drop-in never opens a trust window.
-
-#### Expiry helpers
-
-```go
-func (r *Reloader) WarnIfNearExpiry(threshold time.Duration, msg string)
-func (r *Reloader) ExpiryAttrs(attrName string) func() []any
-```
-
-`WarnIfNearExpiry` emits a single startup-time Warn on the reloader's
-logger when the leaf cert is within `threshold` of expiry (typical
-threshold: `24*time.Hour`). The line carries `remaining` and
-`not_after` structured attrs so alerting rules can fire on either
-field without parsing message text. No-op until the cert has loaded.
-
-`ExpiryAttrs(attrName)` returns a closure that yields
-`[attrName, time-until-leaf-expiry-rounded-to-seconds]` on every
-call — the shape that retry-surface error-attrs hooks like
-`revcheck.Config.RefreshErrorAttrs`, `hostcert.Config.SignErrorAttrs`,
-and `renew.Config.SignErrorAttrs` want. Operators grep one
-consistent attr across every retry surface to see cert exhaustion
-approaching.
-
-```go
-r.WarnIfNearExpiry(24*time.Hour, "workload mTLS cert near expiry")
-
-renewer, _ := renew.New(renew.Config{
-    SignErrorAttrs: r.ExpiryAttrs("mtls_cert_remaining"),
-    // ...
-})
-```
-
-Pairs with `tls.CertLoader` above on the **server** side; together they
-cover both directions of hot-reload for daemons that act as both client and
-server.
 
 [↑ Back to top](#packages)
 
@@ -1507,6 +671,501 @@ window); pass 0 to fall back to the configured default.
 the `JWK` shape published at `/.well-known/jwks.json`. Caller
 assembles the `JWKS` document by walking every active key in its
 keystore — this package doesn't know about storage.
+
+[↑ Back to top](#packages)
+
+---
+
+## cli/ — daemon startup composition
+
+```go
+import "github.com/abagile/tokyo3-base/cli"
+
+type App struct {
+    Name      string  // short binary name → slog "app" attr + app_log subject
+    EnvPrefix string  // env-var prefix, e.g. "CERTD"
+    Instance  string  // optional per-host id (fleet agents) → app_log.<Name>.<Instance>
+}
+
+func (a App) Setup(parent context.Context) Runtime
+func (a App) NATS() NATS
+func (a App) DB() DB
+func (a App) AdminDB() DB
+```
+
+Composes the bootstrap prelude every daemon repeats — application logger
+(with NATS log shipping), a `SIGINT`/`SIGTERM`-cancelled context, and the
+opt-in diagnostics server — depending on `applog`, `debug`, and `envutil`
+but **not** a command framework. Each binary keeps its own cobra (or
+other) command tree and calls `Setup` from inside its serve command.
+`Setup` is additive: a daemon with non-standard env keys can skip it and
+wire the pieces directly.
+
+```go
+func runServe(ctx context.Context) error {
+    rt := cli.App{Name: "certd", EnvPrefix: "CERTD"}.Setup(ctx)
+    defer rt.Shutdown()
+    log := rt.Log
+    // ... build the server, serve until rt.Ctx.Done() ...
+}
+```
+
+```go
+type Runtime struct {
+    Log       *slog.Logger
+    Ctx       context.Context // cancelled on signal or parent cancel
+    NATS      NATS            // resolved NATS material (WORKLOAD_* fallback)
+    DB        DB              // resolved runtime Postgres material (no WORKLOAD fallback)
+    AdminDB   DB              // admin/migration material (ADMIN_* → DB_* → blank)
+    EnvPrefix string
+    Shutdown  func()          // defer it: releases the signal hook + drains the logger
+}
+```
+
+### WORKLOAD identity convention
+
+A daemon's mesh mTLS identity is `<PREFIX>_WORKLOAD_CERT` / `_WORKLOAD_KEY`
+/ `_WORKLOAD_CA`. The **NATS** channel reuses it: each of
+`<PREFIX>_NATS_CERT/KEY/CA` falls back to the matching `WORKLOAD_*`, so a
+daemon that already has a workload identity ships logs and audit over mTLS
+without extra cert sets. Set `<PREFIX>_NATS_*` only to override.
+
+The **Postgres** channel splits the fallback. The client **cert/key** are a
+database-role credential, not the workload identity, so
+`<PREFIX>_DB_CERT/KEY` resolve verbatim (unset ⇒ no client cert, the DSN's
+`sslmode` governs TLS). The **CA** is the shared mesh trust root, so
+`<PREFIX>_DB_CA` falls back to `<PREFIX>_WORKLOAD_CA`. The admin/migration
+material adds an `ADMIN_*` tier on top: cert/key `<PREFIX>_ADMIN_DB_* →
+<PREFIX>_DB_*`, and CA `<PREFIX>_ADMIN_DB_CA → <PREFIX>_DB_CA →
+<PREFIX>_WORKLOAD_CA`.
+
+```go
+type NATS struct { URL, CertFile, KeyFile, CAFile string }
+type DB   struct { URL, CertFile, KeyFile, CAFile string }
+```
+
+`App.NATS()` resolves the NATS material (callable independently of `Setup`);
+`Runtime.NATS` carries the same resolution so audit and other NATS clients
+draw from one source of truth.
+
+`App.DB()` (DSN `<PREFIX>_DATABASE_URL`, files `<PREFIX>_DB_*`) and
+`App.AdminDB()` (`<PREFIX>_ADMIN_DATABASE_URL` / `_ADMIN_DB_*`, each falling
+back to the runtime value) resolve the Postgres material; `Runtime.DB` /
+`Runtime.AdminDB` carry it. These resolve material only — the caller builds a
+hot-reloading `*tls.Config` from the files via `tls/reloader.ClientConfig`
+and owns the connection (pool tuning, migrations); base has no single
+Postgres-open layer to host those.
+
+### Audit sink/source
+
+```go
+func AuditSink[T any](rt Runtime, subject string) (*journal.EncodedSink[T], error)
+func AuditSource(rt Runtime, stream, subject string) (journal.Source, error)
+```
+
+Build a daemon's primary audit publisher (typed by the app's Entry `T`)
+and own-stream reader from the resolved NATS material — the common case
+collapses to one generic call. A daemon that attaches to additional
+streams (e.g. certd tailing ssh-proxy's audit) wires those directly.
+No-op (no error) when no broker URL is configured.
+
+```go
+sink, _ := cli.AuditSink[audit.Entry](rt, audit.Subject)
+src,  _ := cli.AuditSource(rt, audit.StreamName, audit.Subject)
+```
+
+These are free functions, not methods on a generic `App`, so a daemon that
+publishes no audit (e.g. cert-agentd) uses a plain `App` with no spurious
+type parameter.
+
+[↑ Back to top](#packages)
+
+---
+
+## crypto/ — AES-256-GCM and envelope encryption
+
+A subpackage covering symmetric encryption primitives plus an
+envelope-encryption pattern layered on a `KeyProvider` interface, so the
+master key can live wherever the deployment requires (in process, sealed
+file, behind a KMS).
+
+```go
+import bcrypto "github.com/abagile/tokyo3-base/crypto"
+```
+
+Aliasing avoids the stdlib `crypto` collision — pick any name you prefer.
+
+### Direct AEAD primitives
+
+```go
+func Seal(key, plaintext  []byte) ([]byte, error)
+func Open(key, ciphertext []byte) ([]byte, error)
+```
+
+`Seal` encrypts under a 16/24/32-byte AES key using AES-GCM with a fresh
+96-bit random nonce and returns `nonce || ciphertext+tag`. `Open` is the
+inverse. Reach for these when you already have a key and just need to
+seal/unseal short blobs (cookies, session tokens, signed-but-encrypted
+payloads).
+
+> **Nonce-reuse limit**: with random 96-bit nonces a single key is
+> collision-safe up to ~2³² messages (NIST SP 800-38D). Rotate keys
+> before exceeding that, or switch to a deterministic counter nonce.
+
+### Random material and key encoding
+
+```go
+func RandomBytes(n int)               ([]byte, error)
+func GenerateKEK()                    (string, error)   // 32-byte AES-256 key, hex-encoded
+func ParseKEK(hexKey string)          ([]byte, error)   // inverse of GenerateKEK
+```
+
+`RandomBytes` is the single source of cryptographically random bytes used
+internally for keys, DEKs, and nonces. `GenerateKEK` / `ParseKEK` cover
+the common "32-byte AES key as a 64-char hex string" exchange format used
+by env vars and config files; despite the KEK naming, the bytes are just
+an AES-256 key suitable for any role.
+
+### KeyProvider and envelope encryption
+
+For collections of secrets — or any time you want to rotate the master
+key without re-encrypting every value — use envelope encryption: each
+value is encrypted under its own random Data Encryption Key (DEK), and
+the DEK is wrapped under a longer-lived master key via a `KeyProvider`.
+Rotating the master only requires re-wrapping DEKs; the underlying
+ciphertexts stay valid.
+
+```go
+type KeyProvider interface {
+    Wrap  (ctx context.Context, dek         []byte) ([]byte, error)
+    Unwrap(ctx context.Context, wrappedDEK  []byte) ([]byte, error)
+}
+
+func NewLocalKeyProvider(masterKey []byte) *LocalKeyProvider
+
+func EncryptEnvelope(ctx context.Context, kp KeyProvider, plaintext []byte) (encryptedValue, wrappedDEK []byte, err error)
+func DecryptEnvelope(ctx context.Context, kp KeyProvider, wrappedDEK, encryptedValue []byte) ([]byte, error)
+func Rewrap        (ctx context.Context, oldKP, newKP KeyProvider, wrappedDEK []byte) ([]byte, error)
+```
+
+`LocalKeyProvider` wraps DEKs with an in-memory AES-256 master key —
+suitable for development and single-server deployments. For production,
+implement `KeyProvider` against AWS KMS, GCP KMS, HashiCorp Vault Transit,
+or any HSM-backed service; the rest of the API is unchanged.
+
+```go
+hex, _ := bcrypto.GenerateKEK()
+key, _ := bcrypto.ParseKEK(hex)
+kp     := bcrypto.NewLocalKeyProvider(key)
+
+ct, wrappedDEK, _ := bcrypto.EncryptEnvelope(ctx, kp, []byte("postgres://…"))
+pt,             _ := bcrypto.DecryptEnvelope(ctx, kp, wrappedDEK, ct)
+```
+
+Rotating the master key without re-encrypting any values:
+
+```go
+newKP := bcrypto.NewLocalKeyProvider(newKey)
+newWrapped, _ := bcrypto.Rewrap(ctx, kp, newKP, wrappedDEK)
+// persist newWrapped alongside ct; ct stays as-is.
+```
+
+### KeyProviderCache — per-id intermediate-key cache
+
+```go
+type KeyProviderCache struct { /* ... */ }
+
+func NewKeyProviderCache(master KeyProvider, ttl time.Duration) *KeyProviderCache
+func (c *KeyProviderCache) ForKey(ctx context.Context, keyID string, wrappedKey []byte) (KeyProvider, error)
+func (c *KeyProviderCache) Invalidate(keyID string)
+```
+
+For deployments with a tree of envelope keys — the master wraps N
+intermediate keys, each of which wraps many DEKs — `KeyProviderCache`
+unwraps each intermediate at most once per `ttl` and hands the resulting
+KeyProvider out for subsequent operations. Concurrent cold misses for
+the same `keyID` are coalesced into one `master.Unwrap` via
+`golang.org/x/sync/singleflight`, so a thundering herd at startup or
+post-TTL costs one master call, not N. Pass `nil` as `wrappedKey` to get
+the master back directly — handy for callers that mix migrated and
+unmigrated rows.
+
+```go
+cache := bcrypto.NewKeyProviderCache(masterKP, 5*time.Minute)
+
+// On every secret operation: cheap cache hit after the first call per key.
+kp, err := cache.ForKey(ctx, projectID, wrappedProjectKey)
+if err != nil { /* ... */ }
+ct, wrappedDEK, _ := bcrypto.EncryptEnvelope(ctx, kp, plaintext)
+
+// After rotating the underlying key:
+cache.Invalidate(projectID)
+```
+
+[↑ Back to top](#packages)
+
+---
+
+## db/ — PostgreSQL / pgx utilities
+
+### Pool construction
+
+```go
+func NewPgxPool(connStr string, opts ...DatabaseConfigOption) (*pgxpool.Pool, error)
+```
+
+Creates a `pgxpool.Pool` from a connection string. Options are applied to the parsed config before the pool is created.
+
+```go
+type DatabaseConfigOption func(*pgxpool.Config)
+```
+
+Functional option type for `NewPgxPool`.
+
+### Options
+
+```go
+func WithDecimalRegister() DatabaseConfigOption
+```
+
+Registers [`govalues/decimal`](https://github.com/govalues/decimal) with the pgx type map on every new connection, enabling transparent encode/decode of `decimal.Decimal` for PostgreSQL `numeric` columns.
+
+```go
+pool, err := NewPgxPool(connStr, WithDecimalRegister())
+```
+
+### Connection string sanitization
+
+```go
+func SantizeDbConn(connStr string) string
+```
+
+Strips `user=` and `password=` key-value pairs from a DSN and collapses surrounding whitespace. Safe for logging.
+
+```go
+SantizeDbConn("host=localhost user=admin password=secret dbname=app")
+// → "host=localhost dbname=app"
+```
+
+### Placeholder conversion
+
+```go
+func ConvertPgPlaceholders(sql string, args ...any) (string, []any, error)
+```
+
+Converts PostgreSQL-style positional placeholders (`$1`, `$2`, …) to `?` placeholders, reordering `args` to match. Useful when targeting drivers that use `?` syntax (e.g. MySQL, SQLite) while authoring queries in PostgreSQL style.
+
+```go
+sql, args, err := ConvertPgPlaceholders(
+    "SELECT * FROM orders WHERE user_id = $1 AND status = $2",
+    userID, status,
+)
+// sql  → "SELECT * FROM orders WHERE user_id = ? AND status = ?"
+// args → []any{userID, status}
+```
+
+Returns an error if a placeholder index is out of range or malformed. Positional args may be repeated (`$1` used twice maps the same argument into both positions).
+
+### Struct copy with dereferencing
+
+```go
+func CopyDeref[T any, U any](src T, dst *U) (*U, error)
+```
+
+Copies fields from `src` to `dst` by name, with three conversion rules applied in order:
+
+| Source type | Destination type | Behaviour |
+|---|---|---|
+| `[]byte` | `string` | Converts bytes to string |
+| `*T` | `T` | Dereferences pointer; zeroes dst field if nil |
+| `T` | `T` | Direct assignment if types are assignable |
+
+Fields with no matching name in `src`, unexported fields, and fields whose types don't satisfy any rule are silently skipped. `src` may itself be a pointer — it is dereferenced before field matching begins.
+
+```go
+type Row struct {
+    Name  []byte
+    Score *int
+    Tag   string
+}
+type Model struct {
+    Name  string
+    Score int
+    Tag   string
+}
+
+score := 42
+row := Row{Name: []byte("alice"), Score: &score, Tag: "vip"}
+model, err := CopyDeref(row, &Model{})
+// model → Model{Name: "alice", Score: 42, Tag: "vip"}
+```
+
+[↑ Back to top](#packages)
+
+---
+
+## debug/ — opt-in diagnostics server
+
+```go
+import "github.com/abagile/tokyo3-base/debug"
+
+type Config struct {
+    Addr       string        // listen addr, e.g. "127.0.0.1:6060"; empty = disabled
+    Log        *slog.Logger  // defaults to slog.Default()
+    StatsEvery time.Duration // runtime-stats interval; default 30s
+}
+
+func Start(ctx context.Context, cfg Config)
+func Handler() http.Handler
+```
+
+Serves Go runtime profiles (goroutine, heap, threadcreate, allocs, block,
+mutex, CPU, trace) plus a periodic goroutine / OS-thread / heap log line,
+for chasing leaks and stalls. A no-op when `Addr` is empty, so importing
+it is inert until a daemon opts in.
+
+Unlike `net/http/pprof`, it registers **nothing** on
+`http.DefaultServeMux`: the handlers are built directly from
+`runtime/pprof` + `runtime/trace` and served on the package's own mux — so
+importing it can never quietly attach profiling to a binary that serves
+the default mux. `Handler()` exposes that mux for mounting on an existing
+admin server.
+
+```go
+debug.Start(ctx, debug.Config{Addr: os.Getenv("CERTD_DEBUG_ADDR"), Log: log})
+
+// curl http://127.0.0.1:6060/debug/pprof/goroutine?debug=1     # counts by stack
+// curl http://127.0.0.1:6060/debug/pprof/threadcreate?debug=1  # OS threads ≈ cgroup pids.current
+```
+
+A steadily climbing `goroutines` in the stats line confirms a goroutine
+leak; climbing `os_threads` with flat goroutines points instead at threads
+stuck in blocking syscalls/cgo.
+
+> **Unauthenticated** — bind `Addr` to loopback or a private interface;
+> never expose it publicly.
+
+[↑ Back to top](#packages)
+
+---
+
+## envutil/ — cmd/ main.go boilerplate helpers
+
+Tiny dependency-free helpers every cmd/main.go in the suite needs: env-var
+fallback chains, a fail-fast "required" check, a hostname default for
+per-host identifiers, and a safe close-if-Closer wrapper.
+
+```go
+import "github.com/abagile/tokyo3-base/envutil"
+```
+
+| Function | Purpose |
+|---|---|
+| `Or(key, fallback string) string` | Env var with a default. Empty/unset → fallback. |
+| `First(keys ...string) string` | First non-empty value among the named env vars (fallback chains). |
+| `MustEnv(key string) string` | Required env var. Writes `"<key> is required"` to stderr and `os.Exit(2)` when unset — matches Go's `flag.Parse` convention for usage/config errors. |
+| `HostnameOrEmpty() string` | `os.Hostname()` on success, `""` on error. Default for per-host identifier env vars like `CERT_AGENTD_INSTANCE`. |
+
+```go
+addr      := envutil.Or("MYDAEMON_ADDR", ":8080")
+caFile    := envutil.First("MYDAEMON_NATS_CA", "MYDAEMON_WORKLOAD_CA")
+issuer    := envutil.MustEnv("MYDAEMON_ISSUER")
+instance  := envutil.Or("MYDAEMON_INSTANCE", envutil.HostnameOrEmpty())
+```
+
+[↑ Back to top](#packages)
+
+---
+
+## guard/ — panic recovery for background work
+
+```go
+func Guarded(log *slog.Logger, name string, fn func()) func()
+func Go(log *slog.Logger, name string, fn func())
+func Tick(log *slog.Logger, name string, fn func())
+func Close(v any)
+```
+
+A single unrecovered panic in any goroutine crashes the whole process, and
+net/http only recovers request handlers — not reapers, sync loops, or
+trackers. `Go` spawns a goroutine that recovers, logs (with a stack trace)
+under `name`, and returns instead of taking the process down. `Guarded`
+returns that same recovery as a `func()` *without* launching it, so it drops
+into a launcher that owns the goroutine — `sync.WaitGroup.Go`, errgroup —
+when a recovered goroutine must also be joined at shutdown (`Go` is a
+one-liner over it). `Tick` is the
+in-loop counterpart: call it synchronously inside a ticker body so one bad
+iteration logs and the loop keeps firing. Pair them — `Go` as the outer
+backstop, `Tick` per iteration. `Close` is the cleanup companion: a
+best-effort `Close()` of a value that may or may not implement `io.Closer`
+(e.g. an audit sink that's a real client or a no-op) — typically deferred.
+
+A zero-dependency leaf (stdlib only), so a lean tool can recover background
+goroutines without pulling the daemon-composition stack in `cli`.
+
+```go
+guard.Go(rt.Log, "audit-tracker", func() { tracker.Run(rt.Ctx) })
+
+// joinable: same recovery, but a WaitGroup owns the goroutine so it can be
+// waited on at shutdown before the resources it uses are closed.
+var workers sync.WaitGroup
+workers.Go(guard.Guarded(rt.Log, "reaper", func() { runReaper(rt.Ctx) }))
+
+for {
+    select {
+    case <-rt.Ctx.Done():
+        return
+    case <-ticker.C:
+        guard.Tick(rt.Log, "reaper", func() { reapOnce(rt.Ctx) })
+    }
+}
+
+sink, _ := openAuditSink(log)
+defer guard.Close(sink)
+```
+
+[↑ Back to top](#packages)
+
+---
+
+## httpauth/ — HTTP auth middleware
+
+```go
+import "github.com/abagile/tokyo3-base/httpauth"
+
+type BasicAuthConfig struct {
+    Username string  // empty (either field) ⇒ gate disabled
+    Password string
+    Realm    string  // WWW-Authenticate realm; empty ⇒ "restricted"
+}
+
+func (c BasicAuthConfig) Enabled() bool
+func BasicAuth(cfg BasicAuthConfig, next http.Handler, exempt ...string) http.Handler
+```
+
+The HTTP Basic gate the daemons' admin portals share. When either credential
+is empty the gate is disabled and `next` is served unguarded — operators
+front the service with oauth2-proxy, an mTLS reverse proxy, or another
+identity-aware edge instead. When enabled, each request is constant-time
+compared against the configured credentials (a sha256 digest of each side, so
+an attacker's guess length doesn't leak). Paths in `exempt` (exact match)
+bypass the gate — pass `"/healthz"` so external watchdogs can probe without
+the admin credentials.
+
+```go
+mux := http.NewServeMux()
+// ... register routes ...
+handler := httpauth.BasicAuth(httpauth.BasicAuthConfig{
+    Username: os.Getenv("CERTD_PORTAL_USERNAME"),
+    Password: os.Getenv("CERTD_PORTAL_PASSWORD"),
+    Realm:    "certd portal",
+}, mux, "/healthz")
+```
+
+A transport-layer middleware, deliberately separate from the
+credential/token primitives in [`auth/`](#auth--auth-primitives-namespace):
+it *consumes* them rather than defining them, and keeps `net/http` out of
+that transport-agnostic namespace.
 
 [↑ Back to top](#packages)
 
@@ -1845,5 +1504,483 @@ mux.Handle("GET /admin/audit/sse",
 The Data is forwarded byte-for-byte from `Msg.Data`, so producers using
 `journal.NewJSONSink[T]` already publish wire-ready JSON — no transcoding
 on the read side. Browsers parse the `data:` payload as their own JSON.
+
+[↑ Back to top](#packages)
+
+---
+
+## nats/ — NATS dial helper
+
+A one-line wrapper around the boilerplate every NATS-connecting binary
+spells out by hand: load optional mTLS material via `tls.FromFiles`,
+attach `nats.Secure` when the TLS config is non-nil, then `nats.Connect`.
+
+```go
+import (
+    "github.com/abagile/tokyo3-base/nats"
+    "github.com/nats-io/nats.go"
+)
+
+func Dial(url, certFile, keyFile, caFile string, opts ...nats.Option) (*nats.Conn, error)
+```
+
+`certFile`/`keyFile`/`caFile` are forwarded to `tls.FromFiles` — pass
+all three (or all empty) together; empty paths produce a plaintext
+connection (development only).
+
+The variadic `opts ...nats.Option` lets callers tune timeouts, drain
+behaviour, retry policy, reconnect handlers, etc. without bloating the
+signature. They're applied **after** the implicit `nats.Secure` so the
+caller's TLS opinion (if any) wins for everything other than the cert
+material itself.
+
+```go
+nc, err := nats.Dial(
+    os.Getenv("VAULT_NATS_URL"),
+    os.Getenv("VAULT_NATS_CERT"),
+    os.Getenv("VAULT_NATS_KEY"),
+    os.Getenv("VAULT_NATS_CA"),
+    nats.Timeout(1*time.Second),         // fail fast if the broker is unreachable
+    nats.DrainTimeout(500*time.Millisecond), // bound shutdown drain
+)
+```
+
+Pairs with `journal/jetstream` (which dials internally via the same
+shape) and with `WithAsyncNats` from `log.go` (which takes an
+externally-owned `*nats.Conn`).
+
+[↑ Back to top](#packages)
+
+---
+
+## run/ — component lifecycle coordination
+
+```go
+import "github.com/abagile/tokyo3-base/run"
+
+type Component func(context.Context) error
+
+func Group(ctx context.Context, components ...Component) error
+func HTTPServer(srv *http.Server, shutdownTimeout time.Duration, useTLS bool) Component
+```
+
+The serve/shutdown discipline every daemon repeats: run N long-lived
+components concurrently, let the first to exit cancel the rest, and report
+the first error that isn't `context.Canceled`. `Group` derives a child of
+`ctx`, runs each `Component` on it, and on any component's return cancels
+that child. Siblings the caller runs on the parent `ctx` — best-effort
+pollers launched via `guard.Go` — are untouched, so they stop on the
+parent's own cancellation (a signal) or at process exit, not on a component
+exit.
+
+`HTTPServer` adapts a stdlib `*http.Server` into a `Component`: it serves
+until `ctx` cancels, then `Shutdown`s within `shutdownTimeout`, folding
+`http.ErrServerClosed` to nil. Pass `useTLS` for `ListenAndServeTLS` (the
+server's `TLSConfig` is the cert source, so the cert/key args stay empty).
+
+```go
+// single HTTPS server
+err := run.Group(rt.Ctx, run.HTTPServer(httpSrv, 10*time.Second, true))
+
+// several components — a ctx-aware method value satisfies Component directly,
+// a stdlib server gets the adapter
+err := run.Group(rt.Ctx,
+    sshSrv.ListenAndServe,                          // func(context.Context) error
+    run.HTTPServer(portalSrv, 5*time.Second, false),
+)
+```
+
+A component must return when its context is cancelled; one that ignores it
+stalls `Group`'s wait. `Group` is dependency-free (stdlib only), so tools and
+tests can use it without pulling in the `cli` daemon-composition stack.
+
+[↑ Back to top](#packages)
+
+---
+
+## tls/ — stateless TLS helpers
+
+Pure helpers for the boring parts of running a TLS server or client
+without inventing your own PKI: build `*tls.Config` from PEM files or
+strings, parse a trust pool, verify a peer chain, and ship a self-signed
+dev fallback covering `localhost`, `*.localhost`, and loopback IPs.
+Everything here reads its inputs once and returns — no caching, no
+goroutines. For material that rotates under a running process (leaf
+reloaded per handshake, CA pool re-read on change), see
+[`tls/reloader`](#tlsreloader--hot-reload-loaders--multi-pool-orchestrator).
+
+```go
+import "github.com/abagile/tokyo3-base/tls"
+```
+
+### SelfSignedCert — ephemeral dev fallback
+
+```go
+func SelfSignedCert() (tls.Certificate, error)
+```
+
+Generates an ECDSA P-256 self-signed cert valid for one year. SANs cover
+`localhost`, `*.localhost` (single-label subdomains like `api.localhost`),
+`127.0.0.1`, and `::1`. Use as the TLS fallback when no cert/key files
+are configured — clients need `--insecure` (curl) or trust-store import
+(browsers), but `https://localhost` and `https://anything.localhost`
+resolve cleanly.
+
+### Building `*tls.Config`
+
+```go
+func CertPoolFromPEM (pemData []byte)                   (*x509.CertPool, error)
+func CertPoolFromFile(path string)                      (*x509.CertPool, error)
+func FromFiles       (certFile, keyFile, caFile string) (*tls.Config,   error)
+func FromPEM         (certPEM,  keyPEM,  caPEM  string) (*tls.Config,   error)
+func VerifyPeerChain (roots *x509.CertPool, cs tls.ConnectionState) error
+```
+
+`FromFiles` and `FromPEM` are symmetrical: one takes paths, the other
+takes already-loaded PEM strings. Both return `(nil, nil)` when given no
+inputs, so call sites can switch transparently between TLS and plaintext.
+`certFile` / `keyFile` (or `certPEM` / `keyPEM`) must be set together; the
+CA input is optional and populates `RootCAs` when provided.
+
+```go
+// mTLS client config from disk
+cfg, err := tls.FromFiles(
+    "/etc/tls/client.crt",
+    "/etc/tls/client.key",
+    "/etc/tls/ca.crt",
+)
+if err != nil { /* ... */ }
+http.DefaultClient.Transport = &http.Transport{TLSClientConfig: cfg}
+```
+
+`CertPoolFromPEM` is the lower-level building block when you already have
+PEM bytes and just want a `*x509.CertPool` for `RootCAs` / `ClientCAs`.
+`CertPoolFromFile(path)` is the path-taking variant — reads the PEM
+file and rejects bundles with zero certificates so a typo'd path
+doesn't silently disable trust.
+
+`VerifyPeerChain` runs chain + hostname verification of a peer against a
+root pool (roots as anchors, intermediates from the rest of the peer
+chain, SNI as the DNS name). Standalone it's a one-shot check; it's also
+the verification primitive the hot-reload loaders in `tls/reloader` pair
+with `InsecureSkipVerify` to verify against a live, swappable pool.
+
+### tls/reloader — hot-reload loaders + multi-pool orchestrator
+
+```go
+import "github.com/abagile/tokyo3-base/tls/reloader"
+```
+
+Everything stateful: TLS material that rotates under a running process
+without a restart. Three tiers, low to high — the loaders, the
+single-pool client shortcut, and the named multi-pool orchestrator.
+
+#### CertLoader / CALoader — the reloading primitives
+
+```go
+type CertLoader struct {
+    OnSwap  func(cert *tls.Certificate, mtime time.Time)  // optional observation hooks
+    OnError func(err error)
+    /* ... */
+}
+
+func NewCertLoader(certFile, keyFile string) *CertLoader
+func (c *CertLoader) GetCertificate(_ *tls.ClientHelloInfo) (*tls.Certificate, error)        // server side
+func (c *CertLoader) GetClientCertificate(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) // client side
+func (c *CertLoader) Reload() error                                                          // forced, bypasses the mtime gate
+
+type CALoader struct {
+    OnSwap  func(raw []byte, mtime time.Time)  // raw PEM, for fingerprinting
+    OnError func(err error)
+    /* ... */
+}
+
+func NewCALoader(caFile string) *CALoader
+func (l *CALoader) Pool() (*x509.CertPool, error)
+func (l *CALoader) VerifyConnection(cs tls.ConnectionState) error
+```
+
+`CertLoader.GetCertificate` slots into `tls.Config.GetCertificate` (server)
+and `GetClientCertificate` into `tls.Config.GetClientCertificate` (client);
+both share one stat-and-reload path. On every handshake the loader
+stat-checks the cert file; if the mtime has advanced it reloads the pair
+and serves the new cert from then on. Concurrent stale callers are coalesced
+through a double-checked write lock. When a reload fails (e.g. cert written,
+key not yet during a rotation) the previously cached cert is returned so
+in-flight handshakes are unaffected. `Reload()` re-reads regardless of mtime
+— for rotators whose write may not advance the mtime past the cached value
+(same-second coalescing).
+
+`CALoader` is the trust-side sibling: wire `VerifyConnection` into
+`tls.Config.VerifyConnection` (with `InsecureSkipVerify`, since the standard
+verifier freezes `RootCAs` at construction) so a CA bundle dropped in place
+is honored on the next handshake. The `OnSwap`/`OnError` hooks on both are
+observation seams the `Reloader` orchestrator uses for swap/failure logging;
+a failed re-read keeps the previous cert/pool live so a corrupt drop-in
+never opens a trust window.
+
+```go
+// server cert that cert-manager / SPIFFE / ACME rotates in place:
+loader := reloader.NewCertLoader("/etc/tls/server.crt", "/etc/tls/server.key")
+srv := &http.Server{
+    Addr:      ":443",
+    TLSConfig: &tls.Config{GetCertificate: loader.GetCertificate},
+}
+srv.ListenAndServeTLS("", "")  // empty paths — cert comes from GetCertificate
+```
+
+#### ClientConfig — single-pool rotation-safe mTLS client config
+
+```go
+func ClientConfig(certFile, keyFile, caFile string) (*tls.Config, error)
+```
+
+`tls.FromFiles` loads the leaf into `tls.Config.Certificates` **once** at
+build time — fine for a long-lived server cert, but a trap for a *client*
+whose short-TTL workload cert is rotated in place: the connection keeps
+presenting the boot-time copy and breaks on the first reconnect after it
+expires. `ClientConfig` closes that gap by composing the two loaders — the
+leaf reloads per handshake via `CertLoader.GetClientCertificate`, and the CA
+pool re-reads on mtime change via `CALoader.VerifyConnection` (the config
+carries `InsecureSkipVerify`; verification runs against the live pool). A
+failed re-read keeps the previous pool live. `certFile`/`keyFile` are
+required and eagerly loaded so a bad path fails the call rather than the
+first silent handshake; `caFile` is optional (empty ⇒ system roots,
+standard verification).
+
+```go
+// e.g. a NATS log/audit client whose cert cert-agentd rotates every ~10 min
+cfg, err := reloader.ClientConfig(
+    "/certs/workload.crt",
+    "/certs/workload.key",
+    "/certs/ca.crt",
+)
+if err != nil { /* ... */ }
+nc, err := nats.Connect(url, nats.Secure(cfg))
+```
+
+The `applog` NATS shipping helper drives this for you whenever
+`NATSConfig.CertFile`/`KeyFile` are set; reach for `ClientConfig` directly
+when wiring a bespoke long-lived single-pool mTLS client. For named
+multi-pool trust, expiry telemetry, and poll/refresh disciplines, use the
+`Reloader` orchestrator below.
+
+#### ServerTLS — server-side HTTPS config builder
+
+```go
+type ServerTLSConfig struct {
+    CertFile, KeyFile string             // server leaf; both empty ⇒ self-signed dev fallback
+    ClientCAFile      string             // optional inbound mTLS client-CA bundle
+    ClientAuth        tls.ClientAuthType // applied when ClientCAFile set; 0 ⇒ VerifyClientCertIfGiven
+    MinVersion        uint16             // 0 ⇒ Go default
+    Log               *slog.Logger
+}
+
+func ServerTLS(cfg ServerTLSConfig) (*tls.Config, error)
+```
+
+The server-side sibling of `ClientConfig` — the `*tls.Config` an HTTPS
+listener needs. A cert+key pair wires a hot-reloading `CertLoader`
+(`GetCertificate`); both empty falls back to an ephemeral
+[`SelfSignedCert`](#selfsignedcert--ephemeral-dev-fallback) (dev, logged as a
+warning). An optional `ClientCAFile` wires hot-reloading inbound mTLS via
+`NewClientCALoader` — the bundle re-reads mtime-gated with keep-last-good, so
+a client-CA rotation (widen→narrow) lands without a restart. Each daemon
+previously carried a near-identical `buildServerTLS`; they now differ only in
+the env-var names and workload-CA fallback they resolve before calling.
+
+```go
+tlsCfg, err := reloader.ServerTLS(reloader.ServerTLSConfig{
+    CertFile:     os.Getenv("CERTD_API_CERT"),
+    KeyFile:      os.Getenv("CERTD_API_KEY"),
+    ClientCAFile: envutil.First("CERTD_API_CLIENT_CA", "CERTD_WORKLOAD_CA"),
+    MinVersion:   tls.VersionTLS12,
+    Log:          log,
+})
+if err != nil { /* ... */ }
+srv := &http.Server{Addr: addr, TLSConfig: tlsCfg, Handler: routes}
+srv.ListenAndServeTLS("", "")  // empty paths — cert comes from TLSConfig
+```
+
+#### Reloader — named multi-pool orchestrator
+
+For **client-side** mTLS where the workload cert+key and one or more CA
+trust pools rotate from under a running daemon — typical of cert-agentd
+renewing its own SPIFFE cert in-process, or ssh-tunneld picking up an
+external rotator's drop-in.
+
+```go
+type Config struct {
+    CertPath, KeyPath string
+    Pools             map[string]string  // name → CA bundle path
+    PollCert          bool               // true ⇒ also mtime-poll cert+key
+    Log               *slog.Logger
+}
+
+type Reloader struct { /* ... */ }
+
+func New(cfg Config) (*Reloader, error)
+func (r *Reloader) Refresh() error                                       // explicit cert re-read
+func (r *Reloader) GetClientCertificate(*tls.CertificateRequestInfo) (*tls.Certificate, error)
+func (r *Reloader) LeafExpiry() time.Time                                // leaf cert NotAfter
+func (r *Reloader) TLSConfig(poolName string, opts ...TLSConfigOption) *tls.Config
+func (r *Reloader) RunPoll(ctx context.Context, interval time.Duration) error
+func (r *Reloader) VerifyConnection(poolName string) func(tls.ConnectionState) error
+
+func WithServerName(name string) TLSConfigOption
+```
+
+`Reloader.TLSConfig(poolName)` returns a `*tls.Config` whose
+`GetClientCertificate` and `VerifyConnection` callbacks read live in-memory
+state — rotated material applies on the next TLS handshake without
+rebuilding the http.Client. `InsecureSkipVerify: true` is set on purpose;
+the standard verifier freezes `RootCAs` at config-construction, so
+hot-reload uses `VerifyConnection` against a per-handshake pool snapshot
+instead.
+
+The mechanics are the primitives above — one `CertLoader` for the pair,
+one `CALoader` per file-backed pool — so material whose file mtime has
+advanced is also picked up lazily at the next handshake, with swap and
+failure logging wired through the loaders' `OnSwap`/`OnError` hooks. On
+top of that, two refresh disciplines, picked per use case:
+
+- **Explicit refresh** (`PollCert: false`): caller invokes `r.Refresh()`
+  from wherever a new cert lands — typically a renewer's `OnRenewed`
+  callback. Suits binaries that mint their own certs in-process;
+  `Refresh` bypasses the mtime gate, covering same-second writes that
+  per-handshake pickup would miss.
+- **mtime polling** (`PollCert: true`): `RunPoll` probes the cert+key
+  files' mtimes on a fixed cadence. Suits binaries whose cert is
+  rotated by an external agent; the poll bounds how long a rotation
+  waits for the next handshake and gives failures a warn cadence.
+
+CA pools are always mtime-probed by `RunPoll` regardless of `PollCert` —
+they don't have a single explicit-refresh trigger like the cert+key pair
+does. Each pool is registered with a caller-chosen name in `Config.Pools`
+(`"ca"`, `"proxy"`, `"certd"`, …); the same name flows through
+`TLSConfig(name)` to address per-pool tls.Configs from one Reloader.
+
+An empty path in `Config.Pools` is a sentinel for "load from
+`x509.SystemCertPool()`" — useful for dev paths that connect to a
+public-CA-signed endpoint without pinning trust. System pools are
+snapshot at construction; they can't be hot-reloaded and `RunPoll`
+skips them silently:
+
+```go
+r, _ := reloader.New(reloader.Config{
+    CertPath: certPath, KeyPath: keyPath,
+    Pools: map[string]string{
+        "ca": os.Getenv("CERTD_CA_BUNDLE"),  // "" → OS trust store
+    },
+    PollCert: true,
+    Log:      log,
+})
+```
+
+```go
+// single-pool, explicit-refresh (cert-agentd pattern):
+r, _ := reloader.New(reloader.Config{
+    CertPath: "/etc/workload/cert.pem",
+    KeyPath:  "/etc/workload/key.pem",
+    Pools:    map[string]string{"ca": "/etc/workload/ca.pem"},
+    Log:      log,
+})
+client, _ := certd.NewClient(certdURL, r.TLSConfig("ca"))
+// after a successful renewal:
+r.Refresh()
+go func() { errCh <- r.RunPoll(ctx, reloader.DefaultPollInterval) }()
+
+// multi-pool, passive mtime pickup (ssh-tunneld pattern):
+r, _ := reloader.New(reloader.Config{
+    CertPath: certPath, KeyPath: keyPath,
+    Pools: map[string]string{
+        "proxy": proxyCAPath,
+        "certd": certdCAPath,
+    },
+    PollCert: true,
+    Log:      log,
+})
+proxyTLS := r.TLSConfig("proxy", reloader.WithServerName("proxy.internal"))
+certdTLS := r.TLSConfig("certd")
+go func() { errCh <- r.RunPoll(ctx, reloader.DefaultPollInterval) }()
+```
+
+`RunPoll` blocks until ctx cancel — the caller owns the goroutine lifecycle
+(matches `http.Server.ListenAndServe`'s discipline). Read failures during
+RunPoll keep the previous in-memory state live and emit a warn log so a
+corrupt drop-in never opens a trust window.
+
+#### Expiry helpers
+
+```go
+func (r *Reloader) WarnIfNearExpiry(threshold time.Duration, msg string)
+func (r *Reloader) ExpiryAttrs(attrName string) func() []any
+```
+
+`WarnIfNearExpiry` emits a single startup-time Warn on the reloader's
+logger when the leaf cert is within `threshold` of expiry (typical
+threshold: `24*time.Hour`). The line carries `remaining` and
+`not_after` structured attrs so alerting rules can fire on either
+field without parsing message text. No-op until the cert has loaded.
+
+`ExpiryAttrs(attrName)` returns a closure that yields
+`[attrName, time-until-leaf-expiry-rounded-to-seconds]` on every
+call — the shape that retry-surface error-attrs hooks like
+`revcheck.Config.RefreshErrorAttrs`, `hostcert.Config.SignErrorAttrs`,
+and `renew.Config.SignErrorAttrs` want. Operators grep one
+consistent attr across every retry surface to see cert exhaustion
+approaching.
+
+```go
+r.WarnIfNearExpiry(24*time.Hour, "workload mTLS cert near expiry")
+
+renewer, _ := renew.New(renew.Config{
+    SignErrorAttrs: r.ExpiryAttrs("mtls_cert_remaining"),
+    // ...
+})
+```
+
+Pairs with `tls.CertLoader` above on the **server** side; together they
+cover both directions of hot-reload for daemons that act as both client and
+server.
+
+[↑ Back to top](#packages)
+
+---
+
+## version/ — build version resolution
+
+```go
+import "github.com/abagile/tokyo3-base/version"
+
+func Resolve(injected string) string
+```
+
+Maps an ldflags-injected `main.Version` to an effective version string,
+falling back to `runtime/debug.BuildInfo` so `go install …@vX.Y.Z` and
+source-tree builds still report something useful without a Make-driven
+inject. Keep `var Version = "dev"` in `main` (the linker target stays
+`main.Version`) and call `version.Resolve(Version)`.
+
+Resolution order:
+
+1. `injected`, when the linker set it to anything other than `"dev"`.
+2. `BuildInfo.Main.Version` when it's a real module version (e.g.
+   `v1.2.3`) — what `go install pkg@vX.Y.Z` records.
+3. `dev-<vcs.revision[:7]>[-dirty] (<vcs.time>)` from the VCS settings the
+   toolchain stamps into source-tree builds; the commit time is appended
+   when present, rendered in the local time zone.
+4. `"dev"` — last resort (e.g. `go run` outside a module).
+
+```go
+var Version = "dev" // -ldflags "-X main.Version=v1.2.3"
+fmt.Printf("%s %s\n", appName, version.Resolve(Version))
+// tagged install → "v1.2.3"
+// local build    → "dev-1a2b3c4 (2026-05-31T17:30:00+08:00)"
+```
+
+> A Docker image built from a source copy with no `.git` and no ldflags
+> reports `"dev"` — stamp the tag via a `VERSION` build-arg + `-X
+> main.Version` so released images carry their version.
 
 [↑ Back to top](#packages)
