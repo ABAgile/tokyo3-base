@@ -99,6 +99,40 @@ func TestGo_NoPanic_RunsFnNoLog(t *testing.T) {
 	}
 }
 
+func TestGuarded_RecoversPanicAndLogs(t *testing.T) {
+	c := newCapture()
+	// Guarded returns a func; the caller owns the goroutine. Run it inline so a
+	// missing recover would crash the test process.
+	Guarded(slog.New(c), "worker", func() { panic("boom") })()
+
+	r := c.last(t)
+	if r.Level != slog.LevelError {
+		t.Errorf("level = %v, want ERROR", r.Level)
+	}
+	if r.Message != "goroutine panic recovered" {
+		t.Errorf("message = %q", r.Message)
+	}
+	if v, ok := attr(r, "goroutine"); !ok || v.String() != "worker" {
+		t.Errorf("goroutine attr = %v (ok=%v), want worker", v, ok)
+	}
+}
+
+func TestGuarded_JoinsViaWaitGroup(t *testing.T) {
+	c := newCapture()
+	// The whole point of Guarded: compose recovery with a join. A panicking
+	// worker must still let wg.Wait() return (defer Done runs during unwind).
+	var wg sync.WaitGroup
+	wg.Go(Guarded(slog.New(c), "worker", func() { panic("boom") }))
+
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("wg.Wait did not return after a recovered panic")
+	}
+}
+
 func TestTick_RecoversAndReturns(t *testing.T) {
 	c := newCapture()
 	// Must return rather than crash the test process.

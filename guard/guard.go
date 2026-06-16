@@ -16,15 +16,14 @@ import (
 	"runtime/debug"
 )
 
-// Go runs fn in a new goroutine wrapped in panic recovery: a panic is
-// recovered and logged with a stack trace under name, and the goroutine
-// returns instead of taking the whole process down. Use it for every
-// long-lived background goroutine (reapers, sync loops, trackers).
-//
-// Pair it with Tick: Go is the outer backstop for the goroutine, Tick keeps a
-// ticker firing when one iteration panics.
-func Go(log *slog.Logger, name string, fn func()) {
-	go func() {
+// Guarded wraps fn in panic recovery and returns the wrapped func WITHOUT
+// launching it: a panic is recovered and logged with a stack trace under name,
+// and the wrapped func returns instead of taking the whole process down. Use it
+// to give recovered work to a launcher that owns the goroutine — most notably
+// [sync.WaitGroup.Go] (so a recovered goroutine can also be joined at shutdown)
+// or golang.org/x/sync/errgroup. When you just need fire-and-forget, use [Go].
+func Guarded(log *slog.Logger, name string, fn func()) func() {
+	return func() {
 		defer func() {
 			if r := recover(); r != nil {
 				log.Error("goroutine panic recovered",
@@ -34,7 +33,20 @@ func Go(log *slog.Logger, name string, fn func()) {
 			}
 		}()
 		fn()
-	}()
+	}
+}
+
+// Go runs fn in a new goroutine wrapped in panic recovery: a panic is
+// recovered and logged with a stack trace under name, and the goroutine
+// returns instead of taking the whole process down. Use it for every
+// long-lived background goroutine (reapers, sync loops, trackers) that does
+// NOT need to be joined at shutdown; when you need a join, hand
+// [Guarded](log, name, fn) to a WaitGroup/errgroup instead.
+//
+// Pair it with Tick: Go is the outer backstop for the goroutine, Tick keeps a
+// ticker firing when one iteration panics.
+func Go(log *slog.Logger, name string, fn func()) {
+	go Guarded(log, name, fn)()
 }
 
 // Tick runs one iteration of a reaper/sync loop wrapped in panic recovery, so
