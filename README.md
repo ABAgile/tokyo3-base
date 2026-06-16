@@ -1505,6 +1505,51 @@ The Data is forwarded byte-for-byte from `Msg.Data`, so producers using
 `journal.NewJSONSink[T]` already publish wire-ready JSON — no transcoding
 on the read side. Browsers parse the `data:` payload as their own JSON.
 
+### `journal.Tracker[T]` — server-rendered recent-events ring
+
+```go
+type TrackerConfig[T any] struct {
+    Source Source              // required
+    Decode func(Msg) (T, bool) // required; ok=false skips (decode failure OR filtered out)
+    Less   func(a, b T) bool   // optional: newest-first comparator ⇒ sorted; nil ⇒ arrival order
+    Max    int                 // ring cap; 0 ⇒ DefaultTrackerSize (500)
+    Label  string              // optional, for the "subscribed" log line
+    Log    *slog.Logger
+}
+
+func NewTracker[T any](cfg TrackerConfig[T]) (*Tracker[T], error)
+func (t *Tracker[T]) Run(ctx context.Context) error // Subscribe(replay=Max) + tail until ctx
+func (t *Tracker[T]) Snapshot() []T                 // newest-first copy, concurrent-safe
+```
+
+A bounded in-memory ring of the most recent decoded events from a `Source`,
+kept current by a background `Run` loop. It is the **server-side-rendered**
+counterpart to [`journal/sse`](#journalsse--generic-server-sent-events-handler):
+where the SSE handler pushes a live stream to a browser, a `Tracker`
+materializes a snapshot an admin page can render synchronously (a "recent
+activity" table) — the right tool when the view is server-rendered rather than
+a JS-driven live tail.
+
+`Decode` folds decoding and filtering into one step — return `ok=false` to skip
+a record (a JSON failure or an unwanted event, e.g. the wrong action), so the
+caller owns any per-skip logging. `Less` picks the ordering: a newest-first
+comparator (e.g. by an event timestamp) re-sorts the ring on each ingest;
+`nil` prepends by arrival, which suits a stream whose publish order already
+matches recency. Own the `Run` goroutine with [`guard.Go`](#guard--panic-recovery-for-background-work)
+(or a [`run.Group`](#run--component-lifecycle-coordination) component).
+
+```go
+tr, _ := journal.NewTracker(journal.TrackerConfig[AuditEvent]{
+    Source: src,
+    Decode: decodeAuditEvent, // json.Unmarshal + validity ⇒ (AuditEvent, ok)
+    Less:   func(a, b AuditEvent) bool { return a.OccurredAt.After(b.OccurredAt) },
+})
+guard.Go(log, "audit-tracker", func() { _ = tr.Run(ctx) })
+
+// in the /audit page handler:
+events := tr.Snapshot() // newest-first, safe under concurrent Run
+```
+
 [↑ Back to top](#packages)
 
 ---
@@ -1764,6 +1809,27 @@ The `applog` NATS shipping helper drives this for you whenever
 when wiring a bespoke long-lived single-pool mTLS client. For named
 multi-pool trust, expiry telemetry, and poll/refresh disciplines, use the
 `Reloader` orchestrator below.
+
+#### ClientTLS — optional-client-cert config builder
+
+```go
+func ClientTLS(certFile, keyFile, caFile string) (*tls.Config, error)
+```
+
+The "optional client cert" companion to `ClientConfig`, for a client that
+*may or may not* present a cert (Postgres, a SCIM endpoint, …):
+
+- a full cert+key pair ⇒ `ClientConfig` (hot-reloading mTLS — leaf per
+  handshake, CA pool on mtime);
+- no pair ⇒ `btls.FromFiles` — a one-shot config that **still verifies the
+  server against `caFile` when one is set** (fail-secure: an operator who
+  configures a CA gets server verification regardless of whether a client cert
+  is also present), or `(nil, nil)` when nothing is configured so the caller
+  falls back to the DSN's `sslmode` / plaintext.
+
+Reach for `ClientConfig` directly when the client cert is mandatory, and
+`btls.FromFiles` for an always-one-shot config (e.g. a short-lived migration
+connection that closes before any rotation matters).
 
 #### ServerTLS — server-side HTTPS config builder
 

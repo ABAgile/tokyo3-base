@@ -342,6 +342,30 @@ func ClientConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
 	return cfg, nil
 }
 
+// ClientTLS builds the outbound client TLS config a daemon presents to a TLS
+// server (Postgres, a SCIM endpoint, …) from optional file paths. It is the
+// "optional client cert" companion to [ClientConfig]:
+//
+//   - a full cert+key pair ⇒ [ClientConfig] — a hot-reloading mTLS config (leaf
+//     re-read per handshake, CA pool on mtime), so a cert-agentd rotation lands
+//     without a restart;
+//   - no pair ⇒ [btls.FromFiles] — a one-shot config that STILL verifies the
+//     server against caFile when one is set (fail-secure: an operator who
+//     provides a CA gets verification regardless of a client cert), or
+//     (nil, nil) when nothing is configured so the caller falls back to the
+//     DSN's sslmode / plaintext.
+//
+// Use it wherever the client cert is optional; for the always-mTLS case call
+// [ClientConfig] directly, and for an always-one-shot config (e.g. a
+// short-lived migration connection that closes before any rotation matters)
+// call [btls.FromFiles].
+func ClientTLS(certFile, keyFile, caFile string) (*tls.Config, error) {
+	if certFile != "" && keyFile != "" {
+		return ClientConfig(certFile, keyFile, caFile)
+	}
+	return btls.FromFiles(certFile, keyFile, caFile)
+}
+
 // NewClientCALoader is a convenience that creates a [CALoader] for caFile
 // and wires it onto cfg via [CALoader.WireClientCAs], returning the loader
 // so the caller can inspect it. As a side effect it sets cfg.ClientAuth,
