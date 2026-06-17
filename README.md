@@ -27,6 +27,7 @@ go get github.com/abagile/tokyo3-base
 - [httpauth/ — HTTP auth middleware](#httpauth--http-auth-middleware)
 - [journal/ — Append-only durable event journal](#journal--append-only-durable-event-journal)
 - [nats/ — NATS dial helper](#nats--nats-dial-helper)
+- [oidc/ — OIDC ID-token verification](#oidc--oidc-id-token-verification)
 - [ratelimit/ — per-source-IP HTTP rate limiter](#ratelimit--per-source-ip-http-rate-limiter)
 - [run/ — component lifecycle coordination](#run--component-lifecycle-coordination)
 - [tls/ — stateless TLS helpers](#tls--stateless-tls-helpers)
@@ -1608,6 +1609,108 @@ nc, err := nats.Dial(
 Pairs with `journal/jetstream` (which dials internally via the same
 shape) and with `WithAsyncNats` from `log.go` (which takes an
 externally-owned `*nats.Conn`).
+
+[↑ Back to top](#packages)
+
+---
+
+## oidc/ — OIDC ID-token verification
+
+```go
+import "github.com/abagile/tokyo3-base/oidc"
+
+type Claims struct {
+    Subject, Email, Name string
+    Groups               []string
+    Nonce                string
+}
+
+type TokenVerifier interface {
+    Verify(ctx context.Context, rawIDToken string) (*Claims, error)
+}
+
+func NewHTTPVerifier(ctx context.Context, issuer, audience string) (*HTTPVerifier, error)
+func NewLazyHTTPVerifier(issuer, audience string) (*LazyVerifier, error)
+```
+
+Verifies inbound OIDC ID tokens — signature, issuer, audience, expiry — so a
+service derives a caller's identity and groups from a cryptographically-signed
+assertion rather than a self-declared request field. `HTTPVerifier` wraps
+[`coreos/go-oidc`](https://github.com/coreos/go-oidc) (OIDC discovery + JWKS
+fetch, auto-refreshed on key rotation). `LazyVerifier` defers that I/O to the
+first `Verify`, so a daemon boots even while its IdP is briefly unreachable and
+self-heals on the next request — a transient outage at boot surfaces as a 401,
+not a crash. Consumers depend on the `TokenVerifier` interface, so tests inject
+a stub instead of standing up a real issuer.
+
+```go
+v, err := oidc.NewLazyHTTPVerifier(
+    os.Getenv("MYDAEMON_OIDC_ISSUER"),
+    os.Getenv("MYDAEMON_OIDC_AUDIENCE"), // the OIDC client_id minted for this service
+)
+// per request — treat any error as 401:
+claims, err := v.Verify(r.Context(), bearerToken)
+if err != nil { /* 401 */ }
+allowed := slices.Contains(claims.Groups, "admins")
+```
+
+### Authenticator — browser login + sealed session
+
+```go
+type AuthenticatorConfig struct {
+    Issuer, ClientID, ClientSecret, RedirectURL string
+    AdminGroup   string         // required group claim; "" ⇒ any authenticated user
+    Verifier     TokenVerifier  // validates the returned ID token (audience = ClientID)
+    SessionKey   []byte         // 32-byte key sealing the session + flow cookies (AES-256-GCM)
+    SessionTTL   time.Duration  // 0 ⇒ 8h
+    CookiePrefix string         // <prefix>_session / <prefix>_flow (required)
+    CookiePath   string         // "" ⇒ "/"
+    LoginPath, CallbackPath, LogoutPath string // defaults /auth/{login,callback,logout}
+    ExemptPaths  []string       // extra unauthenticated paths (e.g. "/healthz")
+    Now func() time.Time        // injectable clock
+    Log *slog.Logger
+}
+
+func NewAuthenticator(cfg AuthenticatorConfig) (*Authenticator, error)
+func (a *Authenticator) LoginHandler() http.HandlerFunc
+func (a *Authenticator) CallbackHandler() http.HandlerFunc
+func (a *Authenticator) LogoutHandler() http.HandlerFunc
+func (a *Authenticator) Gate(next http.Handler) http.Handler
+func SessionFromContext(ctx context.Context) (Session, bool)
+```
+
+Native browser-based OIDC login for an admin portal — the Authorization-Code +
+PKCE flow, an AES-256-GCM-sealed session cookie, and an optional admin-group
+gate. It owns only the browser glue: `LoginHandler` mints state/nonce/PKCE and
+redirects to the IdP; `CallbackHandler` validates state, exchanges the code
+(via `auth/oidcclient`), verifies the ID token + nonce with the `TokenVerifier`,
+and seals the session; `Gate` enforces the session (and group) on the protected
+mux — redirecting unauthenticated GETs to login (with `return_to`) and 401-ing
+other methods. Downstream handlers read the identity via `SessionFromContext`.
+
+Pair it with [`httpauth.BasicAuth`](#httpauth--http-auth-middleware): a portal
+runs OIDC login when configured, else falls back to the Basic gate.
+
+```go
+auth, _ := oidc.NewAuthenticator(oidc.AuthenticatorConfig{
+    Issuer: issuer, ClientID: clientID, ClientSecret: secret,
+    RedirectURL:  "https://certd.example.com/portal/auth/callback",
+    AdminGroup:   "ca-portal-admin",
+    Verifier:     verifier,          // an oidc.TokenVerifier (audience = clientID)
+    SessionKey:   key,               // 32 bytes, e.g. crypto.ParseKEK(hex)
+    CookiePrefix: "certd_portal",
+    CookiePath:   "/portal/",
+})
+mux.Handle("GET /auth/login", auth.LoginHandler())
+mux.Handle("GET /auth/callback", auth.CallbackHandler())
+mux.Handle("GET /auth/logout", auth.LogoutHandler())
+handler := auth.Gate(mux) // wrap the protected routes
+```
+
+Cookies are HttpOnly, Secure (when served over TLS), SameSite=Lax, scoped to
+`CookiePath`; the flow cookie is short-lived (10m) and the session honors
+`SessionTTL`. `return_to` is confined to a local absolute path so a crafted
+value can't bounce the browser to an attacker origin.
 
 [↑ Back to top](#packages)
 
