@@ -27,6 +27,7 @@ go get github.com/abagile/tokyo3-base
 - [httpauth/ — HTTP auth middleware](#httpauth--http-auth-middleware)
 - [journal/ — Append-only durable event journal](#journal--append-only-durable-event-journal)
 - [nats/ — NATS dial helper](#nats--nats-dial-helper)
+- [ratelimit/ — per-source-IP HTTP rate limiter](#ratelimit--per-source-ip-http-rate-limiter)
 - [run/ — component lifecycle coordination](#run--component-lifecycle-coordination)
 - [tls/ — stateless TLS helpers](#tls--stateless-tls-helpers)
   - [tls/reloader — hot-reload loaders + multi-pool orchestrator](#tlsreloader--hot-reload-loaders--multi-pool-orchestrator)
@@ -1066,11 +1067,25 @@ import "github.com/abagile/tokyo3-base/envutil"
 | `MustEnv(key string) string` | Required env var. Writes `"<key> is required"` to stderr and `os.Exit(2)` when unset — matches Go's `flag.Parse` convention for usage/config errors. |
 | `HostnameOrEmpty() string` | `os.Hostname()` on success, `""` on error. Default for per-host identifier env vars like `CERT_AGENTD_INSTANCE`. |
 
+Typed scalar parsers for the same "config from env" shape — an unset/empty var
+yields the zero value with no error (so the caller applies its own default); a
+malformed value is an error naming the key:
+
+| Function | Purpose |
+|---|---|
+| `Float(key string) (float64, error)` | Parse a float (e.g. a rate-limit RPS). |
+| `Int(key string) (int, error)` | Parse an int (e.g. a burst). |
+| `Duration(key string) (time.Duration, error)` | Parse a Go duration (`"750ms"`, `"6h"`). |
+| `CIDRList(key string) ([]*net.IPNet, error)` | Parse a comma-separated CIDR list; a bare IP ⇒ `/32` (IPv4) or `/128` (IPv6). Handy for trusted-proxy allow-lists. |
+
 ```go
 addr      := envutil.Or("MYDAEMON_ADDR", ":8080")
 caFile    := envutil.First("MYDAEMON_NATS_CA", "MYDAEMON_WORKLOAD_CA")
 issuer    := envutil.MustEnv("MYDAEMON_ISSUER")
 instance  := envutil.Or("MYDAEMON_INSTANCE", envutil.HostnameOrEmpty())
+
+rps, err  := envutil.Float("MYDAEMON_RATE_LIMIT_RPS")          // 0 when unset
+proxies, err := envutil.CIDRList("MYDAEMON_TRUSTED_PROXIES")   // nil when unset
 ```
 
 [↑ Back to top](#packages)
@@ -1593,6 +1608,63 @@ nc, err := nats.Dial(
 Pairs with `journal/jetstream` (which dials internally via the same
 shape) and with `WithAsyncNats` from `log.go` (which takes an
 externally-owned `*nats.Conn`).
+
+[↑ Back to top](#packages)
+
+---
+
+## ratelimit/ — per-source-IP HTTP rate limiter
+
+```go
+import "github.com/abagile/tokyo3-base/ratelimit"
+
+type Config struct {
+    RPS            float64       // per-source req/s; <= 0 disables (New returns nil)
+    Burst          int           // token-bucket burst; < 1 ⇒ 1
+    TrustedProxies []*net.IPNet  // proxies whose X-Forwarded-For is trusted for keying
+    Log            *slog.Logger
+}
+
+func New(cfg Config) *Limiter
+func (l *Limiter) Middleware(next http.Handler, exempt ...string) http.Handler
+```
+
+Baseline defense-in-depth for any workload that exposes an API. `New` returns
+a token-bucket limiter keyed on the immediate TCP peer; `Middleware` wraps a
+handler, returning 429 + `Retry-After` when a source exceeds its rate. A nil
+`*Limiter` (when `RPS <= 0`) passes through, so callers wire it
+unconditionally; `exempt` paths bypass it — pass `"/healthz"`.
+
+```go
+rl := ratelimit.New(ratelimit.Config{
+    RPS:            rps,
+    Burst:          burst,
+    TrustedProxies: proxies, // from envutil.CIDRList("MYDAEMON_TRUSTED_PROXIES")
+    Log:            log,
+})
+mux := http.NewServeMux()
+// ... routes ...
+handler := rl.Middleware(mux, "/healthz")
+```
+
+### What it is (and isn't)
+
+It throttles **per source, per replica, in process** — brute-force and
+credential-stuffing on auth paths, single-client resource exhaustion against an
+expensive signer or DB pool, and the automated scanning/fuzzing that precedes
+an exploit. The key is the immediate peer IP, never a raw `X-Forwarded-For`, so
+it can't be spoofed via the header; `X-Forwarded-For` is honored only when the
+peer is a configured `TrustedProxies` CIDR, in which case the rightmost
+*untrusted* hop (the real client behind our own edge) becomes the key.
+
+It is **not** a volumetric-DoS control: a distributed flood from many IPs
+bypasses per-IP limits, replicas don't coordinate, and L3/L4 floods never reach
+the app — those belong to an upstream LB/WAF/CDN. Nor is it an exploit (e.g.
+RCE) mitigation; it only slows the probing that precedes one. Front the service
+with edge protection for availability; use this to bound single-source abuse.
+
+Idle buckets are swept lazily (no background goroutine) so a stream of distinct
+source IPs can't grow the map without bound.
 
 [↑ Back to top](#packages)
 
