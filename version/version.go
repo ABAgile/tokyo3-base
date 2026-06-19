@@ -18,18 +18,23 @@ import (
 const devSentinel = "dev"
 
 // Resolve maps the ldflags-injected value (pass your package-level
-// main.Version) to an effective version string.
+// main.Version) to an effective version string, with the VCS commit time
+// appended as " (<local time>)" whenever the toolchain recorded one.
 //
-// Resolution order:
+// Base token, in order:
 //
 //  1. injected, when the linker set it to anything other than "dev"
 //  2. BuildInfo.Main.Version when it's a real module version (e.g.
 //     "v1.2.3") — what `go install pkg@vX.Y.Z` records
-//  3. "dev-<vcs.revision[:7]>[-dirty] (<vcs.time>)" from the VCS
-//     settings the toolchain stamps into binaries built from a source
-//     tree; the commit time is appended only when present, rendered in
-//     the local time zone (the toolchain stamps it as UTC)
+//  3. "dev-<vcs.revision[:7]>[-dirty]" from the VCS settings the
+//     toolchain stamps into binaries built from a source tree
 //  4. "dev" — last resort (e.g. `go run` outside a module)
+//
+// The commit time (vcs.time, rendered in the local zone; the toolchain
+// stamps it as UTC) is appended to that token whenever it's present, so a
+// binary reports when it was built on every path the toolchain records it.
+// It's absent for `go install pkg@version` (no source tree) and
+// -buildvcs=false builds, where the bare token is returned unchanged.
 func Resolve(injected string) string {
 	return resolve(injected, debug.ReadBuildInfo, time.Local)
 }
@@ -38,16 +43,12 @@ func Resolve(injected string) string {
 // tests can feed controlled BuildInfo and a fixed time zone instead of
 // the real binary's.
 func resolve(injected string, readBuildInfo func() (*debug.BuildInfo, bool), loc *time.Location) string {
-	if injected != devSentinel {
-		return injected
-	}
 	info, ok := readBuildInfo()
 	if !ok {
+		// No build info: only the injected value is available.
 		return injected
 	}
-	if v := info.Main.Version; v != "" && v != "(devel)" {
-		return v
-	}
+
 	var rev, dirty, vtime string
 	for _, s := range info.Settings {
 		switch s.Key {
@@ -65,14 +66,20 @@ func resolve(injected string, readBuildInfo func() (*debug.BuildInfo, bool), loc
 			vtime = s.Value
 		}
 	}
-	if rev != "" {
-		v := "dev-" + rev + dirty
-		if vtime != "" {
-			v += " (" + localTime(vtime, loc) + ")"
+
+	tok := injected
+	if injected == devSentinel {
+		if v := info.Main.Version; v != "" && v != "(devel)" {
+			tok = v
+		} else if rev != "" {
+			tok = "dev-" + rev + dirty
 		}
-		return v
 	}
-	return injected
+
+	if vtime != "" {
+		tok += " (" + localTime(vtime, loc) + ")"
+	}
+	return tok
 }
 
 // localTime parses the toolchain's RFC3339/UTC vcs.time and renders it
