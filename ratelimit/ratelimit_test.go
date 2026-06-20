@@ -59,24 +59,32 @@ func TestAllow_BurstThenThrottle(t *testing.T) {
 	}
 }
 
-func TestKey_IgnoresXFFWithoutTrustedProxy(t *testing.T) {
-	l := New(Config{RPS: 1})
-	r := httptest.NewRequest(http.MethodGet, "/x", nil)
-	r.RemoteAddr = "203.0.113.9:4444"
-	r.Header.Set("X-Forwarded-For", "1.1.1.1") // must be ignored — peer not trusted
-	if got := l.key(r); got != "203.0.113.9" {
-		t.Errorf("key = %q, want peer IP 203.0.113.9 (XFF ignored)", got)
-	}
-}
+// Keying logic itself lives in (and is tested by) the clientip package; this
+// verifies TrustedProxies is wired through Middleware so the limiter keys on
+// the real client behind a trusted proxy, not the shared proxy IP.
+func TestMiddleware_KeysOnRealClientBehindTrustedProxy(t *testing.T) {
+	l := New(Config{RPS: 1, Burst: 1, Log: discard(), TrustedProxies: []*net.IPNet{mustCIDR(t, "10.0.0.0/8")}})
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) })
+	h := l.Middleware(next)
 
-func TestKey_TrustedProxyUsesRightmostUntrustedHop(t *testing.T) {
-	l := New(Config{RPS: 1, TrustedProxies: []*net.IPNet{mustCIDR(t, "10.0.0.0/8")}})
-	r := httptest.NewRequest(http.MethodGet, "/x", nil)
-	r.RemoteAddr = "10.0.0.5:4444" // trusted proxy
-	// Rightmost untrusted hop is the real client; 10.x hops are our own edge.
-	r.Header.Set("X-Forwarded-For", "198.51.100.7, 10.0.0.9, 10.0.0.5")
-	if got := l.key(r); got != "198.51.100.7" {
-		t.Errorf("key = %q, want 198.51.100.7 (rightmost untrusted hop)", got)
+	send := func(xff string) int {
+		r := httptest.NewRequest(http.MethodGet, "/api", nil)
+		r.RemoteAddr = "10.0.0.5:5555" // trusted proxy
+		r.Header.Set("X-Forwarded-For", xff)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, r)
+		return rec.Code
+	}
+	// Two distinct real clients via the same proxy each get their own bucket.
+	if got := send("198.51.100.7"); got != http.StatusTeapot {
+		t.Fatalf("client A first request: got %d", got)
+	}
+	if got := send("203.0.113.8"); got != http.StatusTeapot {
+		t.Fatalf("client B first request should pass (separate bucket): got %d", got)
+	}
+	// Second request from client A shares A's key and is throttled.
+	if got := send("198.51.100.7"); got != http.StatusTooManyRequests {
+		t.Fatalf("client A second request should be 429: got %d", got)
 	}
 }
 

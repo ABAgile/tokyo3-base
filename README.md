@@ -19,6 +19,7 @@ go get github.com/abagile/tokyo3-base
 - [applog/ — Application logging helpers](#applog--application-logging-helpers)
 - [auth/ — auth primitives namespace](#auth--auth-primitives-namespace)
 - [cli/ — daemon startup composition](#cli--daemon-startup-composition)
+- [clientip/ — spoof-resistant client IP extraction](#clientip--spoof-resistant-client-ip-extraction)
 - [crypto/ — AES-256-GCM and envelope encryption](#crypto--aes-256-gcm-and-envelope-encryption)
 - [db/ — PostgreSQL / pgx utilities](#db--postgresql--pgx-utilities)
 - [debug/ — opt-in diagnostics server](#debug--opt-in-diagnostics-server)
@@ -779,6 +780,41 @@ src,  _ := cli.AuditSource(rt, audit.StreamName, audit.Subject)
 These are free functions, not methods on a generic `App`, so a daemon that
 publishes no audit (e.g. cert-agentd) uses a plain `App` with no spurious
 type parameter.
+
+[↑ Back to top](#packages)
+
+---
+
+## clientip/ — spoof-resistant client IP extraction
+
+```go
+import "github.com/abagile/tokyo3-base/clientip"
+
+func New(trustedProxies []*net.IPNet) *Extractor
+func (e *Extractor) FromRequest(r *http.Request) string // bare host, no port
+```
+
+The one way to answer "what is the real client IP?" for an HTTP request, so
+rate-limit keying and audit attribution agree across the fleet. The immediate
+TCP peer (`r.RemoteAddr`) is the source of truth — the only address a client
+can't forge. `X-Forwarded-For` is consulted **only** when that peer is itself a
+configured trusted proxy, in which case the **rightmost hop that is not
+trusted** (the real client as seen by infrastructure we control) is returned.
+Walking right-to-left and stopping at the first untrusted hop defeats a client
+that pre-seeds `X-Forwarded-For` to spoof its source. With no trusted proxies
+configured, `X-Forwarded-For` is ignored entirely and the peer IP is always
+returned.
+
+```go
+ext := clientip.New(proxies) // proxies from envutil.CIDRList("MYDAEMON_TRUSTED_PROXIES")
+ip := ext.FromRequest(r)     // use as the audit "source" / rate-limit key
+```
+
+Use this instead of hand-rolling a `clientIP` helper per daemon. `ratelimit`
+keys on it internally; an audit layer should derive its `source` from it too,
+so a single source IP is computed identically everywhere. It is HTTP-only — an
+SSH/raw-TCP peer is just a `net.Addr` with no forwarding header and needs no
+such reasoning.
 
 [↑ Back to top](#packages)
 
@@ -1776,10 +1812,13 @@ handler := rl.Middleware(mux, "/healthz")
 It throttles **per source, per replica, in process** — brute-force and
 credential-stuffing on auth paths, single-client resource exhaustion against an
 expensive signer or DB pool, and the automated scanning/fuzzing that precedes
-an exploit. The key is the immediate peer IP, never a raw `X-Forwarded-For`, so
-it can't be spoofed via the header; `X-Forwarded-For` is honored only when the
-peer is a configured `TrustedProxies` CIDR, in which case the rightmost
-*untrusted* hop (the real client behind our own edge) becomes the key.
+an exploit. The key is the real client IP from
+[`clientip`](#clientip--spoof-resistant-client-ip-extraction): the immediate
+peer, never a raw `X-Forwarded-For`, so it can't be spoofed via the header;
+`X-Forwarded-For` is honored only when the peer is a configured `TrustedProxies`
+CIDR, in which case the rightmost *untrusted* hop (the real client behind our
+own edge) becomes the key. Derive audit attribution from the same `clientip`
+extractor so the limiter and the audit log agree on the source.
 
 It is **not** a volumetric-DoS control: a distributed flood from many IPs
 bypasses per-IP limits, replicas don't coordinate, and L3/L4 floods never reach

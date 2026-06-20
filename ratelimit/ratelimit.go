@@ -23,10 +23,10 @@ import (
 	"net"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
+	"github.com/abagile/tokyo3-base/clientip"
 	"golang.org/x/time/rate"
 )
 
@@ -71,7 +71,7 @@ type Config struct {
 type Limiter struct {
 	rps        rate.Limit
 	burst      int
-	trusted    []*net.IPNet
+	clientIP   *clientip.Extractor
 	log        *slog.Logger
 	onThrottle http.HandlerFunc
 
@@ -104,7 +104,7 @@ func New(cfg Config) *Limiter {
 	return &Limiter{
 		rps:        rate.Limit(cfg.RPS),
 		burst:      cfg.Burst,
-		trusted:    cfg.TrustedProxies,
+		clientIP:   clientip.New(cfg.TrustedProxies),
 		log:        log,
 		onThrottle: cfg.OnThrottle,
 		buckets:    make(map[string]*bucket),
@@ -129,7 +129,7 @@ func (l *Limiter) Middleware(next http.Handler, exempt ...string) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		key := l.key(r)
+		key := l.clientIP.FromRequest(r)
 		if !l.allow(key, time.Now()) {
 			w.Header().Set("Retry-After", l.retryAfter())
 			l.log.Warn("rate limit exceeded", "source", key, "path", r.URL.Path)
@@ -173,53 +173,9 @@ func (l *Limiter) sweepLocked(now time.Time) {
 	}
 }
 
-// key returns the rate-limit key for r: the immediate peer IP, or — when that
-// peer is a trusted proxy — the rightmost X-Forwarded-For hop that is not
-// itself trusted (the real client as seen by our own edge). Walking
-// right-to-left and stopping at the first untrusted hop defeats a client that
-// pre-seeds X-Forwarded-For to spoof its source.
-func (l *Limiter) key(r *http.Request) string {
-	peer := hostOnly(r.RemoteAddr)
-	if len(l.trusted) == 0 || !l.isTrusted(peer) {
-		return peer
-	}
-	xff := r.Header.Get("X-Forwarded-For")
-	if xff == "" {
-		return peer
-	}
-	parts := strings.Split(xff, ",")
-	for i := len(parts) - 1; i >= 0; i-- {
-		ip := strings.TrimSpace(parts[i])
-		if ip != "" && !l.isTrusted(ip) {
-			return ip
-		}
-	}
-	return peer
-}
-
-func (l *Limiter) isTrusted(ip string) bool {
-	parsed := net.ParseIP(ip)
-	if parsed == nil {
-		return false
-	}
-	for _, n := range l.trusted {
-		if n.Contains(parsed) {
-			return true
-		}
-	}
-	return false
-}
-
 // retryAfter is a coarse Retry-After hint (whole seconds, ≥1): the time for one
 // token to refill.
 func (l *Limiter) retryAfter() string {
 	secs := max(int(math.Ceil(1/float64(l.rps))), 1)
 	return strconv.Itoa(secs)
-}
-
-func hostOnly(remoteAddr string) string {
-	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
-		return host
-	}
-	return remoteAddr
 }
