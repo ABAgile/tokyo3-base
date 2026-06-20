@@ -1671,6 +1671,11 @@ type TokenVerifier interface {
 func NewHTTPVerifier(ctx context.Context, issuer, audience string) (*HTTPVerifier, error)
 func NewLazyHTTPVerifier(issuer, audience string) (*LazyVerifier, error)
 
+// OAuth2 endpoints from discovery, for a login broker that also runs the
+// code exchange against the same provider (no second discovery):
+func (v *HTTPVerifier) Endpoint() oauth2.Endpoint
+func (v *LazyVerifier) Endpoint(ctx context.Context) (oauth2.Endpoint, error)
+
 // Back-channel logout (HTTPVerifier and LazyVerifier):
 type LogoutClaims struct {
     Issuer, Subject, SessionID, JTI string

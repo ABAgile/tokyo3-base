@@ -19,6 +19,7 @@ import (
 	"time"
 
 	goidc "github.com/coreos/go-oidc/v3/oidc"
+	"golang.org/x/oauth2"
 )
 
 // Claims is the subset of OIDC + custom claims services typically read. New
@@ -61,6 +62,7 @@ type TokenVerifier interface {
 // the service should trust.
 type HTTPVerifier struct {
 	verifier *goidc.IDTokenVerifier
+	endpoint oauth2.Endpoint
 	issuer   string
 	audience string
 }
@@ -89,7 +91,7 @@ func NewHTTPVerifier(ctx context.Context, issuer, audience string) (*HTTPVerifie
 		return nil, fmt.Errorf("discover OIDC provider %q: %w", issuer, err)
 	}
 	v := provider.Verifier(&goidc.Config{ClientID: audience})
-	return &HTTPVerifier{verifier: v, issuer: issuer, audience: audience}, nil
+	return &HTTPVerifier{verifier: v, endpoint: provider.Endpoint(), issuer: issuer, audience: audience}, nil
 }
 
 // Verify satisfies [TokenVerifier]. Returns the underlying go-oidc errors;
@@ -185,6 +187,13 @@ func (v *HTTPVerifier) VerifyLogoutToken(ctx context.Context, raw string) (*Logo
 func (v *HTTPVerifier) Issuer() string   { return v.issuer }
 func (v *HTTPVerifier) Audience() string { return v.audience }
 
+// Endpoint returns the IdP's OAuth2 authorization and token endpoints as
+// discovered from the issuer's metadata. It lets a login broker that also runs
+// the authorization-code exchange build its oauth2.Config against the same
+// provider this verifier validates tokens for, instead of discovering twice.
+// Fields are empty if the discovery document omits them.
+func (v *HTTPVerifier) Endpoint() oauth2.Endpoint { return v.endpoint }
+
 // LazyVerifier defers OIDC discovery + JWKS fetch to the first
 // [LazyVerifier.Verify] call. This decouples a service's startup from the
 // IdP's reachability: the service can boot when the IdP is down, and the first
@@ -250,3 +259,15 @@ func (v *LazyVerifier) ensure(ctx context.Context) (*HTTPVerifier, error) {
 
 func (v *LazyVerifier) Issuer() string   { return v.issuer }
 func (v *LazyVerifier) Audience() string { return v.audience }
+
+// Endpoint performs OIDC discovery if it hasn't happened yet (exactly as the
+// first Verify would) and returns the IdP's OAuth2 endpoints. The context
+// covers that one-time discovery round-trip; a discovery failure is returned
+// and the next call retries, matching Verify's self-healing semantics.
+func (v *LazyVerifier) Endpoint(ctx context.Context) (oauth2.Endpoint, error) {
+	hv, err := v.ensure(ctx)
+	if err != nil {
+		return oauth2.Endpoint{}, err
+	}
+	return hv.Endpoint(), nil
+}

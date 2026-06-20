@@ -55,6 +55,8 @@ func (fi *fakeIssuer) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"issuer":                                fi.issuer,
 		"jwks_uri":                              fi.jwksURL,
+		"authorization_endpoint":                fi.issuer + "/authorize",
+		"token_endpoint":                        fi.issuer + "/token",
 		"id_token_signing_alg_values_supported": []string{"RS256"},
 	})
 }
@@ -205,6 +207,33 @@ func TestHTTPVerifier_IssuerAudienceAccessors(t *testing.T) {
 	ver, _ := oidc.NewHTTPVerifier(context.Background(), fi.issuer, testAud)
 	if ver.Issuer() != fi.issuer || ver.Audience() != testAud {
 		t.Errorf("accessors = %q/%q", ver.Issuer(), ver.Audience())
+	}
+}
+
+func TestHTTPVerifier_Endpoint(t *testing.T) {
+	fi := newFakeIssuer(t)
+	ver, err := oidc.NewHTTPVerifier(context.Background(), fi.issuer, testAud)
+	if err != nil {
+		t.Fatalf("NewHTTPVerifier: %v", err)
+	}
+	ep := ver.Endpoint()
+	if ep.AuthURL != fi.issuer+"/authorize" || ep.TokenURL != fi.issuer+"/token" {
+		t.Errorf("endpoint = %q/%q, want %q/%q", ep.AuthURL, ep.TokenURL, fi.issuer+"/authorize", fi.issuer+"/token")
+	}
+}
+
+func TestLazyVerifier_Endpoint(t *testing.T) {
+	fi := newFakeIssuer(t)
+	ver, err := oidc.NewLazyHTTPVerifier(fi.issuer, testAud)
+	if err != nil {
+		t.Fatalf("NewLazyHTTPVerifier: %v", err)
+	}
+	ep, err := ver.Endpoint(context.Background())
+	if err != nil {
+		t.Fatalf("Endpoint: %v", err)
+	}
+	if ep.AuthURL != fi.issuer+"/authorize" || ep.TokenURL != fi.issuer+"/token" {
+		t.Errorf("endpoint = %q/%q", ep.AuthURL, ep.TokenURL)
 	}
 }
 
