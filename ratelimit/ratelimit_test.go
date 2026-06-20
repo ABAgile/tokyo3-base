@@ -114,3 +114,37 @@ func TestMiddleware_ExemptAnd429(t *testing.T) {
 		t.Error("429 should carry a Retry-After header")
 	}
 }
+
+func TestMiddleware_OnThrottle(t *testing.T) {
+	l := New(Config{RPS: 1, Burst: 1, Log: discard(), OnThrottle: func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"slow down"}`))
+	}})
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) })
+	h := l.Middleware(next)
+
+	req := func() *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "/api", nil)
+		r.RemoteAddr = "203.0.113.2:5555"
+		return r
+	}
+	// Burst 1: first passes, second is throttled and rendered by OnThrottle.
+	h.ServeHTTP(httptest.NewRecorder(), req())
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req())
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("OnThrottle should set the status; got %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	if rec.Body.String() != `{"error":"slow down"}` {
+		t.Errorf("body = %q", rec.Body.String())
+	}
+	// Retry-After is set before OnThrottle runs, so it's still present.
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("Retry-After should be set even with a custom OnThrottle")
+	}
+}

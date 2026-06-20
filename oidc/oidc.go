@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	goidc "github.com/coreos/go-oidc/v3/oidc"
 )
@@ -40,6 +41,12 @@ type Claims struct {
 	// cookie to defend against token replay; a machine bearer-token path
 	// leaves it unset.
 	Nonce string
+	// Issuer is the issuer claim (`iss`) of the verified token.
+	Issuer string
+	// AuthTime is the user authentication time (`auth_time`).
+	AuthTime time.Time
+	// SessionID is the OIDC session identifier (`sid`).
+	SessionID string
 }
 
 // TokenVerifier is the abstraction services talk to. Implementations must
@@ -96,20 +103,80 @@ func (v *HTTPVerifier) Verify(ctx context.Context, rawIDToken string) (*Claims, 
 		return nil, err
 	}
 	var raw struct {
-		Email  string   `json:"email"`
-		Name   string   `json:"name"`
-		Groups []string `json:"groups"`
-		Nonce  string   `json:"nonce"`
+		Email    string   `json:"email"`
+		Name     string   `json:"name"`
+		Groups   []string `json:"groups"`
+		Nonce    string   `json:"nonce"`
+		AuthTime int64    `json:"auth_time"`
+		SID      string   `json:"sid"`
 	}
 	if err := tok.Claims(&raw); err != nil {
 		return nil, fmt.Errorf("decode token claims: %w", err)
 	}
+	var authTime time.Time
+	if raw.AuthTime > 0 {
+		authTime = time.Unix(raw.AuthTime, 0).UTC()
+	}
 	return &Claims{
-		Subject: tok.Subject,
-		Email:   raw.Email,
-		Name:    raw.Name,
-		Groups:  raw.Groups,
-		Nonce:   raw.Nonce,
+		Subject:   tok.Subject,
+		Email:     raw.Email,
+		Name:      raw.Name,
+		Groups:    raw.Groups,
+		Nonce:     raw.Nonce,
+		Issuer:    tok.Issuer,
+		AuthTime:  authTime,
+		SessionID: raw.SID,
+	}, nil
+}
+
+// LogoutClaims represents the subset of claims validated from an OIDC
+// Back-Channel Logout 1.0 logout_token (§2.4).
+type LogoutClaims struct {
+	Issuer    string
+	Subject   string
+	SessionID string
+	JTI       string
+	IssuedAt  time.Time
+	ExpiresAt time.Time
+}
+
+// VerifyLogoutToken validates an OIDC Back-Channel Logout 1.0 logout_token
+// per §2.6 using the same JWKS-backed verifier configured for ID tokens.
+func (v *HTTPVerifier) VerifyLogoutToken(ctx context.Context, raw string) (*LogoutClaims, error) {
+	tok, err := v.verifier.Verify(ctx, raw)
+	if err != nil {
+		return nil, fmt.Errorf("verify logout token: %w", err)
+	}
+	var body struct {
+		SID    string                    `json:"sid"`
+		Nonce  string                    `json:"nonce"`
+		JTI    string                    `json:"jti"`
+		IAT    int64                     `json:"iat"`
+		Exp    int64                     `json:"exp"`
+		Events map[string]map[string]any `json:"events"`
+	}
+	if err := tok.Claims(&body); err != nil {
+		return nil, fmt.Errorf("decode logout claims: %w", err)
+	}
+	if body.Nonce != "" {
+		return nil, fmt.Errorf("logout_token has nonce claim (forbidden by spec §2.6)")
+	}
+	if _, ok := body.Events["http://schemas.openid.net/event/backchannel-logout"]; !ok {
+		return nil, fmt.Errorf("logout_token missing backchannel-logout event")
+	}
+	if tok.Subject == "" && body.SID == "" {
+		return nil, fmt.Errorf("logout_token missing both sub and sid claims")
+	}
+	if body.JTI == "" {
+		return nil, fmt.Errorf("logout_token missing jti")
+	}
+	return &LogoutClaims{
+		Issuer:    tok.Issuer,
+		Subject:   tok.Subject,
+		SessionID: body.SID,
+		JTI:       body.JTI,
+		IssuedAt:  time.Unix(body.IAT, 0).UTC(),
+		ExpiresAt: time.Unix(body.Exp, 0).UTC(),
 	}, nil
 }
 
@@ -155,6 +222,16 @@ func (v *LazyVerifier) Verify(ctx context.Context, rawIDToken string) (*Claims, 
 		return nil, err
 	}
 	return hv.Verify(ctx, rawIDToken)
+}
+
+// VerifyLogoutToken validates an OIDC Back-Channel Logout 1.0 logout_token.
+// It lazily initializes the underlying OIDC provider on the first call if needed.
+func (v *LazyVerifier) VerifyLogoutToken(ctx context.Context, raw string) (*LogoutClaims, error) {
+	hv, err := v.ensure(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return hv.VerifyLogoutToken(ctx, raw)
 }
 
 func (v *LazyVerifier) ensure(ctx context.Context) (*HTTPVerifier, error) {

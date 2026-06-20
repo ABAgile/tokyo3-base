@@ -307,3 +307,94 @@ func TestTokenVerifier_Stub(t *testing.T) {
 		t.Fatalf("stub = %+v, %v", got, err)
 	}
 }
+
+func TestVerifyLogoutToken(t *testing.T) {
+	fi := newFakeIssuer(t)
+	ver, err := oidc.NewHTTPVerifier(context.Background(), fi.issuer, testAud)
+	if err != nil {
+		t.Fatalf("NewHTTPVerifier: %v", err)
+	}
+
+	now := time.Now().Unix()
+	validLogoutToken := fi.signToken(t, map[string]any{
+		"iss": fi.issuer,
+		"aud": testAud,
+		"sub": "user-1",
+		"iat": now,
+		"exp": now + 300,
+		"sid": "session-1",
+		"jti": "jti-1",
+		"events": map[string]any{
+			"http://schemas.openid.net/event/backchannel-logout": map[string]any{},
+		},
+	})
+
+	claims, err := ver.VerifyLogoutToken(context.Background(), validLogoutToken)
+	if err != nil {
+		t.Fatalf("VerifyLogoutToken failed: %v", err)
+	}
+	if claims.Subject != "user-1" || claims.SessionID != "session-1" || claims.JTI != "jti-1" {
+		t.Errorf("unexpected logout claims: %+v", claims)
+	}
+
+	// Verify using LazyVerifier as well to exercise and verify it
+	lazyVer, err := oidc.NewLazyHTTPVerifier(fi.issuer, testAud)
+	if err != nil {
+		t.Fatalf("NewLazyHTTPVerifier: %v", err)
+	}
+	lazyClaims, err := lazyVer.VerifyLogoutToken(context.Background(), validLogoutToken)
+	if err != nil {
+		t.Fatalf("LazyVerifier.VerifyLogoutToken failed: %v", err)
+	}
+	if lazyClaims.Subject != "user-1" || lazyClaims.SessionID != "session-1" {
+		t.Errorf("unexpected lazy logout claims: %+v", lazyClaims)
+	}
+
+	// Nonce is forbidden
+	invalidNonceToken := fi.signToken(t, map[string]any{
+		"iss":   fi.issuer,
+		"aud":   testAud,
+		"sub":   "user-1",
+		"iat":   now,
+		"exp":   now + 300,
+		"sid":   "session-1",
+		"jti":   "jti-1",
+		"nonce": "some-nonce",
+		"events": map[string]any{
+			"http://schemas.openid.net/event/backchannel-logout": map[string]any{},
+		},
+	})
+	if _, err := ver.VerifyLogoutToken(context.Background(), invalidNonceToken); err == nil || !strings.Contains(err.Error(), "nonce") {
+		t.Errorf("expected nonce error, got %v", err)
+	}
+
+	// Missing backchannel-logout event
+	missingEventToken := fi.signToken(t, map[string]any{
+		"iss":    fi.issuer,
+		"aud":    testAud,
+		"sub":    "user-1",
+		"iat":    now,
+		"exp":    now + 300,
+		"sid":    "session-1",
+		"jti":    "jti-1",
+		"events": map[string]any{},
+	})
+	if _, err := ver.VerifyLogoutToken(context.Background(), missingEventToken); err == nil || !strings.Contains(err.Error(), "missing backchannel-logout event") {
+		t.Errorf("expected missing event error, got %v", err)
+	}
+
+	// Missing both sub and sid
+	missingSubSidToken := fi.signToken(t, map[string]any{
+		"iss": fi.issuer,
+		"aud": testAud,
+		"iat": now,
+		"exp": now + 300,
+		"jti": "jti-1",
+		"events": map[string]any{
+			"http://schemas.openid.net/event/backchannel-logout": map[string]any{},
+		},
+	})
+	if _, err := ver.VerifyLogoutToken(context.Background(), missingSubSidToken); err == nil || !strings.Contains(err.Error(), "missing both sub and sid") {
+		t.Errorf("expected missing sub/sid error, got %v", err)
+	}
+}

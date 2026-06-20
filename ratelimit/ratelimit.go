@@ -58,15 +58,22 @@ type Config struct {
 
 	// Log receives a Warn line per throttled request. nil ⇒ slog.Default.
 	Log *slog.Logger
+
+	// OnThrottle renders the response for a throttled request. The Retry-After
+	// header is already set when it runs, so a handler may write any status,
+	// body, and Content-Type it likes (e.g. JSON for API clients, HTML for
+	// browsers). nil ⇒ a plain-text 429 via [http.Error].
+	OnThrottle http.HandlerFunc
 }
 
 // Limiter is a per-source-IP token-bucket limiter. The zero value is unusable;
 // build with [New].
 type Limiter struct {
-	rps     rate.Limit
-	burst   int
-	trusted []*net.IPNet
-	log     *slog.Logger
+	rps        rate.Limit
+	burst      int
+	trusted    []*net.IPNet
+	log        *slog.Logger
+	onThrottle http.HandlerFunc
 
 	mu        sync.Mutex
 	buckets   map[string]*bucket
@@ -95,18 +102,20 @@ func New(cfg Config) *Limiter {
 		log = slog.Default()
 	}
 	return &Limiter{
-		rps:     rate.Limit(cfg.RPS),
-		burst:   cfg.Burst,
-		trusted: cfg.TrustedProxies,
-		log:     log,
-		buckets: make(map[string]*bucket),
+		rps:        rate.Limit(cfg.RPS),
+		burst:      cfg.Burst,
+		trusted:    cfg.TrustedProxies,
+		log:        log,
+		onThrottle: cfg.OnThrottle,
+		buckets:    make(map[string]*bucket),
 	}
 }
 
 // Middleware wraps next with per-source-IP token-bucket limiting. A nil Limiter
 // (rate limiting disabled) returns next unchanged. Paths in exempt (exact
 // match) bypass the limiter — pass "/healthz" so monitoring probes are never
-// throttled. A throttled request gets 429 with a Retry-After header.
+// throttled. A throttled request gets a Retry-After header and is rendered by
+// Config.OnThrottle, defaulting to a plain-text 429.
 func (l *Limiter) Middleware(next http.Handler, exempt ...string) http.Handler {
 	if l == nil {
 		return next
@@ -124,7 +133,11 @@ func (l *Limiter) Middleware(next http.Handler, exempt ...string) http.Handler {
 		if !l.allow(key, time.Now()) {
 			w.Header().Set("Retry-After", l.retryAfter())
 			l.log.Warn("rate limit exceeded", "source", key, "path", r.URL.Path)
-			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+			if l.onThrottle != nil {
+				l.onThrottle(w, r)
+			} else {
+				http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+			}
 			return
 		}
 		next.ServeHTTP(w, r)

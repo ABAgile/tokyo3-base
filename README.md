@@ -1623,6 +1623,9 @@ type Claims struct {
     Subject, Email, Name string
     Groups               []string
     Nonce                string
+    Issuer               string    // iss
+    AuthTime             time.Time // auth_time
+    SessionID            string    // sid
 }
 
 type TokenVerifier interface {
@@ -1631,6 +1634,14 @@ type TokenVerifier interface {
 
 func NewHTTPVerifier(ctx context.Context, issuer, audience string) (*HTTPVerifier, error)
 func NewLazyHTTPVerifier(issuer, audience string) (*LazyVerifier, error)
+
+// Back-channel logout (HTTPVerifier and LazyVerifier):
+type LogoutClaims struct {
+    Issuer, Subject, SessionID, JTI string
+    IssuedAt, ExpiresAt             time.Time
+}
+func (v *HTTPVerifier) VerifyLogoutToken(ctx context.Context, raw string) (*LogoutClaims, error)
+func (v *LazyVerifier) VerifyLogoutToken(ctx context.Context, raw string) (*LogoutClaims, error)
 ```
 
 Verifies inbound OIDC ID tokens — signature, issuer, audience, expiry — so a
@@ -1642,6 +1653,12 @@ first `Verify`, so a daemon boots even while its IdP is briefly unreachable and
 self-heals on the next request — a transient outage at boot surfaces as a 401,
 not a crash. Consumers depend on the `TokenVerifier` interface, so tests inject
 a stub instead of standing up a real issuer.
+
+`VerifyLogoutToken` validates an [OIDC Back-Channel Logout 1.0](https://openid.net/specs/openid-connect-backchannel-1_0.html)
+`logout_token` over the same JWKS-backed verifier (§2.6: rejects a `nonce`,
+requires the `backchannel-logout` event, requires `jti` and at least one of
+`sub`/`sid`). Pair it with the `SessionID` (`sid`) now surfaced on `Claims` to
+correlate and terminate the right session on a logout callback.
 
 ```go
 v, err := oidc.NewLazyHTTPVerifier(
@@ -1726,6 +1743,7 @@ type Config struct {
     Burst          int           // token-bucket burst; < 1 ⇒ 1
     TrustedProxies []*net.IPNet  // proxies whose X-Forwarded-For is trusted for keying
     Log            *slog.Logger
+    OnThrottle     http.HandlerFunc // renders a throttled response; nil ⇒ plain-text 429
 }
 
 func New(cfg Config) *Limiter
@@ -1736,7 +1754,10 @@ Baseline defense-in-depth for any workload that exposes an API. `New` returns
 a token-bucket limiter keyed on the immediate TCP peer; `Middleware` wraps a
 handler, returning 429 + `Retry-After` when a source exceeds its rate. A nil
 `*Limiter` (when `RPS <= 0`) passes through, so callers wire it
-unconditionally; `exempt` paths bypass it — pass `"/healthz"`.
+unconditionally; `exempt` paths bypass it — pass `"/healthz"`. Set `OnThrottle`
+to render the throttled response yourself (e.g. JSON for API clients, HTML for
+browsers); the `Retry-After` header is already set when it runs, and the default
+is a plain-text 429 via `http.Error`.
 
 ```go
 rl := ratelimit.New(ratelimit.Config{
