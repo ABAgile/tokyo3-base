@@ -21,6 +21,7 @@ go get github.com/abagile/tokyo3-base
 - [cli/ — daemon startup composition](#cli--daemon-startup-composition)
 - [clientip/ — spoof-resistant client IP extraction](#clientip--spoof-resistant-client-ip-extraction)
 - [crypto/ — AES-256-GCM and envelope encryption](#crypto--aes-256-gcm-and-envelope-encryption)
+- [csrf/ — session-bound anti-CSRF tokens](#csrf--session-bound-anti-csrf-tokens)
 - [db/ — PostgreSQL / pgx utilities](#db--postgresql--pgx-utilities)
 - [debug/ — opt-in diagnostics server](#debug--opt-in-diagnostics-server)
 - [envutil/ — cmd/ main.go boilerplate helpers](#envutil--cmd-maingo-boilerplate-helpers)
@@ -31,6 +32,8 @@ go get github.com/abagile/tokyo3-base
 - [oidc/ — OIDC ID-token verification](#oidc--oidc-id-token-verification)
 - [ratelimit/ — per-source-IP HTTP rate limiter](#ratelimit--per-source-ip-http-rate-limiter)
 - [run/ — component lifecycle coordination](#run--component-lifecycle-coordination)
+- [sealedcookie/ — one sealed single-purpose cookie](#sealedcookie--one-sealed-single-purpose-cookie)
+- [session/ — sealed browser session, gate, CSRF](#session--sealed-browser-session-gate-csrf)
 - [tls/ — stateless TLS helpers](#tls--stateless-tls-helpers)
   - [tls/reloader — hot-reload loaders + multi-pool orchestrator](#tlsreloader--hot-reload-loaders--multi-pool-orchestrator)
 - [version/ — build version resolution](#version--build-version-resolution)
@@ -944,6 +947,41 @@ cache.Invalidate(projectID)
 
 ---
 
+## csrf/ — session-bound anti-CSRF tokens
+
+```go
+import "github.com/abagile/tokyo3-base/csrf"
+
+type Secret string
+
+func NewSecret() (Secret, error)
+func Token(secret Secret, scope string) (string, error)
+func Validate(secret Secret, token, scope string) bool
+```
+
+Anti-CSRF token minting and validation (OWASP synchronizer/signed family) —
+deliberately pure token math: no cookie, no HTTP. Where the secret lives is
+entirely the caller's job: store a `NewSecret` with the authenticated session
+state it protects (e.g. `session` seals it into the session cookie as
+`Session.CSRFSecret`), render `Token` into each form (hidden field), check
+`Validate` on POST. Tokens are HMAC-SHA256(secret, scope) — forging one
+requires forging the state holding the secret itself — and `scope` optionally
+partitions the token space (e.g. per form action).
+
+Every token is XOR-masked with a fresh random pad per call (the Django/Rails
+scheme): each render emits different wire bytes while the underlying HMAC
+stays stable — multi-tab keeps working, nothing rotates server-side, and
+compression side-channels (BREACH) against the embedded value are defeated.
+All comparisons are constant-time; empty/malformed/mismatched inputs fail
+uniformly so handlers render one "expired or forged" message.
+
+Most consumers never call this package directly — `session.Manager.CSRFToken`
+/ `ValidateCSRF` wrap it with the session plumbing.
+
+[↑ Back to top](#packages)
+
+---
+
 ## db/ — PostgreSQL / pgx utilities
 
 ### Pool construction
@@ -1712,63 +1750,62 @@ if err != nil { /* 401 */ }
 allowed := slices.Contains(claims.Groups, "admins")
 ```
 
-### Authenticator — browser login + sealed session
+### Authenticator — browser OIDC login flow over a session.Manager
 
 ```go
 type AuthenticatorConfig struct {
     Issuer, ClientID, ClientSecret, RedirectURL string
-    AdminGroup   string         // required group claim; "" ⇒ any authenticated user
-    Verifier     TokenVerifier  // validates the returned ID token (audience = ClientID)
-    SessionKey   []byte         // 32-byte key sealing the session + flow cookies (AES-256-GCM)
-    SessionTTL   time.Duration  // 0 ⇒ 8h
-    CookiePrefix string         // <prefix>_session / <prefix>_flow (required)
-    CookiePath   string         // "" ⇒ "/"
-    LoginPath, CallbackPath, LogoutPath string // defaults /auth/{login,callback,logout}
-    ExemptPaths  []string       // extra unauthenticated paths (e.g. "/healthz")
-    Now func() time.Time        // injectable clock
-    Log *slog.Logger
+    Verifier     TokenVerifier // validates the returned ID token (audience = ClientID)
+    Scopes       string        // "" ⇒ "openid email profile groups"
+    CallbackPath string        // must be exempt on the injected Manager; "" ⇒ /auth/callback
+    // optional login-time enrichment of the session (Extra, Expiry) from
+    // the verified claims; a returned error aborts the login (fail closed):
+    EnrichSession func(ctx context.Context, claims *Claims, sess *session.Session) error
 }
 
-func NewAuthenticator(cfg AuthenticatorConfig) (*Authenticator, error)
+func NewAuthenticator(cfg AuthenticatorConfig, sess *session.Manager) (*Authenticator, error)
 func (a *Authenticator) LoginHandler() http.HandlerFunc
 func (a *Authenticator) CallbackHandler() http.HandlerFunc
-func (a *Authenticator) LogoutHandler() http.HandlerFunc
-func (a *Authenticator) Gate(next http.Handler) http.Handler
-func SessionFromContext(ctx context.Context) (Session, bool)
 ```
 
 Native browser-based OIDC login for an admin portal — the Authorization-Code +
-PKCE flow, an AES-256-GCM-sealed session cookie, and an optional admin-group
-gate. It owns only the browser glue: `LoginHandler` mints state/nonce/PKCE and
+PKCE flow, and nothing else: `LoginHandler` mints state/nonce/PKCE (sealed
+into a short-lived flow cookie via the Manager's `SiblingCookie`) and
 redirects to the IdP; `CallbackHandler` validates state, exchanges the code
-(via `auth/oidcclient`), verifies the ID token + nonce with the `TokenVerifier`,
-and seals the session; `Gate` enforces the session (and group) on the protected
-mux — redirecting unauthenticated GETs to login (with `return_to`) and 401-ing
-other methods. Downstream handlers read the identity via `SessionFromContext`.
+(via `auth/oidcclient`), verifies the ID token + nonce with the
+`TokenVerifier`, and mints the session on the injected
+[`session.Manager`](#session--sealed-browser-session-gate-csrf). The session
+cookie, access gate, group check, CSRF tokens, and logout all belong to that
+Manager — Authenticator does not wrap or re-expose it.
 
 Pair it with [`httpauth.BasicAuth`](#httpauth--http-auth-middleware): a portal
 runs OIDC login when configured, else falls back to the Basic gate.
 
 ```go
+sess, _ := session.New(session.Config{
+    RequiredGroup: "ca-portal-admin",
+    SessionKey:    key,             // 32 bytes, e.g. crypto.ParseKEK(hex)
+    CookiePrefix:  "certd_portal",
+    BasePath:      "/portal",
+    ExemptPaths:   []string{"/healthz", "/auth/callback"},
+})
 auth, _ := oidc.NewAuthenticator(oidc.AuthenticatorConfig{
     Issuer: issuer, ClientID: clientID, ClientSecret: secret,
-    RedirectURL:  "https://certd.example.com/portal/auth/callback",
-    AdminGroup:   "ca-portal-admin",
-    Verifier:     verifier,          // an oidc.TokenVerifier (audience = clientID)
-    SessionKey:   key,               // 32 bytes, e.g. crypto.ParseKEK(hex)
-    CookiePrefix: "certd_portal",
-    CookiePath:   "/portal/",
-})
+    RedirectURL: "https://certd.example.com/portal/auth/callback",
+    Verifier:    verifier,           // an oidc.TokenVerifier (audience = clientID)
+}, sess)
 mux.Handle("GET /auth/login", auth.LoginHandler())
 mux.Handle("GET /auth/callback", auth.CallbackHandler())
-mux.Handle("GET /auth/logout", auth.LogoutHandler())
-handler := auth.Gate(mux) // wrap the protected routes
+mux.Handle("POST /auth/logout", sess.LogoutHandler())
+handler := sess.Gate(mux) // wrap the protected routes
 ```
 
-Cookies are HttpOnly, Secure (when served over TLS), SameSite=Lax, scoped to
-`CookiePath`; the flow cookie is short-lived (10m) and the session honors
-`SessionTTL`. `return_to` is confined to a local absolute path so a crafted
-value can't bounce the browser to an attacker origin.
+Cookies are HttpOnly, Secure (when served over TLS — `X-Forwarded-Proto`
+aware), SameSite=Lax, scoped to the Manager's cookie path; the flow cookie is
+short-lived (10m) and the session honors the Manager's `SessionTTL`.
+`return_to` is confined to a local absolute path (the Manager's
+`SafeReturnTo`) so a crafted value can't bounce the browser to an attacker
+origin.
 
 [↑ Back to top](#packages)
 
@@ -1878,6 +1915,120 @@ err := run.Group(rt.Ctx,
 A component must return when its context is cancelled; one that ignores it
 stalls `Group`'s wait. `Group` is dependency-free (stdlib only), so tools and
 tests can use it without pulling in the `cli` daemon-composition stack.
+
+[↑ Back to top](#packages)
+
+---
+
+## sealedcookie/ — one sealed single-purpose cookie
+
+```go
+import "github.com/abagile/tokyo3-base/sealedcookie"
+
+type Cookie struct {
+    Key  []byte           // AES-256-GCM key
+    Name string           // cookie name
+    Path string           // cookie Path scope
+    Now  func() time.Time // nil ⇒ time.Now
+}
+
+func (c Cookie) Set(w http.ResponseWriter, r *http.Request, v any, ttl time.Duration) error
+func (c Cookie) Read(r *http.Request, dst any) error
+func (c Cookie) Clear(w http.ResponseWriter, r *http.Request)
+
+// the underlying seal, for non-cookie transports of the same shape:
+func Seal(key []byte, v any) (string, error)
+func Open(key []byte, val string, dst any) error
+```
+
+One sealed (AES-256-GCM), single-purpose HTTP cookie: marshal a value to
+JSON, seal it under a key, and set/read/clear it under a fixed name, path,
+and clock. It has no notion of what the value MEANS — a long-lived login
+session and a short-lived OIDC login-flow state are both just "a value,
+sealed into a cookie, for some TTL"; `session` and `oidc` each compose one
+for their own payload type.
+
+Cookies are HttpOnly, SameSite=Lax, and Secure when the request arrived over
+HTTPS — including behind a TLS-terminating proxy (`X-Forwarded-Proto`).
+`ttl <= 0` sets no Expires/Max-Age (a browser-session cookie). `Read` returns
+one uniform error whether the cookie is absent, malformed, or fails to open,
+so callers treat "no valid value" as a single case.
+
+[↑ Back to top](#packages)
+
+---
+
+## session/ — sealed browser session, gate, CSRF
+
+```go
+import "github.com/abagile/tokyo3-base/session"
+
+type Session struct {
+    Subject, Email, Name string
+    Groups               []string
+    Expiry               time.Time       // slides on activity when IdleTimeout is set
+    AbsoluteExpiry       time.Time       // hard ceiling: login + SessionTTL
+    CSRFSecret           csrf.Secret     // minted by NewSession
+    Extra                json.RawMessage // opaque consumer payload
+}
+
+type Config struct {
+    RequiredGroup  string        // group required by Gate; "" ⇒ any authenticated session
+    SessionKey     []byte        // 32-byte AES-256-GCM key (required)
+    SessionTTL     time.Duration // 0 ⇒ 8h
+    CookiePrefix   string        // <prefix>_session (required)
+    LoginPath      string        // default /auth/login
+    LogoutPath     string        // default /auth/logout
+    ExemptPaths    []string      // extra unauthenticated paths (e.g. "/healthz")
+    BasePath       string        // browser-visible mount prefix under StripPrefix
+    IdleTimeout    time.Duration // > 0 ⇒ sliding idle expiry, capped at AbsoluteExpiry
+    TrustedOrigins *[]string     // non-nil ⇒ Origin/Sec-Fetch-Site verification on
+    Now            func() time.Time
+    Log            *slog.Logger
+}
+
+func New(cfg Config) (*Manager, error)
+func (m *Manager) NewSession() (Session, error)
+func (m *Manager) IssueSession(w http.ResponseWriter, r *http.Request, sess Session) error
+func (m *Manager) UpdateSession(w http.ResponseWriter, r *http.Request, mutate func(*Session) error) error
+func (m *Manager) Gate(next http.Handler) http.Handler
+func (m *Manager) LogoutHandler() http.HandlerFunc
+func (m *Manager) CSRFToken(r *http.Request, scope string) (string, error)
+func (m *Manager) ValidateCSRF(r *http.Request, token, scope string) bool
+func (m *Manager) SiblingCookie(suffix string) sealedcookie.Cookie
+func SessionFromContext(ctx context.Context) (Session, bool)
+```
+
+A sealed-cookie browser session: an encrypted identity cookie (via
+`sealedcookie`), an access gate, and session-bound anti-CSRF tokens (via
+`csrf`). It has no notion of HOW the identity was established — OIDC, SAML,
+a magic link, HTTP Basic followed by session issuance — that is the caller's
+job: authenticate the request some other way, build a `Session` (starting
+from `NewSession`, which mints `Expiry` and a fresh `CSRFSecret`), and call
+`IssueSession`. `oidc.Authenticator` is the in-repo consumer, composing a
+Manager underneath its Authorization-Code + PKCE flow.
+
+`Gate` wraps the protected mux: exempt paths pass through; an
+unauthenticated GET redirects to `LoginPath` (carrying `return_to`), other
+methods get 401; a session lacking `RequiredGroup` gets 403; on success the
+`Session` is injected into the request context for `SessionFromContext`.
+With `IdleTimeout` set, activity slides `Expiry` forward (never past
+`AbsoluteExpiry`); with `TrustedOrigins` non-nil, Go's
+`http.CrossOriginProtection` rejects cross-origin state-changing requests
+before the session/CSRF checks even run — defense-in-depth alongside, not
+instead of, the CSRF tokens.
+
+`CSRFToken`/`ValidateCSRF` bind tokens to the session's `CSRFSecret` — embed
+the token in each form and check it on POST. A consumer without a login flow
+can still use a Manager purely as the secret's sealed transport: mint an
+anonymous `NewSession` (identity fields empty) lazily at first form render
+and keep its own gate — that's how the CA portal's Basic-auth mode works.
+
+`SiblingCookie` derives a `sealedcookie.Cookie` sharing the Manager's key,
+path scope, and clock under `<CookiePrefix>_<suffix>` — for a caller's own
+related cookie (e.g. an OIDC login-flow state). Helpers `Log`, `IsExempt`,
+`CookiePath`, and `SafeReturnTo` support callers composing their own
+login-flow handlers.
 
 [↑ Back to top](#packages)
 
