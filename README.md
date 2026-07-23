@@ -1883,6 +1883,58 @@ cookie + redirect for a browser session) implements `SessionIssuer` +
 `CompletionOverride` directly instead, supplying its own `FlowCookie` (any
 key/name/path/clock — no dependency on `session.Manager` at all).
 
+### BackchannelLogoutHandler — OIDC Back-Channel Logout 1.0 consumption
+
+```go
+type LogoutTokenVerifier interface {
+    VerifyLogoutToken(ctx context.Context, raw string) (*LogoutClaims, error)
+}
+
+type LogoutRevoker interface {
+    RevokeSession(ctx context.Context, sid string) (revoked int64, err error)
+    RevokeUser(ctx context.Context, issuer, subject string) (revoked int64, identity string, ok bool, err error)
+}
+
+type BackchannelLogoutConfig struct {
+    Verifier     LogoutTokenVerifier // required; *HTTPVerifier / *LazyVerifier satisfy this verbatim
+    Revoker      LogoutRevoker       // required; maps a notification onto your session/token model
+    ReplayWindow time.Duration       // jti replay-rejection window; "" ⇒ 5m
+    // OnRevoked, if set, runs after a successful revocation (including the
+    // "unknown user" idempotent case) so the caller can audit-log with its
+    // own metadata shape. A returned error fails the request with 500.
+    OnRevoked func(r *http.Request, claims *LogoutClaims, scope, identity string, revoked int64) error
+    Log       *slog.Logger
+}
+
+func NewBackchannelLogoutHandler(cfg BackchannelLogoutConfig) (*BackchannelLogoutHandler, error)
+func (h *BackchannelLogoutHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
+```
+
+Consumes [OIDC Back-Channel Logout 1.0](https://openid.net/specs/openid-connect-backchannel-1_0.html)
+notifications end to end: parses the `application/x-www-form-urlencoded`
+`logout_token` field (§2.5), verifies it via the injected `LogoutTokenVerifier`,
+rejects a replayed `jti` (§2.6 — an in-memory, single-process window; a
+multi-replica deployment wants a shared cache instead), and dispatches to
+`RevokeSession` when the token carries `sid` (the precise path) or
+`RevokeUser` as the `sub`-only fallback. `RevokeUser`'s `ok=false` ("I don't
+know this issuer+subject") is treated as an idempotent success, not an
+error — a logout notification for a user the caller doesn't know about needs
+no action, and the OP shouldn't keep retrying it. Every response carries
+`Cache-Control: no-store` and the §2.8-mandated status shape (200 on success,
+4xx for a bad/replayed token, 5xx only for an unexpected internal failure).
+
+```go
+verifier, _ := oidc.NewLazyHTTPVerifier(issuer, clientID)
+handler, _ := oidc.NewBackchannelLogoutHandler(oidc.BackchannelLogoutConfig{
+    Verifier: verifier,
+    Revoker:  myRevoker{}, // implements RevokeSession / RevokeUser against your store
+    OnRevoked: func(r *http.Request, claims *oidc.LogoutClaims, scope, identity string, revoked int64) error {
+        return auditLog(r, scope, identity, revoked)
+    },
+})
+mux.Handle("POST /api/v1/auth/oidc/backchannel-logout", handler)
+```
+
 [↑ Back to top](#packages)
 
 ---
