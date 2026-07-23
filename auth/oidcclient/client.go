@@ -262,11 +262,24 @@ func Refresh(ctx context.Context, issuer, clientID, refreshToken string) (*Token
 // Expiration here so callers don't have to track the relative-vs-
 // absolute time semantics. Exported because the device flow uses it
 // for the polling exchange.
+//
+// PostToken assumes the {issuer}/token convention; use [PostTokenAt] when
+// the token endpoint URL is already known (e.g. resolved via OIDC
+// discovery) and may not follow that convention.
 func PostToken(ctx context.Context, issuer string, form url.Values) (*Tokens, error) {
+	return PostTokenAt(ctx, strings.TrimRight(issuer, "/")+"/token", form)
+}
+
+// PostTokenAt POSTs to the explicit tokenURL and decodes the standard
+// OAuth2 response into a Tokens, exactly like [PostToken] but without
+// assuming the {issuer}/token convention — for callers (e.g. a login
+// broker driving a third-party IdP) that resolve the token endpoint via
+// OIDC discovery instead.
+func PostTokenAt(ctx context.Context, tokenURL string, form url.Values) (*Tokens, error) {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		strings.TrimRight(issuer, "/")+"/token", strings.NewReader(form.Encode()))
+		tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, err
 	}

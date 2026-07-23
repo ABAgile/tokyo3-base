@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/oauth2"
+
 	"github.com/abagile/tokyo3-base/sealedcookie"
 	"github.com/abagile/tokyo3-base/session"
 )
@@ -508,3 +510,130 @@ func TestCompletionOverride_ErrorRenders500(t *testing.T) {
 }
 
 var errBoom = errors.New("boom")
+
+// ── Discovery-based endpoint resolution ───────────────────────────────
+
+// syncEndpointStub implements TokenVerifier plus the sync Endpoint() shape
+// HTTPVerifier exposes, so Authenticator resolves endpoints via discovery
+// instead of the hardcoded {issuer}/authorize + {issuer}/token convention.
+type syncEndpointStub struct {
+	stubTok
+	ep oauth2.Endpoint
+}
+
+func (s syncEndpointStub) Endpoint() oauth2.Endpoint { return s.ep }
+
+// asyncEndpointStub implements TokenVerifier plus the ctx-taking Endpoint
+// shape LazyVerifier exposes.
+type asyncEndpointStub struct {
+	stubTok
+	ep  oauth2.Endpoint
+	err error
+}
+
+func (a asyncEndpointStub) Endpoint(context.Context) (oauth2.Endpoint, error) { return a.ep, a.err }
+
+func TestBegin_FallsBackToHardcodedConventionWithoutEndpoint(t *testing.T) {
+	a := testAuth(t, stubTok{}, func(c *AuthenticatorConfig) { c.Issuer = "https://idp.example.com" })
+	w := httptest.NewRecorder()
+	authURL, err := a.Begin(w, httptest.NewRequest(http.MethodGet, "/auth/login", nil), "")
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	if !strings.HasPrefix(authURL, "https://idp.example.com/authorize?") {
+		t.Errorf("authURL = %q, want the hardcoded {issuer}/authorize convention", authURL)
+	}
+}
+
+func TestBegin_UsesSyncDiscoveredEndpoint(t *testing.T) {
+	ver := syncEndpointStub{ep: oauth2.Endpoint{
+		AuthURL:  "https://discovered.example/oauth2/v1/authorize",
+		TokenURL: "https://discovered.example/oauth2/v1/token",
+	}}
+	a := testAuth(t, ver, func(c *AuthenticatorConfig) { c.Issuer = "https://idp.example.com" })
+	w := httptest.NewRecorder()
+	authURL, err := a.Begin(w, httptest.NewRequest(http.MethodGet, "/auth/login", nil), "")
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	if !strings.HasPrefix(authURL, "https://discovered.example/oauth2/v1/authorize?") {
+		t.Errorf("authURL = %q, want the sync-discovered endpoint, not the hardcoded convention", authURL)
+	}
+}
+
+func TestBegin_UsesAsyncDiscoveredEndpoint(t *testing.T) {
+	ver := asyncEndpointStub{ep: oauth2.Endpoint{
+		AuthURL:  "https://discovered.example/authorize",
+		TokenURL: "https://discovered.example/token",
+	}}
+	a := testAuth(t, ver, func(c *AuthenticatorConfig) { c.Issuer = "https://idp.example.com" })
+	w := httptest.NewRecorder()
+	authURL, err := a.Begin(w, httptest.NewRequest(http.MethodGet, "/auth/login", nil), "")
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	if !strings.HasPrefix(authURL, "https://discovered.example/authorize?") {
+		t.Errorf("authURL = %q, want the async-discovered endpoint, not the hardcoded convention", authURL)
+	}
+}
+
+func TestBegin_AsyncDiscoveryFailure_ReturnsError(t *testing.T) {
+	ver := asyncEndpointStub{err: errBoom}
+	a := testAuth(t, ver, func(c *AuthenticatorConfig) { c.Issuer = "https://idp.example.com" })
+	w := httptest.NewRecorder()
+	if _, err := a.Begin(w, httptest.NewRequest(http.MethodGet, "/auth/login", nil), ""); err == nil {
+		t.Error("want error when the verifier's discovery fails, not a silent fallback to the hardcoded convention")
+	}
+}
+
+// TestLoginCallback_UsesDiscoveredTokenURL proves the token exchange POSTs
+// to the DISCOVERED token endpoint rather than {Issuer}/token: Issuer is a
+// non-resolvable placeholder, so the callback can only succeed if
+// oidcclient.PostTokenAt actually used the verifier's discovered TokenURL
+// (the real httptest server).
+func TestLoginCallback_UsesDiscoveredTokenURL(t *testing.T) {
+	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "at", "id_token": "it"})
+	}))
+	defer tokenSrv.Close()
+
+	stub := stubTok{}
+	ver := syncEndpointStub{stubTok: stub, ep: oauth2.Endpoint{
+		AuthURL:  "https://issuer.invalid/authorize",
+		TokenURL: tokenSrv.URL + "/token",
+	}}
+	a := testAuth(t, ver, func(c *AuthenticatorConfig) { c.Issuer = "https://issuer.invalid" })
+	fc, flow := startFlow(t, a)
+
+	stub.claims = &Claims{Subject: "u-1", Email: "alice@x", Nonce: flow.Nonce}
+	ver.stubTok = stub
+	a.cfg.Verifier = ver
+
+	r := httptest.NewRequest(http.MethodGet, "/auth/callback?state="+url.QueryEscape(flow.State)+"&code=abc", nil)
+	r.AddCookie(fc)
+	rec := httptest.NewRecorder()
+	a.CallbackHandler()(rec, r)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("callback code = %d body=%q, want 303 (exchange must have hit the discovered token URL, not the unresolvable issuer)", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCallback_AsyncDiscoveryFailure_502(t *testing.T) {
+	ver := asyncEndpointStub{err: errBoom}
+	a := testAuth(t, stubTok{}, func(c *AuthenticatorConfig) { c.Issuer = "https://idp.example.com" })
+	fc, flow := startFlow(t, a)
+
+	// Swap in the failing-discovery verifier only for the callback, after
+	// Begin (which used the stub) has already sealed the flow cookie.
+	a.cfg.Verifier = ver
+
+	r := httptest.NewRequest(http.MethodGet, "/auth/callback?state="+url.QueryEscape(flow.State)+"&code=abc", nil)
+	r.AddCookie(fc)
+	rec := httptest.NewRecorder()
+	a.CallbackHandler()(rec, r)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("callback code = %d, want 502 when endpoint discovery fails", rec.Code)
+	}
+}

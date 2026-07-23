@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/oauth2"
+
 	"github.com/abagile/tokyo3-base/auth/oidcclient"
 	"github.com/abagile/tokyo3-base/crypto"
 	"github.com/abagile/tokyo3-base/sealedcookie"
@@ -251,13 +253,18 @@ func (a *Authenticator) Begin(w http.ResponseWriter, r *http.Request, extra stri
 		return "", err
 	}
 
+	ep, err := a.endpoint(r.Context())
+	if err != nil {
+		return "", fmt.Errorf("oidc: resolve endpoint: %w", err)
+	}
 	sum := sha256.Sum256([]byte(verifier))
 	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
-	return a.authorizeURL(state, nonce, challenge), nil
+	return a.authorizeURL(ep, state, nonce, challenge), nil
 }
 
-// authorizeURL builds the IdP /authorize redirect for the code flow.
-func (a *Authenticator) authorizeURL(state, nonce, challenge string) string {
+// authorizeURL builds the IdP /authorize redirect for the code flow, from
+// the endpoint resolved via [Authenticator.endpoint].
+func (a *Authenticator) authorizeURL(ep oauth2.Endpoint, state, nonce, challenge string) string {
 	q := url.Values{}
 	q.Set("response_type", "code")
 	q.Set("client_id", a.cfg.ClientID)
@@ -267,7 +274,44 @@ func (a *Authenticator) authorizeURL(state, nonce, challenge string) string {
 	q.Set("nonce", nonce)
 	q.Set("code_challenge", challenge)
 	q.Set("code_challenge_method", "S256")
-	return strings.TrimRight(a.cfg.Issuer, "/") + "/authorize?" + q.Encode()
+	return ep.AuthURL + "?" + q.Encode()
+}
+
+// endpointResolver is implemented by verifiers that can report the IdP's
+// discovered OAuth2 endpoints, deferring discovery to this call if it
+// hasn't happened yet — [LazyVerifier.Endpoint] matches this shape
+// directly.
+type endpointResolver interface {
+	Endpoint(ctx context.Context) (oauth2.Endpoint, error)
+}
+
+// syncEndpointResolver is the shape [HTTPVerifier.Endpoint] exposes:
+// discovery already happened at construction, so no context or error is
+// needed.
+type syncEndpointResolver interface {
+	Endpoint() oauth2.Endpoint
+}
+
+// endpoint resolves the IdP's authorize/token endpoints from the configured
+// Verifier when it exposes them (real OIDC discovery — required for
+// interop with any IdP whose paths don't follow the tokyo3-auth
+// convention, e.g. Google/Okta/Auth0). Falls back to the hardcoded
+// {issuer}/authorize + {issuer}/token convention when the Verifier exposes
+// neither shape (e.g. a test stub), preserving prior behavior exactly for
+// those callers. A discovery failure from an endpointResolver is returned
+// rather than silently falling back — masking a genuine IdP-unreachable
+// error behind a guessed URL would trade a clear failure for a confusing
+// one.
+func (a *Authenticator) endpoint(ctx context.Context) (oauth2.Endpoint, error) {
+	switch v := a.cfg.Verifier.(type) {
+	case endpointResolver:
+		return v.Endpoint(ctx)
+	case syncEndpointResolver:
+		return v.Endpoint(), nil
+	default:
+		issuer := strings.TrimRight(a.cfg.Issuer, "/")
+		return oauth2.Endpoint{AuthURL: issuer + "/authorize", TokenURL: issuer + "/token"}, nil
+	}
 }
 
 // CallbackHandler completes the flow: it validates state against the flow
@@ -307,8 +351,14 @@ func (a *Authenticator) CallbackHandler() http.HandlerFunc {
 		if a.cfg.ClientSecret != "" {
 			form.Set("client_secret", a.cfg.ClientSecret)
 		}
+		ep, err := a.endpoint(r.Context())
+		if err != nil {
+			a.sess.Log().Warn("oidc: resolve endpoint failed", "err", err)
+			http.Error(w, "token exchange failed", http.StatusBadGateway)
+			return
+		}
 		form.Set("code_verifier", flow.Verifier)
-		tokens, err := oidcclient.PostToken(r.Context(), a.cfg.Issuer, form)
+		tokens, err := oidcclient.PostTokenAt(r.Context(), ep.TokenURL, form)
 		if err != nil {
 			a.sess.Log().Warn("oidc: token exchange failed", "err", err)
 			http.Error(w, "token exchange failed", http.StatusBadGateway)
