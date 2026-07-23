@@ -14,25 +14,25 @@ import (
 )
 
 // codeFlowFixture stands up a fake issuer that serves the /token
-// endpoint and supplies a mock openBrowser that drives the loopback
+// endpoint and supplies a mock OpenBrowser that drives the loopback
 // callback directly. Tests use the public RunCodeFlow API exactly as
 // production callers do; the seam is just the package-level
-// openBrowser var, swapped under a sync.Mutex so concurrent tests
+// OpenBrowser var, swapped under a sync.Mutex so concurrent tests
 // can't corrupt each other.
 type codeFlowFixture struct {
 	t          *testing.T
 	srv        *httptest.Server
 	tokenResp  string // raw body the /token endpoint returns on 200
 	tokenCode  int    // override status (0 = 200)
-	browserErr error  // injected error from openBrowser, if any
+	browserErr error  // injected error from OpenBrowser, if any
 	// scripted callback values — defaults to a real "approval"
 	// (matching state, real code). Override for negative tests.
 	overrideCode  string // if non-empty, used as the ?code= value
 	overrideState string // if non-empty, used as the ?state= value (mismatch test)
-	skipCallback  bool   // if true, openBrowser doesn't fire the callback at all
+	skipCallback  bool   // if true, OpenBrowser doesn't fire the callback at all
 }
 
-// reset locks the openBrowser var for the duration of a single test.
+// reset locks the OpenBrowser var for the duration of a single test.
 // Subsequent fixture-driven tests must wait — this is the price of
 // having a package-level seam.
 var openBrowserMu sync.Mutex
@@ -59,15 +59,15 @@ func newCodeFlowFixture(t *testing.T) *codeFlowFixture {
 	return f
 }
 
-// install swaps openBrowser with the fixture's mock for the duration
+// install swaps OpenBrowser with the fixture's mock for the duration
 // of the test, restoring the original on cleanup. The mock parses
 // the authorize URL the package produces, extracts redirect_uri +
 // state, and POSTs back to the loopback /callback so RunCodeFlow's
 // listener can resolve.
 func (f *codeFlowFixture) install() {
 	openBrowserMu.Lock()
-	original := openBrowser
-	openBrowser = func(rawURL string) error {
+	original := OpenBrowser
+	OpenBrowser = func(rawURL string) error {
 		if f.browserErr != nil {
 			return f.browserErr
 		}
@@ -76,7 +76,7 @@ func (f *codeFlowFixture) install() {
 		}
 		u, err := url.Parse(rawURL)
 		if err != nil {
-			f.t.Errorf("openBrowser mock: parse authURL: %v", err)
+			f.t.Errorf("OpenBrowser mock: parse authURL: %v", err)
 			return nil
 		}
 		q := u.Query()
@@ -105,7 +105,7 @@ func (f *codeFlowFixture) install() {
 		return nil
 	}
 	f.t.Cleanup(func() {
-		openBrowser = original
+		OpenBrowser = original
 		openBrowserMu.Unlock()
 	})
 }
@@ -252,8 +252,8 @@ func TestRunCodeFlow_UsesDiscoveredTokenEndpoint(t *testing.T) {
 	defer srv.Close()
 
 	openBrowserMu.Lock()
-	original := openBrowser
-	openBrowser = func(rawURL string) error {
+	original := OpenBrowser
+	OpenBrowser = func(rawURL string) error {
 		u, err := url.Parse(rawURL)
 		if err != nil {
 			t.Errorf("parse authURL: %v", err)
@@ -274,7 +274,7 @@ func TestRunCodeFlow_UsesDiscoveredTokenEndpoint(t *testing.T) {
 		return nil
 	}
 	defer func() {
-		openBrowser = original
+		OpenBrowser = original
 		openBrowserMu.Unlock()
 	}()
 

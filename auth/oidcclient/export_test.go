@@ -8,7 +8,7 @@ import (
 
 // deviceSleeperMu serializes UseInstantDeviceSleeper installations so
 // concurrent tests can't see a half-installed swap. Same pattern the
-// codeflow internal tests use for the openBrowser var.
+// codeflow internal tests use for the OpenBrowser var.
 var deviceSleeperMu sync.Mutex
 
 // UseInstantDeviceSleeper replaces the device-flow polling sleeper

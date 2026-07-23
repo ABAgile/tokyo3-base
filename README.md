@@ -514,6 +514,28 @@ exact endpoint paths — not just ones matching tokyo3-auth's
 convention. A missing, unreachable, or malformed discovery document
 falls back to that convention rather than failing the login.
 
+#### Loopback primitives for non-OAuth server-mediated logins
+
+```go
+func LoopbackListener(port int, path string) (net.Listener, string, error)
+func StartLoopbackCallback(listener net.Listener, path string,
+    handle func(w http.ResponseWriter, r *http.Request) (string, error)) *LoopbackCallback
+func (lc *LoopbackCallback) Wait(ctx context.Context, timeout time.Duration) (string, error)
+var OpenBrowser func(rawURL string) error
+```
+
+The bind/serve/timeout/shutdown mechanics behind `RunCodeFlow` are
+exported separately for callers whose loopback redirect doesn't carry
+a raw OAuth code — e.g. vault's `vault login --oidc`, which proxies
+through its own server and receives a service-minted token instead of
+talking to the IdP directly. Call `StartLoopbackCallback` (serving
+starts immediately), then open the browser, then call `Wait` — in that
+order: opening the browser before the server is actually accepting
+connections risks the redirect arriving nowhere. `OpenBrowser` folds
+in a headless-session check (no `DISPLAY`/`WAYLAND_DISPLAY` on Linux)
+before attempting `xdg-open`, which would otherwise hang or fail
+confusingly over SSH.
+
 ### Token cache — `LoadConfig`, `LoadTokens`, `EnsureFreshTokens`, `Refresh`
 
 ```go
