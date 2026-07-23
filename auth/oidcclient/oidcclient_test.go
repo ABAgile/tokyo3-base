@@ -309,6 +309,37 @@ func TestRefresh_HappyPath(t *testing.T) {
 	}
 }
 
+// TestRefresh_UsesDiscoveredTokenEndpoint proves Refresh POSTs to the
+// issuer's discovered token endpoint rather than the hardcoded
+// {issuer}/token convention: the server only serves /custom-token
+// (plus the discovery document pointing at it), so Refresh can only
+// succeed if the discovered endpoint was actually used.
+func TestRefresh_UsesDiscoveredTokenEndpoint(t *testing.T) {
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/.well-known/openid-configuration":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"token_endpoint":"` + srv.URL + `/custom-token"}`))
+		case "/custom-token":
+			_, _ = w.Write([]byte(`{"access_token":"at-discovered","refresh_token":"rt-discovered","id_token":"it-discovered","expires_in":3600}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	got, err := oidcclient.Refresh(ctx, srv.URL, "client-x", "old-rt")
+	if err != nil {
+		t.Fatalf("Refresh: %v (expected success via discovered /custom-token)", err)
+	}
+	if got.AccessToken != "at-discovered" {
+		t.Errorf("tokens not propagated: %+v", got)
+	}
+}
+
 // TestEnsureFreshTokens_KeepsRefreshTokenWhenServerOmits guards the
 // "rotation disabled" path: when /token doesn't echo refresh_token,
 // EnsureFreshTokens must retain the previously-cached value.

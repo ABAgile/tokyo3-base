@@ -13,7 +13,6 @@ import (
 	"net/url"
 	"os/exec"
 	"runtime"
-	"strings"
 	"time"
 )
 
@@ -79,7 +78,12 @@ func RunCodeFlow(ctx context.Context, issuer, clientID string, port int, stderr 
 		_ = srv.Shutdown(shutCtx)
 	}()
 
-	authURL := BuildAuthorizeURL(issuer, clientID, redirectURI, state, challenge)
+	// Discover the real /authorize + /token endpoints when the issuer
+	// exposes a discovery document; falls back to the tokyo3-auth path
+	// convention (the exact pre-discovery behavior) otherwise.
+	ep := discoverEndpoints(ctx, issuer)
+
+	authURL := buildAuthorizeURLAt(ep.AuthorizationEndpoint, clientID, redirectURI, state, challenge)
 	if stderr != nil {
 		fmt.Fprintln(stderr, "Opening browser for OIDC login. If it doesn't open, paste this URL:")
 		fmt.Fprintln(stderr, "  ", authURL)
@@ -96,13 +100,20 @@ func RunCodeFlow(ctx context.Context, issuer, clientID string, port int, stderr 
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-	return exchangeCode(ctx, issuer, clientID, redirectURI, code, verifier)
+	return exchangeCodeAt(ctx, ep.TokenEndpoint, clientID, redirectURI, code, verifier)
 }
 
-// BuildAuthorizeURL constructs the /authorize URL for the code flow.
-// Exported so a caller (or test) can verify the exact wire shape
-// without doing IO.
+// BuildAuthorizeURL constructs the /authorize URL for the code flow
+// using the tokyo3-auth path convention ({issuer}/authorize). Exported
+// so a caller (or test) can verify the exact wire shape without doing
+// IO. RunCodeFlow itself uses the issuer's discovered authorization
+// endpoint when available (see discoverEndpoints) and only falls back
+// to this convention when discovery is unavailable.
 func BuildAuthorizeURL(issuer, clientID, redirectURI, state, challenge string) string {
+	return buildAuthorizeURLAt(conventionEndpoints(issuer).AuthorizationEndpoint, clientID, redirectURI, state, challenge)
+}
+
+func buildAuthorizeURLAt(authEndpoint, clientID, redirectURI, state, challenge string) string {
 	q := url.Values{}
 	q.Set("response_type", "code")
 	q.Set("client_id", clientID)
@@ -111,17 +122,17 @@ func BuildAuthorizeURL(issuer, clientID, redirectURI, state, challenge string) s
 	q.Set("state", state)
 	q.Set("code_challenge", challenge)
 	q.Set("code_challenge_method", "S256")
-	return strings.TrimRight(issuer, "/") + "/authorize?" + q.Encode()
+	return authEndpoint + "?" + q.Encode()
 }
 
-func exchangeCode(ctx context.Context, issuer, clientID, redirectURI, code, verifier string) (*Tokens, error) {
+func exchangeCodeAt(ctx context.Context, tokenEndpoint, clientID, redirectURI, code, verifier string) (*Tokens, error) {
 	form := url.Values{}
 	form.Set("grant_type", "authorization_code")
 	form.Set("client_id", clientID)
 	form.Set("code", code)
 	form.Set("redirect_uri", redirectURI)
 	form.Set("code_verifier", verifier)
-	return PostToken(ctx, issuer, form)
+	return PostTokenAt(ctx, tokenEndpoint, form)
 }
 
 // openBrowser is a package-level function variable so tests can swap

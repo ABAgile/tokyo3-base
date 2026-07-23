@@ -321,3 +321,48 @@ func TestLogin_RejectsEmptyConfig(t *testing.T) {
 		}
 	}
 }
+
+// TestRunDeviceFlow_UsesDiscoveredEndpoints proves both the
+// device_authorization POST and the polling POST go to the issuer's
+// discovered endpoints rather than the hardcoded
+// {issuer}/device_authorization + {issuer}/token convention: the
+// server only serves /custom-device-authz and /custom-token (plus
+// the discovery document pointing at them), so the flow can only
+// succeed if the discovered endpoints were actually used.
+func TestRunDeviceFlow_UsesDiscoveredEndpoints(t *testing.T) {
+	oidcclient.UseInstantDeviceSleeper(t)
+	var polls atomic.Int32
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/.well-known/openid-configuration":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"device_authorization_endpoint":"` + srv.URL + `/custom-device-authz","token_endpoint":"` + srv.URL + `/custom-token"}`))
+		case "/custom-device-authz":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"device_code": "dc-discovered", "user_code": "WXYZ",
+				"verification_uri": srv.URL + "/device", "expires_in": 60, "interval": 1,
+			})
+		case "/custom-token":
+			if polls.Add(1) == 1 {
+				writeTokenError(w, "authorization_pending", "still waiting")
+				return
+			}
+			writeTokenSuccess(w)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	tok, err := oidcclient.RunDeviceFlow(ctx, srv.URL, "cli-client", io.Discard)
+	if err != nil {
+		t.Fatalf("RunDeviceFlow: %v (expected success via discovered endpoints)", err)
+	}
+	if tok.AccessToken != "at-final" {
+		t.Errorf("tokens not propagated: %+v", tok)
+	}
+}

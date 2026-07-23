@@ -254,18 +254,24 @@ func Refresh(ctx context.Context, issuer, clientID, refreshToken string) (*Token
 	form.Set("grant_type", "refresh_token")
 	form.Set("client_id", clientID)
 	form.Set("refresh_token", refreshToken)
-	return PostToken(ctx, issuer, form)
+	// Discover the real token endpoint when the issuer exposes a
+	// discovery document; falls back to the tokyo3-auth path convention
+	// otherwise.
+	return PostTokenAt(ctx, discoverEndpoints(ctx, issuer).TokenEndpoint, form)
 }
 
 // PostToken POSTs to {issuer}/token and decodes the standard OAuth2
 // response into a Tokens. expires_in is normalized into an absolute
 // Expiration here so callers don't have to track the relative-vs-
-// absolute time semantics. Exported because the device flow uses it
-// for the polling exchange.
+// absolute time semantics.
 //
-// PostToken assumes the {issuer}/token convention; use [PostTokenAt] when
-// the token endpoint URL is already known (e.g. resolved via OIDC
-// discovery) and may not follow that convention.
+// PostToken assumes the {issuer}/token convention; every flow in this
+// package (RunCodeFlow, RunDeviceFlow, Refresh) instead resolves the
+// token endpoint via [discoverEndpoints] and calls [PostTokenAt]
+// directly, falling back to this same convention only when discovery is
+// unavailable. PostToken remains exported for external callers who
+// already know their issuer follows the convention and want the
+// exchange without a discovery round-trip.
 func PostToken(ctx context.Context, issuer string, form url.Values) (*Tokens, error) {
 	return PostTokenAt(ctx, strings.TrimRight(issuer, "/")+"/token", form)
 }

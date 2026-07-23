@@ -28,8 +28,12 @@ var deviceSleeper = func(d time.Duration) <-chan time.Time { return time.After(d
 // remote shells, container builds). The OAuth client must have
 // allow_device_grant enabled at the issuer's admin surface.
 func RunDeviceFlow(ctx context.Context, issuer, clientID string, stderr io.Writer) (*Tokens, error) {
-	authzURL := strings.TrimRight(issuer, "/") + "/device_authorization"
-	tokenURL := strings.TrimRight(issuer, "/") + "/token"
+	// Discover the real device_authorization + token endpoints when the
+	// issuer exposes a discovery document; falls back to the tokyo3-auth
+	// path convention otherwise.
+	ep := discoverEndpoints(ctx, issuer)
+	authzURL := ep.DeviceAuthorizationEndpoint
+	tokenURL := ep.TokenEndpoint
 
 	form := url.Values{}
 	form.Set("client_id", clientID)

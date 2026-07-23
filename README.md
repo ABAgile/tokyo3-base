@@ -506,6 +506,14 @@ redirect URI is built from the listener's actual port; the auth
 server must implement RFC 8252 §7.3 loopback-aware matching so a
 single `http://127.0.0.1/callback` registration accepts any port.
 
+The authorize/token/device_authorization endpoints are resolved from
+the issuer's `{issuer}/.well-known/openid-configuration` document
+when present, so any standards-compliant IdP works regardless of its
+exact endpoint paths — not just ones matching tokyo3-auth's
+`{issuer}/authorize` + `{issuer}/token` + `{issuer}/device_authorization`
+convention. A missing, unreachable, or malformed discovery document
+falls back to that convention rather than failing the login.
+
 ### Token cache — `LoadConfig`, `LoadTokens`, `EnsureFreshTokens`, `Refresh`
 
 ```go

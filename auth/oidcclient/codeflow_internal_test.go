@@ -228,3 +228,63 @@ func TestRunCodeFlow_ListenFailure(t *testing.T) {
 		t.Errorf("error %q does not name the listen failure source", err.Error())
 	}
 }
+
+// TestRunCodeFlow_UsesDiscoveredTokenEndpoint proves the code exchange
+// POSTs to the token endpoint the issuer's discovery document
+// advertises rather than the hardcoded {issuer}/token convention: the
+// server only serves /custom-token (and the discovery document
+// pointing at it), so the flow can only succeed if the discovered
+// endpoint was actually used.
+func TestRunCodeFlow_UsesDiscoveredTokenEndpoint(t *testing.T) {
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/.well-known/openid-configuration":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"authorization_endpoint":"` + srv.URL + `/custom-authorize","token_endpoint":"` + srv.URL + `/custom-token"}`))
+		case "/custom-token":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"at-discovered","refresh_token":"rt-discovered","id_token":"it-discovered","expires_in":3600}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	openBrowserMu.Lock()
+	original := openBrowser
+	openBrowser = func(rawURL string) error {
+		u, err := url.Parse(rawURL)
+		if err != nil {
+			t.Errorf("parse authURL: %v", err)
+			return nil
+		}
+		if !strings.HasPrefix(rawURL, srv.URL+"/custom-authorize?") {
+			t.Errorf("authURL = %q, want prefix %s/custom-authorize?", rawURL, srv.URL)
+		}
+		q := u.Query()
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			cb := q.Get("redirect_uri") + "?code=discovered-code&state=" + url.QueryEscape(q.Get("state"))
+			resp, err := http.Get(cb)
+			if err == nil {
+				resp.Body.Close()
+			}
+		}()
+		return nil
+	}
+	defer func() {
+		openBrowser = original
+		openBrowserMu.Unlock()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	tok, err := RunCodeFlow(ctx, srv.URL, "cli-client", 0, io.Discard)
+	if err != nil {
+		t.Fatalf("RunCodeFlow: %v (expected success via discovered /custom-token)", err)
+	}
+	if tok.AccessToken != "at-discovered" {
+		t.Errorf("tokens not propagated: %+v", tok)
+	}
+}
