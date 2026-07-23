@@ -1750,33 +1750,71 @@ if err != nil { /* 401 */ }
 allowed := slices.Contains(claims.Groups, "admins")
 ```
 
-### Authenticator — browser OIDC login flow over a session.Manager
+### Authenticator — browser OIDC login flow over a pluggable session issuer
 
 ```go
 type AuthenticatorConfig struct {
     Issuer, ClientID, ClientSecret, RedirectURL string
-    Verifier     TokenVerifier // validates the returned ID token (audience = ClientID)
-    Scopes       string        // "" ⇒ "openid email profile groups"
-    CallbackPath string        // must be exempt on the injected Manager; "" ⇒ /auth/callback
+    Verifier     TokenVerifier      // validates the returned ID token (audience = ClientID)
+    Scopes       string             // "" ⇒ "openid email profile groups"
+    CallbackPath string             // must be exempt on the injected issuer's gate; "" ⇒ /auth/callback
+    FlowCookie   sealedcookie.Cookie // required; carries state/nonce/PKCE/return_to/extra across the redirect
     // optional login-time enrichment of the session (Extra, Expiry) from
-    // the verified claims; a returned error aborts the login (fail closed):
+    // the verified claims, used only on the DefaultCompleter path; a
+    // returned error aborts the login (fail closed):
     EnrichSession func(ctx context.Context, claims *Claims, sess *session.Session) error
 }
 
-func NewAuthenticator(cfg AuthenticatorConfig, sess *session.Manager) (*Authenticator, error)
+// SessionIssuer is the minimal contract every Authenticator caller supplies;
+// *session.Manager satisfies it verbatim. It must additionally implement
+// DefaultCompleter or CompletionOverride (or both) so a verified login has a
+// way to actually complete.
+type SessionIssuer interface {
+    SafeReturnTo(path string) string
+    IsExempt(path string) bool
+    Log() *slog.Logger
+}
+
+// DefaultCompleter is the "mint a session, persist it, redirect to
+// ReturnTo" completion path; *session.Manager satisfies it verbatim via
+// NewSession/IssueSession.
+type DefaultCompleter interface {
+    NewSession() (session.Session, error)
+    IssueSession(w http.ResponseWriter, r *http.Request, sess session.Session) error
+}
+
+// CompletionOverride lets a SessionIssuer take full control of the HTTP
+// response for a verified login instead of DefaultCompleter's default —
+// for callers that must serve more than one completion shape (JSON, a
+// redirect carrying a credential, a cookie + redirect, …) from one
+// callback endpoint. Takes precedence over DefaultCompleter when a
+// SessionIssuer implements both.
+type CompletedFlow struct{ ReturnTo, Extra string }
+type CompletionOverride interface {
+    CompleteLogin(w http.ResponseWriter, r *http.Request, claims *Claims, flow CompletedFlow) error
+}
+
+func NewAuthenticator(cfg AuthenticatorConfig, sess SessionIssuer) (*Authenticator, error)
 func (a *Authenticator) LoginHandler() http.HandlerFunc
+func (a *Authenticator) Begin(w http.ResponseWriter, r *http.Request, extra string) (authURL string, err error)
 func (a *Authenticator) CallbackHandler() http.HandlerFunc
 ```
 
 Native browser-based OIDC login for an admin portal — the Authorization-Code +
-PKCE flow, and nothing else: `LoginHandler` mints state/nonce/PKCE (sealed
-into a short-lived flow cookie via the Manager's `SiblingCookie`) and
-redirects to the IdP; `CallbackHandler` validates state, exchanges the code
-(via `auth/oidcclient`), verifies the ID token + nonce with the
-`TokenVerifier`, and mints the session on the injected
-[`session.Manager`](#session--sealed-browser-session-gate-csrf). The session
-cookie, access gate, group check, CSRF tokens, and logout all belong to that
-Manager — Authenticator does not wrap or re-expose it.
+PKCE flow, and nothing else: `LoginHandler` (a thin wrapper over `Begin` with
+an empty `extra`) mints state/nonce/PKCE, seals them into `FlowCookie`
+alongside a sanitised `return_to` and `extra`, and redirects to the IdP;
+`CallbackHandler` validates state, exchanges the code (via `auth/oidcclient`,
+against the token endpoint resolved from the `Verifier`'s OIDC discovery when
+it exposes one — falling back to `{issuer}/token` otherwise), verifies the ID
+token + nonce, then completes the login via the injected `SessionIssuer`'s
+`CompletionOverride` (full response control) if implemented, else its
+`DefaultCompleter` (mint a session, redirect to `ReturnTo`). Use `Begin`
+directly instead of `LoginHandler` when a caller needs to supply `extra` or
+control the response itself (e.g. a CLI-loopback flow returning the authorize
+URL as JSON). For a [`session.Manager`](#session--sealed-browser-session-gate-csrf)-backed
+issuer, the session cookie, access gate, group check, CSRF tokens, and logout
+all belong to that Manager — Authenticator does not wrap or re-expose it.
 
 Pair it with [`httpauth.BasicAuth`](#httpauth--http-auth-middleware): a portal
 runs OIDC login when configured, else falls back to the Basic gate.
@@ -1792,8 +1830,9 @@ sess, _ := session.New(session.Config{
 auth, _ := oidc.NewAuthenticator(oidc.AuthenticatorConfig{
     Issuer: issuer, ClientID: clientID, ClientSecret: secret,
     RedirectURL: "https://certd.example.com/portal/auth/callback",
-    Verifier:    verifier,           // an oidc.TokenVerifier (audience = clientID)
-}, sess)
+    Verifier:    verifier,               // an oidc.TokenVerifier (audience = clientID)
+    FlowCookie:  sess.SiblingCookie("flow"), // shares sess's key, path, and clock
+}, sess) // *session.Manager satisfies SessionIssuer + DefaultCompleter verbatim
 mux.Handle("GET /auth/login", auth.LoginHandler())
 mux.Handle("GET /auth/callback", auth.CallbackHandler())
 mux.Handle("POST /auth/logout", sess.LogoutHandler())
@@ -1806,6 +1845,13 @@ short-lived (10m) and the session honors the Manager's `SessionTTL`.
 `return_to` is confined to a local absolute path (the Manager's
 `SafeReturnTo`) so a crafted value can't bounce the browser to an attacker
 origin.
+
+A caller that isn't `session.Manager`-backed (e.g. a server-side token-table
+session with its own revocation and multi-mode completion — JSON for a plain
+API caller, a redirect carrying a credential for a CLI loopback flow, a
+cookie + redirect for a browser session) implements `SessionIssuer` +
+`CompletionOverride` directly instead, supplying its own `FlowCookie` (any
+key/name/path/clock — no dependency on `session.Manager` at all).
 
 [↑ Back to top](#packages)
 
