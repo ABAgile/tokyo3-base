@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -335,3 +336,175 @@ func TestCallback_NonceMismatch(t *testing.T) {
 		t.Fatalf("code=%d body=%q, want 400 nonce mismatch", rec.Code, rec.Body.String())
 	}
 }
+
+// ── CompletionOverride ────────────────────────────────────────────────────────
+
+// fakeOverrideIssuer is a minimal SessionIssuer + CompletionOverride
+// implementation exercising the full-response-control completion path —
+// mirroring how a token-table-backed caller (e.g. vault) would plug in
+// without any session.Manager cookie at all. Deliberately does NOT
+// implement DefaultCompleter, to prove CompletionOverride alone suffices.
+type fakeOverrideIssuer struct {
+	callbackPath string
+	completeErr  error
+
+	gotClaims *Claims
+	gotFlow   CompletedFlow
+	called    bool
+}
+
+func (f *fakeOverrideIssuer) SafeReturnTo(string) string { return "/fallback" }
+func (f *fakeOverrideIssuer) IsExempt(path string) bool  { return path == f.callbackPath }
+func (f *fakeOverrideIssuer) Log() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func (f *fakeOverrideIssuer) CompleteLogin(w http.ResponseWriter, r *http.Request, claims *Claims, flow CompletedFlow) error {
+	f.called = true
+	f.gotClaims = claims
+	f.gotFlow = flow
+	if f.completeErr != nil {
+		return f.completeErr
+	}
+	w.Header().Set("X-Fake-Extra", flow.Extra)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("completed"))
+	return nil
+}
+
+// bareSessionIssuer implements only [SessionIssuer] — neither
+// [DefaultCompleter] nor [CompletionOverride] — to exercise
+// [NewAuthenticator]'s construction-time requirement that at least one be
+// present.
+type bareSessionIssuer struct{ callbackPath string }
+
+func (b bareSessionIssuer) SafeReturnTo(string) string { return "/" }
+func (b bareSessionIssuer) IsExempt(path string) bool  { return path == b.callbackPath }
+func (b bareSessionIssuer) Log() *slog.Logger          { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+func TestNewAuthenticator_RequiresCompleterOrOverride(t *testing.T) {
+	sess := bareSessionIssuer{callbackPath: defaultCallbackPath}
+	cfg := AuthenticatorConfig{
+		Issuer: "i", ClientID: "c", RedirectURL: "r", Verifier: stubTok{},
+		FlowCookie: sealedcookie.Cookie{Key: testKey, Name: "test_flow", Path: "/"},
+	}
+	if _, err := NewAuthenticator(cfg, sess); err == nil {
+		t.Error("want error when the session issuer implements neither DefaultCompleter nor CompletionOverride")
+	}
+}
+
+func TestCompletionOverride_TakesPrecedenceAndCarriesExtra(t *testing.T) {
+	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "at", "id_token": "it"})
+	}))
+	defer tokenSrv.Close()
+
+	stub := stubTok{}
+	issuer := &fakeOverrideIssuer{callbackPath: defaultCallbackPath}
+	cfg := AuthenticatorConfig{
+		Issuer: tokenSrv.URL, ClientID: "c", RedirectURL: "r", Verifier: stub,
+		FlowCookie: sealedcookie.Cookie{Key: testKey, Name: "test_flow", Path: "/"},
+	}
+	a, err := NewAuthenticator(cfg, issuer)
+	if err != nil {
+		t.Fatalf("NewAuthenticator: %v", err)
+	}
+
+	// Begin with a non-empty Extra (e.g. vault's cli_callback), matching
+	// how a CLI-loopback-flow caller would invoke it directly instead of
+	// LoginHandler (which always passes "").
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/auth/login", nil)
+	authURL, err := a.Begin(w, req, "cli-loopback-token")
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	if authURL == "" {
+		t.Fatal("Begin returned empty authURL")
+	}
+	var fc *http.Cookie
+	for _, c := range w.Result().Cookies() {
+		if c.Name == a.flow.Name {
+			fc = c
+		}
+	}
+	if fc == nil {
+		t.Fatal("Begin set no flow cookie")
+	}
+	var flow oidcFlow
+	if err := sealedcookie.Open(a.flow.Key, fc.Value, &flow); err != nil {
+		t.Fatalf("open flow cookie: %v", err)
+	}
+
+	stub.claims = &Claims{Subject: "u-1", Email: "cli@x", Nonce: flow.Nonce}
+	a.cfg.Verifier = stub
+
+	r := httptest.NewRequest(http.MethodGet, "/auth/callback?state="+url.QueryEscape(flow.State)+"&code=abc", nil)
+	r.AddCookie(fc)
+	rec := httptest.NewRecorder()
+	a.CallbackHandler()(rec, r)
+
+	if !issuer.called {
+		t.Fatal("CompleteLogin was not called — DefaultCompleter path ran instead")
+	}
+	if rec.Code != http.StatusOK || rec.Body.String() != "completed" {
+		t.Fatalf("callback code=%d body=%q, want 200 completed (from CompleteLogin, not a redirect)", rec.Code, rec.Body.String())
+	}
+	if issuer.gotFlow.Extra != "cli-loopback-token" {
+		t.Errorf("CompletedFlow.Extra = %q, want %q", issuer.gotFlow.Extra, "cli-loopback-token")
+	}
+	if issuer.gotClaims.Email != "cli@x" {
+		t.Errorf("CompleteLogin claims.Email = %q, want cli@x", issuer.gotClaims.Email)
+	}
+}
+
+func TestCompletionOverride_ErrorRenders500(t *testing.T) {
+	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "at", "id_token": "it"})
+	}))
+	defer tokenSrv.Close()
+
+	stub := stubTok{}
+	issuer := &fakeOverrideIssuer{callbackPath: defaultCallbackPath, completeErr: errBoom}
+	cfg := AuthenticatorConfig{
+		Issuer: tokenSrv.URL, ClientID: "c", RedirectURL: "r", Verifier: stub,
+		FlowCookie: sealedcookie.Cookie{Key: testKey, Name: "test_flow", Path: "/"},
+	}
+	a, err := NewAuthenticator(cfg, issuer)
+	if err != nil {
+		t.Fatalf("NewAuthenticator: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/auth/login", nil)
+	authURL, err := a.Begin(w, req, "")
+	if err != nil || authURL == "" {
+		t.Fatalf("Begin: authURL=%q err=%v", authURL, err)
+	}
+	var fc *http.Cookie
+	for _, c := range w.Result().Cookies() {
+		if c.Name == a.flow.Name {
+			fc = c
+		}
+	}
+	var flow oidcFlow
+	if err := sealedcookie.Open(a.flow.Key, fc.Value, &flow); err != nil {
+		t.Fatalf("open flow cookie: %v", err)
+	}
+	stub.claims = &Claims{Subject: "u-1", Nonce: flow.Nonce}
+	a.cfg.Verifier = stub
+
+	r := httptest.NewRequest(http.MethodGet, "/auth/callback?state="+url.QueryEscape(flow.State)+"&code=abc", nil)
+	r.AddCookie(fc)
+	rec := httptest.NewRecorder()
+	a.CallbackHandler()(rec, r)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("callback code = %d, want 500", rec.Code)
+	}
+	if !issuer.called {
+		t.Fatal("CompleteLogin was not called")
+	}
+}
+
+var errBoom = errors.New("boom")
