@@ -47,6 +47,19 @@ type AuthenticatorConfig struct {
 	// complete. "" ⇒ /auth/callback.
 	CallbackPath string
 
+	// FlowCookie is the sealed cookie [Authenticator] uses to carry
+	// per-login CSRF/PKCE state (state/nonce/PKCE verifier/return_to)
+	// across the redirect round-trip, before any session exists. It is
+	// independent of however the caller ultimately persists the
+	// authenticated session (a sealed cookie via [session.Manager], a
+	// server-side token-table row, or anything else) — required so
+	// [NewAuthenticator] fails fast rather than defaulting to an
+	// unconfigured cookie. A caller using [session.Manager] for its
+	// session typically passes sess.SiblingCookie("flow") here, so the
+	// flow cookie shares that Manager's key, path scope, and clock under
+	// its own name.
+	FlowCookie sealedcookie.Cookie
+
 	// EnrichSession, if set, is called by the callback handler after the
 	// ID token verifies and the base [session.Session] is built (via
 	// session.Manager.NewSession), before it is sealed into the cookie.
@@ -69,19 +82,16 @@ type Authenticator struct {
 	cfg  AuthenticatorConfig
 	sess *session.Manager
 	// flow is the login-flow cookie (state/nonce/PKCE verifier/return_to)
-	// — a distinct, short-lived payload built via [session.Manager.SiblingCookie],
-	// so it shares the session cookie's key, path scope, and clock, under
-	// its own name and TTL. It does not go through session.Manager, which
-	// only knows about [session.Session].
+	// — a distinct, short-lived payload carrying per-login CSRF/PKCE state
+	// across the redirect round-trip, before any session exists. Set from
+	// [AuthenticatorConfig.FlowCookie] at construction; independent of
+	// however the caller later persists the session.
 	flow sealedcookie.Cookie
 }
 
 // NewAuthenticator validates cfg, verifies sess exempts CallbackPath from
 // its gate, and returns an Authenticator. Issuer, ClientID, RedirectURL,
-// Verifier, and sess are required. The flow cookie's key, path, and clock,
-// and all logging, are derived from sess — see [session.Manager.SiblingCookie]
-// and [session.Manager.Log] — so this config carries no session/cookie
-// mechanics of its own to keep in sync with the injected Manager's.
+// Verifier, FlowCookie, and sess are required.
 func NewAuthenticator(cfg AuthenticatorConfig, sess *session.Manager) (*Authenticator, error) {
 	switch {
 	case cfg.Issuer == "":
@@ -92,6 +102,8 @@ func NewAuthenticator(cfg AuthenticatorConfig, sess *session.Manager) (*Authenti
 		return nil, errors.New("oidc: redirect url is required")
 	case cfg.Verifier == nil:
 		return nil, errors.New("oidc: verifier is required")
+	case len(cfg.FlowCookie.Key) == 0:
+		return nil, errors.New("oidc: flow cookie is required")
 	case sess == nil:
 		return nil, errors.New("oidc: session manager is required")
 	}
@@ -107,7 +119,7 @@ func NewAuthenticator(cfg AuthenticatorConfig, sess *session.Manager) (*Authenti
 	return &Authenticator{
 		cfg:  cfg,
 		sess: sess,
-		flow: sess.SiblingCookie("flow"),
+		flow: cfg.FlowCookie,
 	}, nil
 }
 

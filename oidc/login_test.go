@@ -58,7 +58,8 @@ func testAuthWith(t *testing.T, ver TokenVerifier, mut func(*AuthenticatorConfig
 	t.Helper()
 	cfg := AuthenticatorConfig{
 		Issuer: "https://idp.example.com", ClientID: "portal", RedirectURL: "https://app/auth/callback",
-		Verifier: ver,
+		Verifier:   ver,
+		FlowCookie: sess.SiblingCookie("flow"),
 	}
 	if mut != nil {
 		mut(&cfg)
@@ -86,7 +87,10 @@ func otherCookie(cookies []*http.Cookie, exclude string) *http.Cookie {
 
 func TestNewAuthenticator_Validation(t *testing.T) {
 	validSess := testSessionManager(t, nil)
-	base := AuthenticatorConfig{Issuer: "i", ClientID: "c", RedirectURL: "r", Verifier: stubTok{}}
+	base := AuthenticatorConfig{
+		Issuer: "i", ClientID: "c", RedirectURL: "r", Verifier: stubTok{},
+		FlowCookie: validSess.SiblingCookie("flow"),
+	}
 	for _, tc := range []struct {
 		name string
 		mut  func(*AuthenticatorConfig)
@@ -96,6 +100,7 @@ func TestNewAuthenticator_Validation(t *testing.T) {
 		{"clientid", func(c *AuthenticatorConfig) { c.ClientID = "" }, validSess},
 		{"redirect", func(c *AuthenticatorConfig) { c.RedirectURL = "" }, validSess},
 		{"verifier", func(c *AuthenticatorConfig) { c.Verifier = nil }, validSess},
+		{"flow cookie", func(c *AuthenticatorConfig) { c.FlowCookie = sealedcookie.Cookie{} }, validSess},
 		{"nil session manager", func(*AuthenticatorConfig) {}, nil},
 	} {
 		cfg := base
@@ -112,7 +117,10 @@ func TestNewAuthenticator_Validation(t *testing.T) {
 // could ever complete.
 func TestNewAuthenticator_RequiresCallbackPathExempt(t *testing.T) {
 	sess := testSessionManager(t, func(c *session.Config) { c.ExemptPaths = nil }) // no /auth/callback exemption
-	cfg := AuthenticatorConfig{Issuer: "i", ClientID: "c", RedirectURL: "r", Verifier: stubTok{}}
+	cfg := AuthenticatorConfig{
+		Issuer: "i", ClientID: "c", RedirectURL: "r", Verifier: stubTok{},
+		FlowCookie: sess.SiblingCookie("flow"),
+	}
 	if _, err := NewAuthenticator(cfg, sess); err == nil {
 		t.Error("want error when the session.Manager doesn't exempt CallbackPath")
 	}
