@@ -149,9 +149,10 @@ func (a App) AdminDB() DB {
 // cancelled on SIGINT/SIGTERM (or when the parent cancels), the resolved
 // NATS / Postgres material, and a Shutdown to defer.
 type Runtime struct {
-	Log  *slog.Logger
-	Ctx  context.Context
-	NATS NATS
+	Log      *slog.Logger
+	LogLevel *slog.LevelVar
+	Ctx      context.Context
+	NATS     NATS
 	// DB and AdminDB carry the resolved Postgres material (see [App.DB] and
 	// [App.AdminDB]). AdminDB mirrors DB unless the ADMIN_* vars are set.
 	DB      DB
@@ -176,7 +177,7 @@ type Runtime struct {
 // logger.
 func (a App) Setup(parent context.Context) Runtime {
 	n := a.NATS()
-	log, _, drainLog := applog.AppLoggerWithNATS(
+	log, logLevel, drainLog := applog.AppLoggerWithNATS(
 		applog.Config{App: a.Name, Instance: a.Instance},
 		applog.NATSConfig{
 			URL:      n.URL,
@@ -193,6 +194,7 @@ func (a App) Setup(parent context.Context) Runtime {
 
 	return Runtime{
 		Log:       log,
+		LogLevel:  logLevel,
 		Ctx:       ctx,
 		NATS:      n,
 		DB:        a.DB(),

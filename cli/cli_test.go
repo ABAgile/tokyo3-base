@@ -16,6 +16,9 @@ func TestSetup(t *testing.T) {
 	if rt.Log == nil {
 		t.Fatal("Setup returned nil Log")
 	}
+	if rt.LogLevel == nil {
+		t.Fatal("Setup returned nil LogLevel")
+	}
 	if rt.Ctx == nil {
 		t.Fatal("Setup returned nil Ctx")
 	}

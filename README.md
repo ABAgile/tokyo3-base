@@ -735,7 +735,9 @@ opt-in diagnostics server — depending on `applog`, `debug`, and `envutil`
 but **not** a command framework. Each binary keeps its own cobra (or
 other) command tree and calls `Setup` from inside its serve command.
 `Setup` is additive: a daemon with non-standard env keys can skip it and
-wire the pieces directly.
+wire the pieces directly. The returned `Runtime.LogLevel` is the same
+concurrency-safe level variable used by the logger, so a daemon can expose a
+validated log-level setting without rebuilding its logger.
 
 ```go
 func runServe(ctx context.Context) error {
@@ -749,6 +751,7 @@ func runServe(ctx context.Context) error {
 ```go
 type Runtime struct {
     Log       *slog.Logger
+    LogLevel  *slog.LevelVar  // runtime minimum log level; defaults to Info
     Ctx       context.Context // cancelled on signal or parent cancel
     NATS      NATS            // resolved NATS material (WORKLOAD_* fallback)
     DB        DB              // resolved runtime Postgres material (no WORKLOAD fallback)
