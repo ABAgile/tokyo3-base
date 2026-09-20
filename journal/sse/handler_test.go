@@ -3,6 +3,7 @@ package sse_test
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -115,6 +116,9 @@ func readEvents(t *testing.T, r io.Reader, n int) (events []sseEvent, pings int)
 				}
 			}
 		}
+	}
+	if err := scanner.Err(); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("scan SSE events: %v", err)
 	}
 	return
 }

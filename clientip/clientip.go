@@ -19,6 +19,7 @@ package clientip
 import (
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 )
 
@@ -51,8 +52,8 @@ func (e *Extractor) FromRequest(r *http.Request) string {
 		return peer
 	}
 	parts := strings.Split(xff, ",")
-	for i := len(parts) - 1; i >= 0; i-- {
-		ip := strings.TrimSpace(parts[i])
+	for _, part := range slices.Backward(parts) {
+		ip := strings.TrimSpace(part)
 		if ip != "" && !e.isTrusted(ip) {
 			return ip
 		}

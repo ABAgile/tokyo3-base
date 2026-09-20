@@ -47,15 +47,13 @@ func (s *Signer) MintLogoutToken(audience, sub, sid, jti string, now time.Time) 
 		jti = uuid.NewString()
 	}
 	claims := LogoutClaims{
-		RegisteredClaims: gojwt.RegisteredClaims{
-			Issuer:    s.issuer,
-			Subject:   sub,
-			Audience:  gojwt.ClaimStrings{audience},
-			IssuedAt:  gojwt.NewNumericDate(now),
-			ExpiresAt: gojwt.NewNumericDate(now.Add(logoutTokenTTL)),
-			ID:        jti,
-		},
-		SID: sid,
+		Issuer:    s.issuer,
+		Subject:   sub,
+		Audience:  gojwt.ClaimStrings{audience},
+		IssuedAt:  gojwt.NewNumericDate(now),
+		ExpiresAt: gojwt.NewNumericDate(now.Add(logoutTokenTTL)),
+		ID:        jti,
+		SID:       sid,
 		Events: map[string]map[string]any{
 			backchannelLogoutEventURI: {},
 		},

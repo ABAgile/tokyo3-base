@@ -156,15 +156,13 @@ func (s *Signer) MintFederationToken(userID, audience, email, name string, group
 		lifetime = s.cfg.FederationTokenTTL
 	}
 	claims := FederationClaims{
-		RegisteredClaims: gojwt.RegisteredClaims{
-			Issuer:    s.issuer,
-			Subject:   userID,
-			Audience:  gojwt.ClaimStrings{audience},
-			ExpiresAt: gojwt.NewNumericDate(now.Add(lifetime)),
-			IssuedAt:  gojwt.NewNumericDate(now),
-			NotBefore: gojwt.NewNumericDate(now),
-			ID:        uuid.NewString(),
-		},
+		Issuer:            s.issuer,
+		Subject:           userID,
+		Audience:          gojwt.ClaimStrings{audience},
+		ExpiresAt:         gojwt.NewNumericDate(now.Add(lifetime)),
+		IssuedAt:          gojwt.NewNumericDate(now),
+		NotBefore:         gojwt.NewNumericDate(now),
+		ID:                uuid.NewString(),
 		Email:             email,
 		Name:              name,
 		PreferredUsername: email,
@@ -208,14 +206,12 @@ func (s *Signer) MintIDToken(userID, clientID, email, name, nonce string, scopes
 		acr = s.cfg.ACRMFA
 	}
 	claims := IDClaims{
-		RegisteredClaims: gojwt.RegisteredClaims{
-			Issuer:    s.issuer,
-			Subject:   userID,
-			Audience:  gojwt.ClaimStrings{clientID},
-			ExpiresAt: gojwt.NewNumericDate(now.Add(s.cfg.IDTokenTTL)),
-			IssuedAt:  gojwt.NewNumericDate(now),
-			ID:        uuid.NewString(),
-		},
+		Issuer:            s.issuer,
+		Subject:           userID,
+		Audience:          gojwt.ClaimStrings{clientID},
+		ExpiresAt:         gojwt.NewNumericDate(now.Add(s.cfg.IDTokenTTL)),
+		IssuedAt:          gojwt.NewNumericDate(now),
+		ID:                uuid.NewString(),
 		Nonce:             nonce,
 		AuthTime:          authTime.Unix(),
 		ACR:               acr,
