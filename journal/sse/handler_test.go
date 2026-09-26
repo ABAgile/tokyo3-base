@@ -85,8 +85,9 @@ func (f *fakeSource) Close() error { return nil }
 // sseEvent is one parsed event off the wire. Comment-only lines (heartbeats)
 // are reported separately via readEvents' pings counter.
 type sseEvent struct {
-	id   uint64
-	data string
+	id      uint64
+	data    string
+	hasData bool
 }
 
 // readEvents reads from r until n full events have been seen or r returns
@@ -106,9 +107,13 @@ func readEvents(t *testing.T, r io.Reader, n int) (events []sseEvent, pings int)
 		case strings.HasPrefix(line, "id: "):
 			cur.id, _ = strconv.ParseUint(strings.TrimPrefix(line, "id: "), 10, 64)
 		case strings.HasPrefix(line, "data: "):
-			cur.data = strings.TrimPrefix(line, "data: ")
+			if cur.hasData {
+				cur.data += "\n"
+			}
+			cur.data += strings.TrimPrefix(line, "data: ")
+			cur.hasData = true
 		case line == "":
-			if cur.id != 0 || cur.data != "" {
+			if cur.id != 0 || cur.hasData {
 				events = append(events, cur)
 				cur = sseEvent{}
 				if len(events) >= n {
@@ -166,6 +171,36 @@ func TestHandler_ReplayWindow(t *testing.T) {
 	}
 	if src.gotReplay != 100 || src.gotStartSeq != 0 {
 		t.Errorf("subscribe args: replay=%d startSeq=%d, want 100,0", src.gotReplay, src.gotStartSeq)
+	}
+}
+
+func TestHandler_MultilineDataIsFramed(t *testing.T) {
+	src := newFakeSource()
+	src.history = []journal.Msg{{
+		Seq:  7,
+		Data: []byte("first\nid: 999\ndata: injected\r\nlast\r"),
+	}}
+	srv := httptest.NewServer(sse.Handler{Source: src, Replay: 1, Heartbeat: 0})
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+
+	events, _ := readEvents(t, resp.Body, 1)
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+	if events[0].id != 7 {
+		t.Errorf("event id = %d, want 7", events[0].id)
+	}
+	if want := "first\nid: 999\ndata: injected\nlast\n"; events[0].data != want {
+		t.Errorf("event data = %q, want %q", events[0].data, want)
 	}
 }
 

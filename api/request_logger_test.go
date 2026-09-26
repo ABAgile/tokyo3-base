@@ -30,9 +30,19 @@ func TestSanitizeHeaders(t *testing.T) {
 			expected: map[string][]string{"Cookie": {"***redacted***"}},
 		},
 		{
-			name:     "case insensitive redaction",
-			input:    map[string][]string{"AUTHORIZATION": {"secret"}, "COOKIE": {"val"}},
-			expected: map[string][]string{"AUTHORIZATION": {"***redacted***"}, "COOKIE": {"***redacted***"}},
+			name: "case insensitive redaction",
+			input: map[string][]string{
+				"AUTHORIZATION": {"secret"},
+				"COOKIE":        {"val"},
+				"SET-COOKIE":    {"session=secret"},
+				"X-API-KEY":     {"key-secret"},
+			},
+			expected: map[string][]string{
+				"AUTHORIZATION": {redactedLogValue},
+				"COOKIE":        {redactedLogValue},
+				"SET-COOKIE":    {redactedLogValue},
+				"X-API-KEY":     {redactedLogValue},
+			},
 		},
 		{
 			name:     "passes through safe headers unchanged",
@@ -144,12 +154,13 @@ func TestWithRequestLogger(t *testing.T) {
 	type payload struct{ Status string }
 
 	testCases := []struct {
-		name        string
-		method      string
-		path        string
-		ctxAttrs    map[string]string
-		reqOpts     []RestyRequestOption
-		logContains []string
+		name           string
+		method         string
+		path           string
+		ctxAttrs       map[string]string
+		reqOpts        []RestyRequestOption
+		logContains    []string
+		logNotContains []string
 	}{
 		{
 			name:        "logs outgoing request with method",
@@ -160,20 +171,24 @@ func TestWithRequestLogger(t *testing.T) {
 			logContains: []string{"INCOMING_RESPONSE", "GET", "200"},
 		},
 		{
-			name:        "context attrs appear in both log lines",
-			ctxAttrs:    map[string]string{"plan_no": "P123", "tref": "T456"},
-			logContains: []string{"plan_no: [P123]", "tref: [T456]"},
+			name:           "context attrs appear in both log lines and redact secrets",
+			ctxAttrs:       map[string]string{"plan_no": "P123", "tref": "T456", "access_token": "context-secret"},
+			logContains:    []string{"plan_no: [P123]", "tref: [T456]", redactedLogValue},
+			logNotContains: []string{"context-secret"},
 		},
 		{
-			name:        "logs request body",
-			method:      http.MethodPost,
-			reqOpts:     []RestyRequestOption{RO.WithBody(map[string]string{"bodymarker": "present"})},
-			logContains: []string{"bodymarker"},
+			name:           "omits request and response bodies",
+			method:         http.MethodPost,
+			reqOpts:        []RestyRequestOption{RO.WithBody(map[string]string{"client_secret": "request-secret"})},
+			logNotContains: []string{"request-secret", "response-secret"},
 		},
 		{
-			name:        "logs query params in URL",
-			reqOpts:     []RestyRequestOption{RO.WithQueryParam("page", "3")},
-			logContains: []string{"page=3"},
+			name: "logs ordinary query params and redacts credentials",
+			reqOpts: []RestyRequestOption{RO.WithQueryParams(map[string]string{
+				"page": "3", "key": "query-secret", "access_token": "token-secret", "aws_access_key_id": "aws-secret", "device_code": "device-secret",
+			})},
+			logContains:    []string{"page=3", redactedLogValue},
+			logNotContains: []string{"query-secret", "token-secret", "aws-secret", "device-secret"},
 		},
 		{
 			name:        "logs path params in URL",
@@ -181,13 +196,22 @@ func TestWithRequestLogger(t *testing.T) {
 			reqOpts:     []RestyRequestOption{RO.WithPathParam("id", "42")},
 			logContains: []string{"42"},
 		},
+		{
+			name:           "redacts credential path params",
+			path:           "/session/{access_token}",
+			reqOpts:        []RestyRequestOption{RO.WithPathParam("access_token", "path-secret")},
+			logNotContains: []string{"path-secret"},
+		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(payload{Status: "ok"})
+				w.Header().Set("Set-Cookie", "session=session-secret; HttpOnly")
+				json.NewEncoder(w).Encode(map[string]string{
+					"Status": "ok", "access_token": "response-secret",
+				})
 			}))
 			defer srv.Close()
 
@@ -213,6 +237,9 @@ func TestWithRequestLogger(t *testing.T) {
 
 			for _, s := range tc.logContains {
 				assert.Contains(t, buf.String(), s)
+			}
+			for _, s := range append(tc.logNotContains, "response-secret", "session-secret") {
+				assert.NotContains(t, buf.String(), s)
 			}
 		})
 	}

@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"path"
 	"slices"
 	"strings"
 	"time"
@@ -26,6 +27,7 @@ import (
 )
 
 const (
+	sessionKeySize    = 32
 	defaultSessionTTL = 8 * time.Hour
 	defaultLoginPath  = "/auth/login"
 	defaultLogoutPath = "/auth/logout"
@@ -173,6 +175,8 @@ func New(cfg Config) (*Manager, error) {
 	switch {
 	case len(cfg.SessionKey) == 0:
 		return nil, errors.New("session: session key is required")
+	case len(cfg.SessionKey) != sessionKeySize:
+		return nil, fmt.Errorf("session: session key must be %d bytes, got %d", sessionKeySize, len(cfg.SessionKey))
 	case cfg.CookiePrefix == "":
 		return nil, errors.New("session: cookie prefix is required")
 	}
@@ -405,10 +409,20 @@ func (m *Manager) CookiePath() string {
 // LoginHandler) to sanitise a return_to query parameter before sealing it
 // into its own flow state.
 func (m *Manager) SafeReturnTo(p string) string {
-	if strings.HasPrefix(p, "/") && !strings.HasPrefix(p, "//") {
-		return p
+	fallback := m.cfg.BasePath + "/"
+	if !strings.HasPrefix(p, "/") || strings.HasPrefix(p, "//") {
+		return fallback
 	}
-	return m.cfg.BasePath + "/"
+	u, err := url.Parse(p)
+	if err != nil || u.IsAbs() || u.Host != "" || strings.ContainsRune(u.Path, '\\') {
+		return fallback
+	}
+	basePath := path.Clean(m.cfg.BasePath)
+	returnPath := path.Clean(u.Path)
+	if basePath != "." && basePath != "/" && returnPath != basePath && !strings.HasPrefix(returnPath, basePath+"/") {
+		return fallback
+	}
+	return p
 }
 
 // maybeExtendIdle re-issues the session cookie with Expiry pushed out to

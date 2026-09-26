@@ -155,7 +155,7 @@ token, err = tm.GetToken(ctx)
 
 ### Request logging
 
-`CO.WithRequestLogger` attaches a `*slog.Logger` that emits one `OUTGOING_REQUEST` line before each call and one `INCOMING_RESPONSE` line after. `Authorization` and `Cookie` headers are redacted automatically.
+`CO.WithRequestLogger` attaches a `*slog.Logger` that emits one `OUTGOING_REQUEST` line before each call and one `INCOMING_RESPONSE` line after. Request and response bodies are omitted. Credential-like headers, query parameters, path parameters, and context attributes are redacted by name, including `Authorization`, `Cookie`, `Set-Cookie`, API keys, tokens, and secrets.
 
 #### Context log attributes
 
@@ -175,7 +175,7 @@ Each `WithLogAttr` / `WithLogAttrs` call produces a new context; the parent is n
 func SanitizeHeaders(h map[string][]string) map[string][]string
 ```
 
-Redacts `Authorization` and `Cookie` values (case-insensitive). Used internally by the logger; also available for custom middleware.
+Redacts credential-like header values (case-insensitive), including `Authorization`, `Cookie`, `Set-Cookie`, API keys, tokens, and secrets. Used internally by the logger; also available for custom middleware.
 
 ### api/google — Google Maps / Places client
 
@@ -1623,9 +1623,11 @@ mux.Handle("GET /admin/audit/sse",
     }))
 ```
 
-The Data is forwarded byte-for-byte from `Msg.Data`, so producers using
-`journal.NewJSONSink[T]` already publish wire-ready JSON — no transcoding
-on the read side. Browsers parse the `data:` payload as their own JSON.
+UTF-8 payloads are framed across one or more `data:` fields; EventSource
+joins multiline content with LF (CRLF and CR are normalized to LF). Encode
+binary payloads before publishing (for example, as base64). JSON events from
+`journal.NewJSONSink[T]` work directly, and browsers can parse each event's
+`data` as JSON.
 
 ### `journal.Tracker[T]` — server-rendered recent-events ring
 
@@ -1874,8 +1876,9 @@ handler := sess.Gate(mux) // wrap the protected routes
 Cookies are HttpOnly, Secure (when served over TLS — `X-Forwarded-Proto`
 aware), SameSite=Lax, scoped to the Manager's cookie path; the flow cookie is
 short-lived (10m) and the session honors the Manager's `SessionTTL`.
-`return_to` is confined to a local absolute path (the Manager's
-`SafeReturnTo`) so a crafted value can't bounce the browser to an attacker
+`return_to` is confined to a local absolute path under the configured
+`BasePath` (or any local absolute path when root-mounted) by the Manager's
+`SafeReturnTo`, so it cannot escape the app mount or bounce to an attacker
 origin.
 
 A caller that isn't `session.Manager`-backed (e.g. a server-side token-table

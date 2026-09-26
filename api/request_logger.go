@@ -2,10 +2,10 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"maps"
+	"net/url"
 	"slices"
 	"strings"
 
@@ -57,12 +57,88 @@ func logAttrsToSlog(attrs map[string]string) []slog.Attr {
 	return result
 }
 
+const redactedLogValue = "***redacted***"
+
+func isSensitiveLogField(name string) bool {
+	key := strings.ToLower(strings.NewReplacer("-", "", "_", "").Replace(name))
+	if key == "signature" || key == "sig" {
+		return true
+	}
+	for _, part := range []string{"auth", "cookie", "key", "code", "token", "secret", "password", "passwd", "passphrase", "credential", "assertion", "session", "nonce", "state", "verifier", "csrf", "jwt"} {
+		if strings.Contains(key, part) {
+			return true
+		}
+	}
+	return false
+}
+
+func sanitizeQuery(values url.Values) url.Values {
+	safe := make(url.Values, len(values))
+	for key, vals := range values {
+		if isSensitiveLogField(key) {
+			safe[key] = []string{redactedLogValue}
+		} else {
+			safe[key] = vals
+		}
+	}
+	return safe
+}
+
+func sanitizeURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "[invalid URL]"
+	}
+	if u.User != nil {
+		u.User = url.User(redactedLogValue)
+	}
+	query, err := url.ParseQuery(u.RawQuery)
+	if err != nil {
+		u.RawQuery = ""
+		u.ForceQuery = false
+		return u.String()
+	}
+	u.RawQuery = sanitizeQuery(query).Encode()
+	if u.RawQuery == "" {
+		u.ForceQuery = false
+	}
+	return u.String()
+}
+
+func sanitizeRequestURL(raw string, pathParams map[string]string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return sanitizeURL(raw)
+	}
+	for key, value := range pathParams {
+		if value != "" && isSensitiveLogField(key) {
+			u.Path = strings.ReplaceAll(u.Path, value, redactedLogValue)
+			u.RawPath = ""
+		}
+	}
+	return sanitizeURL(u.String())
+}
+
+func sanitizeLogAttrs(attrs map[string]string) map[string]string {
+	if len(attrs) == 0 {
+		return attrs
+	}
+	safe := make(map[string]string, len(attrs))
+	for key, value := range attrs {
+		if isSensitiveLogField(key) {
+			value = redactedLogValue
+		}
+		safe[key] = value
+	}
+	return safe
+}
+
+// SanitizeHeaders returns a copy of h with sensitive header values redacted.
 func SanitizeHeaders(h map[string][]string) map[string][]string {
 	safe := make(map[string][]string, len(h))
 	for k, v := range h {
-		key := strings.ToLower(k)
-		if key == "authorization" || key == "cookie" {
-			safe[k] = []string{"***redacted***"}
+		if isSensitiveLogField(k) {
+			safe[k] = []string{redactedLogValue}
 		} else {
 			safe[k] = v
 		}
@@ -70,57 +146,67 @@ func SanitizeHeaders(h map[string][]string) map[string][]string {
 	return safe
 }
 
+// WithRequestLogger adds structured request/response metadata logging. Bodies
+// are omitted, and credential-like headers, URL fields, and context attributes
+// are redacted by name.
 func (co *ClientOption) WithRequestLogger(logger *slog.Logger) RestyClientOption {
 	return func(c *resty.Client) {
 		if logger == nil {
 			logger = slog.Default()
 		}
-		c.OnBeforeRequest(func(rc *resty.Client, r *resty.Request) error {
-			var bodyStr string
-			if r.Body != nil {
-				if jb, err := json.Marshal(r.Body); err == nil {
-					bodyStr = string(jb)
-				}
-			}
-			fullUrl := r.URL
-			queryStr := r.QueryParam.Encode()
+		c.OnBeforeRequest(func(_ *resty.Client, r *resty.Request) error {
+			queryStr := sanitizeQuery(r.QueryParam).Encode()
+			requestURL := sanitizeRequestURL(r.URL, r.PathParams)
+			fullURL := requestURL
 			if queryStr != "" {
-				fullUrl += "?" + queryStr
+				separator := "?"
+				if strings.Contains(fullURL, "?") {
+					separator = "&"
+				}
+				fullURL += separator + queryStr
 			}
 			pathParamStr := ""
 			if len(r.PathParams) > 0 {
-				pathParamStr = fmt.Sprintf("%v", r.PathParams)
-				fullUrl += " " + pathParamStr[3:]
+				pathParams := make(map[string]string, len(r.PathParams))
+				for key, value := range r.PathParams {
+					if isSensitiveLogField(key) {
+						value = redactedLogValue
+					}
+					pathParams[key] = value
+				}
+				pathParamStr = fmt.Sprintf("%v", pathParams)
+				fullURL += " " + strings.TrimPrefix(pathParamStr, "map")
 			}
 			attrs, _ := r.Context().Value(logAttrsKey).(map[string]string)
+			attrs = sanitizeLogAttrs(attrs)
 			logAttrs := append([]slog.Attr{
 				slog.String("method", r.Method),
-				slog.String("url", r.URL),
+				slog.String("url", requestURL),
 				slog.String("queryParam", queryStr),
 				slog.String("pathParam", pathParamStr),
 				slog.Any("header", SanitizeHeaders(r.Header)),
-				slog.String("body", bodyStr),
 			}, logAttrsToSlog(attrs)...)
 			logger.LogAttrs(r.Context(), slog.LevelInfo,
-				fmt.Sprintf("OUTGOING_REQUEST: %s %s%s", r.Method, fullUrl, logAttrsSuffix(attrs)),
+				fmt.Sprintf("OUTGOING_REQUEST: %s %s%s", r.Method, fullURL, logAttrsSuffix(attrs)),
 				logAttrs...,
 			)
 			return nil
 		})
 
-		c.OnAfterResponse(func(rc *resty.Client, r *resty.Response) error {
+		c.OnAfterResponse(func(_ *resty.Client, r *resty.Response) error {
 			attrs, _ := r.Request.Context().Value(logAttrsKey).(map[string]string)
+			attrs = sanitizeLogAttrs(attrs)
+			requestURL := sanitizeRequestURL(r.Request.URL, r.Request.PathParams)
 			logAttrs := append([]slog.Attr{
 				slog.String("method", r.Request.Method),
-				slog.String("url", r.Request.URL),
+				slog.String("url", requestURL),
 				slog.Int("status", r.StatusCode()),
 				slog.Any("header", SanitizeHeaders(r.Header())),
-				slog.String("body", string(r.Body())),
 				slog.String("elapsed", r.Time().String()),
 				slog.Duration("elapsed_ms", r.Time()),
 			}, logAttrsToSlog(attrs)...)
 			logger.LogAttrs(r.Request.Context(), slog.LevelInfo,
-				fmt.Sprintf("INCOMING_RESPONSE: %s %s %d%s", r.Request.Method, r.Request.URL, r.StatusCode(), logAttrsSuffix(attrs)),
+				fmt.Sprintf("INCOMING_RESPONSE: %s %s %d%s", r.Request.Method, requestURL, r.StatusCode(), logAttrsSuffix(attrs)),
 				logAttrs...,
 			)
 			return nil

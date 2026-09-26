@@ -58,6 +58,7 @@ func TestNew_Validation(t *testing.T) {
 		mut  func(*Config)
 	}{
 		{"key", func(c *Config) { c.SessionKey = nil }},
+		{"short key", func(c *Config) { c.SessionKey = make([]byte, 16) }},
 		{"prefix", func(c *Config) { c.CookiePrefix = "" }},
 		{"basepath", func(c *Config) { c.BasePath = "portal" }}, // missing leading slash
 	} {
@@ -137,6 +138,16 @@ func TestBasePath_SafeReturnToAndCookiePath(t *testing.T) {
 	}
 	if got := m.SafeReturnTo("/portal/roles"); got != "/portal/roles" {
 		t.Errorf("SafeReturnTo(safe) = %q, want passthrough", got)
+	}
+	if got := m.SafeReturnTo("/portal/roles?tab=active"); got != "/portal/roles?tab=active" {
+		t.Errorf("SafeReturnTo(query) = %q, want to preserve query", got)
+	}
+	for _, unsafe := range []string{
+		"/admin", "/portalx", "/portal/../admin", "/portal\\..\\admin",
+	} {
+		if got := m.SafeReturnTo(unsafe); got != "/portal/" {
+			t.Errorf("SafeReturnTo(%q) = %q, want /portal/ fallback", unsafe, got)
+		}
 	}
 	if got := m.CookiePath(); got != "/portal" {
 		t.Errorf("CookiePath = %q, want /portal", got)

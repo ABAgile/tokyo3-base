@@ -2,11 +2,13 @@
 // journal.Source — the symmetric read counterpart to journal.Sink for the
 // "watch this audit log live in a browser" use case.
 //
-// Wire shape: each Msg becomes one SSE event with `id: <seq>` and
-// `data: <msg.Data verbatim>`. The Data is forwarded byte-for-byte so the
-// handler is encoding-agnostic — producers using journal.NewJSONSink[T]
-// already publish wire-ready JSON. SSE comments (`: ping`) are written at
-// the configured Heartbeat interval to keep proxy connections warm.
+// Wire shape: each Msg becomes one SSE event with `id: <seq>` and one or
+// more `data:` fields. Payloads are UTF-8 text; CRLF and CR line endings are
+// normalized to LF, and each line is framed separately so payload text cannot
+// inject SSE fields. Binary payloads must be encoded (for example, as
+// base64) before publishing. Producers using journal.NewJSONSink[T] already
+// publish wire-ready JSON. SSE comments (`: ping`) are written at the
+// configured Heartbeat interval to keep proxy connections warm.
 //
 // Reconnect: browsers' EventSource auto-reconnects with the last seen
 // id in the Last-Event-ID header. The handler reads that header and
@@ -21,6 +23,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/abagile/tokyo3-base/journal"
@@ -110,10 +113,25 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			if _, err := fmt.Fprintf(w, "id: %d\ndata: %s\n\n", m.Seq, m.Data); err != nil {
+			if err := writeSSEEvent(w, m); err != nil {
 				return
 			}
 			flusher.Flush()
 		}
 	}
+}
+
+func writeSSEEvent(w http.ResponseWriter, m journal.Msg) error {
+	if _, err := fmt.Fprintf(w, "id: %d\n", m.Seq); err != nil {
+		return err
+	}
+	data := strings.ReplaceAll(string(m.Data), "\r\n", "\n")
+	data = strings.ReplaceAll(data, "\r", "\n")
+	for line := range strings.SplitSeq(data, "\n") {
+		if _, err := fmt.Fprintf(w, "data: %s\n", line); err != nil {
+			return err
+		}
+	}
+	_, err := fmt.Fprint(w, "\n")
+	return err
 }
