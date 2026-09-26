@@ -3,10 +3,9 @@
 [![Release](https://img.shields.io/github/v/release/abagile/tokyo3-base?sort=semver&logo=Go&color=%23007D9C)](https://github.com/abagile/tokyo3-base/releases)
 [![Test](https://github.com/abagile/tokyo3-base/actions/workflows/test.yml/badge.svg)](https://github.com/abagile/tokyo3-base/actions/workflows/test.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/abagile/tokyo3-base.svg)](https://pkg.go.dev/github.com/abagile/tokyo3-base)
-[![Go Report Card](https://goreportcard.com/badge/github.com/abagile/tokyo3-base)](https://goreportcard.com/report/github.com/abagile/tokyo3-base)
 [![codecov](https://codecov.io/gh/abagile/tokyo3-base/branch/main/graph/badge.svg)](https://codecov.io/gh/abagile/tokyo3-base)
 
-**Requires Go 1.26+**
+**Requires Go 1.27+**
 
 ```
 go get github.com/abagile/tokyo3-base
