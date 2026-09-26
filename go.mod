@@ -7,7 +7,6 @@ require (
 	github.com/coreos/go-oidc/v3 v3.18.0
 	github.com/go-resty/resty/v2 v2.17.2
 	github.com/golang-jwt/jwt/v5 v5.3.1
-	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/nats-io/nats.go v1.50.0
 	github.com/phuslu/log v1.0.124

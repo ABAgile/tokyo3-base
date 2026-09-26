@@ -2,9 +2,9 @@ package jwt
 
 import (
 	"time"
+	"uuid"
 
 	gojwt "github.com/golang-jwt/jwt/v5"
-	"github.com/google/uuid"
 )
 
 // backchannelLogoutEventURI is the literal identifier the RP looks
@@ -41,10 +41,10 @@ type LogoutClaims struct {
 //
 // jti is supplied by the caller so the OP can log the same value RPs
 // use for replay detection — easier post-mortems when something goes
-// wrong. Empty jti causes the package to generate one (uuid.NewString).
+// wrong. Empty jti causes the package to generate one (uuid.NewV4().String).
 func (s *Signer) MintLogoutToken(audience, sub, sid, jti string, now time.Time) (string, error) {
 	if jti == "" {
-		jti = uuid.NewString()
+		jti = uuid.NewV4().String()
 	}
 	claims := LogoutClaims{
 		Issuer:    s.issuer,

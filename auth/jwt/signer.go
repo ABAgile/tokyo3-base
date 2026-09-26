@@ -21,10 +21,10 @@ import (
 	"crypto/rsa"
 	"sort"
 	"time"
+	"uuid"
 
 	"github.com/abagile/tokyo3-base/auth/awsclaims"
 	gojwt "github.com/golang-jwt/jwt/v5"
-	"github.com/google/uuid"
 )
 
 // Defaults applied when the corresponding Config field is zero/empty.
@@ -162,7 +162,7 @@ func (s *Signer) MintFederationToken(userID, audience, email, name string, group
 		ExpiresAt:         gojwt.NewNumericDate(now.Add(lifetime)),
 		IssuedAt:          gojwt.NewNumericDate(now),
 		NotBefore:         gojwt.NewNumericDate(now),
-		ID:                uuid.NewString(),
+		ID:                uuid.NewV4().String(),
 		Email:             email,
 		Name:              name,
 		PreferredUsername: email,
@@ -211,7 +211,7 @@ func (s *Signer) MintIDToken(userID, clientID, email, name, nonce string, scopes
 		Audience:          gojwt.ClaimStrings{clientID},
 		ExpiresAt:         gojwt.NewNumericDate(now.Add(s.cfg.IDTokenTTL)),
 		IssuedAt:          gojwt.NewNumericDate(now),
-		ID:                uuid.NewString(),
+		ID:                uuid.NewV4().String(),
 		Nonce:             nonce,
 		AuthTime:          authTime.Unix(),
 		ACR:               acr,
