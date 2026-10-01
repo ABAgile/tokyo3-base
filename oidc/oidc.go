@@ -21,6 +21,7 @@ import (
 
 	goidc "github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/oauth2"
+	"golang.org/x/sync/singleflight"
 )
 
 // Claims is the subset of OIDC + custom claims services typically read. New
@@ -252,8 +253,9 @@ func (v *HTTPVerifier) Endpoint() oauth2.Endpoint { return v.endpoint }
 type LazyVerifier struct {
 	issuer, audience string
 
-	mu       sync.Mutex
-	verifier *HTTPVerifier
+	mu        sync.RWMutex
+	verifier  *HTTPVerifier
+	discovery singleflight.Group
 }
 
 // NewLazyHTTPVerifier returns a verifier that performs no I/O at construction.
@@ -293,17 +295,44 @@ func (v *LazyVerifier) VerifyLogoutToken(ctx context.Context, raw string) (*Logo
 }
 
 func (v *LazyVerifier) ensure(ctx context.Context) (*HTTPVerifier, error) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if v.verifier != nil {
-		return v.verifier, nil
-	}
-	hv, err := NewHTTPVerifier(ctx, v.issuer, v.audience)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	v.verifier = hv
-	return hv, nil
+	v.mu.RLock()
+	cached := v.verifier
+	v.mu.RUnlock()
+	if cached != nil {
+		return cached, nil
+	}
+	result := v.discovery.DoChan("provider", func() (any, error) {
+		v.mu.RLock()
+		cached := v.verifier
+		v.mu.RUnlock()
+		if cached != nil {
+			return cached, nil
+		}
+		// Preserve a custom OAuth HTTP client, but do not let one caller's
+		// cancellation abort discovery for everyone else. Bound shared I/O.
+		discoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		hv, err := NewHTTPVerifier(discoveryCtx, v.issuer, v.audience)
+		if err != nil {
+			return nil, err
+		}
+		v.mu.Lock()
+		v.verifier = hv
+		v.mu.Unlock()
+		return hv, nil
+	})
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case r := <-result:
+		if r.Err != nil {
+			return nil, r.Err
+		}
+		return r.Val.(*HTTPVerifier), nil
+	}
 }
 
 func (v *LazyVerifier) Issuer() string   { return v.issuer }

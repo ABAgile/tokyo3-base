@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -33,6 +34,9 @@ func NewRestClient(baseURL string, opts ...RestyClientOption) *RestyClient {
 	for _, opt := range opts {
 		opt(client)
 	}
+	// Bound error reads before Resty buffers or logs them. Success responses
+	// remain unlimited, and custom transports configured by options survive.
+	client.GetClient().Transport = errorBodyTransport{base: client.GetClient().Transport}
 	return &RestyClient{Client: client}
 }
 
@@ -126,7 +130,13 @@ func (rc *RestyClient) R(ctx context.Context, method, path string, result any, o
 		return fmt.Errorf("api call failed: %w", err)
 	}
 	if resp.IsError() {
-		return &ApiError{StatusCode: resp.StatusCode(), Body: resp.Body()}
+		body := resp.Body()
+		// Also enforce the retained-body contract if a caller replaced the
+		// embedded Resty client's transport after construction.
+		if len(body) > apiErrorBodyLimit {
+			body = slices.Clone(body[:apiErrorBodyLimit])
+		}
+		return &ApiError{StatusCode: resp.StatusCode(), Body: body}
 	}
 	// Decode the response body into result manually rather than via
 	// Resty's SetResult — that auto-decode hinges on the server

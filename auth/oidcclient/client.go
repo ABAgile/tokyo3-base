@@ -174,13 +174,27 @@ func LoadConfig() (*Config, error) {
 	return &c, nil
 }
 
-// SaveTokens persists Tokens atomically with mode 0o600.
+type cachedTokens struct {
+	Tokens
+	Config *Config `json:"config,omitempty"`
+}
+
+// SaveTokens persists Tokens atomically with mode 0o600. Login and refresh
+// additionally bind the stored tokens to their issuer/client configuration.
 func SaveTokens(t *Tokens) error {
+	return saveTokens(t, nil)
+}
+
+func saveTokens(t *Tokens, cfg *Config) error {
 	dir, err := CacheDir()
 	if err != nil {
 		return err
 	}
-	b, err := json.MarshalIndent(t, "", "  ")
+	var value any = t
+	if t != nil && cfg != nil {
+		value = cachedTokens{Tokens: *t, Config: cfg}
+	}
+	b, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -190,6 +204,14 @@ func SaveTokens(t *Tokens) error {
 // LoadTokens reads the cached Tokens file. Returns a descriptive
 // error when the file does not exist so callers can suggest a login.
 func LoadTokens() (*Tokens, error) {
+	cached, err := loadCachedTokens()
+	if err != nil {
+		return nil, err
+	}
+	return &cached.Tokens, nil
+}
+
+func loadCachedTokens() (*cachedTokens, error) {
 	dir, err := CacheDir()
 	if err != nil {
 		return nil, err
@@ -202,7 +224,7 @@ func LoadTokens() (*Tokens, error) {
 	if err != nil {
 		return nil, err
 	}
-	var t Tokens
+	var t cachedTokens
 	if err := json.Unmarshal(b, &t); err != nil {
 		return nil, err
 	}
@@ -219,10 +241,14 @@ func LoadTokens() (*Tokens, error) {
 // previously-cached IDToken is retained — refresh responses are
 // allowed to omit it per OIDC spec.
 func EnsureFreshTokens(ctx context.Context, cfg Config, accessSkew time.Duration) (*Tokens, error) {
-	tokens, err := LoadTokens()
+	cached, err := loadCachedTokens()
 	if err != nil {
 		return nil, err
 	}
+	if cached.Config != nil && *cached.Config != cfg {
+		return nil, errors.New("SSO cache issuer/client mismatch; run login again")
+	}
+	tokens := &cached.Tokens
 	if time.Until(tokens.Expiration) >= accessSkew {
 		return tokens, nil
 	}
@@ -238,7 +264,7 @@ func EnsureFreshTokens(ctx context.Context, cfg Config, accessSkew time.Duration
 	if fresh.IDToken == "" {
 		fresh.IDToken = tokens.IDToken
 	}
-	if err := SaveTokens(fresh); err != nil {
+	if err := saveTokens(fresh, &cfg); err != nil {
 		return nil, fmt.Errorf("save tokens: %w", err)
 	}
 	return fresh, nil
@@ -282,24 +308,40 @@ func PostToken(ctx context.Context, issuer string, form url.Values) (*Tokens, er
 // broker driving a third-party IdP) that resolve the token endpoint via
 // OIDC discovery instead.
 func PostTokenAt(ctx context.Context, tokenURL string, form url.Values) (*Tokens, error) {
+	status, body, err := postForm(ctx, tokenURL, form)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("token endpoint %d: %s", status, strings.TrimSpace(string(body)))
+	}
+	return parseTokens(body)
+}
+
+// postForm bounds each exchange through the body read, not just the headers.
+func postForm(ctx context.Context, endpoint string, form url.Values) (int, []byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		tokenURL, strings.NewReader(form.Encode()))
+		endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
-		return nil, err
+		return 0, nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, err
+		return 0, nil, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("token endpoint %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return 0, nil, fmt.Errorf("read OAuth response: %w", err)
 	}
+	return resp.StatusCode, body, nil
+}
+
+func parseTokens(body []byte) (*Tokens, error) {
 	var raw struct {
 		AccessToken  string `json:"access_token"`
 		RefreshToken string `json:"refresh_token"`

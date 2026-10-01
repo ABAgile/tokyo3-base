@@ -80,6 +80,12 @@ func (rc *RestyClient) R(ctx context.Context, method, path string, result any, o
 
 Executes a request and unmarshals the response body into `result` on success. Returns `*ApiError` on HTTP error status; the response body is decoded with `encoding/json` directly (no Content-Type heuristics) so test mocks that omit `Content-Type: application/json` work unchanged.
 
+`NewRestClient` wraps the transport configured by its options to cap error-body
+reads at 64 KiB before Resty buffers/logs them, including after gzip decoding.
+Success bodies are not capped. Configure custom transports/TLS through the
+constructor options; replacing the embedded client's transport later bypasses
+the read limit, although `ApiError.Body` is still truncated to 64 KiB.
+
 ```go
 var out MyResponse
 err := rc.R(ctx, http.MethodGet, "/v1/orders/{id}", &out,
@@ -539,7 +545,9 @@ order: opening the browser before the server is actually accepting
 connections risks the redirect arriving nowhere. `OpenBrowser` folds
 in a headless-session check (no `DISPLAY`/`WAYLAND_DISPLAY` on Linux)
 before attempting `xdg-open`, which would otherwise hang or fail
-confusingly over SSH.
+confusingly over SSH. The first callback handler runs once and its success or
+error is the only result delivered by `Wait`; repeated requests receive 409
+instead of blocking. Unexpected serve failures are delivered to `Wait` too.
 
 ### Token cache — `LoadConfig`, `LoadTokens`, `EnsureFreshTokens`, `Refresh`
 
@@ -557,7 +565,11 @@ refresh token, persists the rotated pair, and returns the new tokens.
 Refresh-token rotation is the assumed default (the new refresh token
 in the response replaces the old); if the issuer omits the new
 refresh in the response (rotation disabled at the AS), the previous
-value is retained.
+value is retained. Failed OAuth flows do not change either cache file. Login
+and refresh store an issuer/client binding inside `tokens.json`; mismatched
+configuration is rejected before returning tokens or contacting an issuer.
+This also fails closed if updating `config.json` after token persistence fails.
+Legacy unbound cache files remain readable and acquire a binding on refresh.
 
 ```go
 cfg, err := oidcclient.LoadConfig()      // run-login prompt if missing
@@ -1044,7 +1056,7 @@ Functional option type for `NewPgxPool`.
 func WithDecimalRegister() DatabaseConfigOption
 ```
 
-Registers [`govalues/decimal`](https://github.com/govalues/decimal) with the pgx type map on every new connection, enabling transparent encode/decode of `decimal.Decimal` for PostgreSQL `numeric` columns.
+Registers [`govalues/decimal`](https://github.com/govalues/decimal) with the pgx type map on every new connection, enabling transparent encode/decode of `decimal.Decimal` for PostgreSQL `numeric` columns. An existing `AfterConnect` hook runs first; its errors are preserved.
 
 ```go
 pool, err := NewPgxPool(connStr, WithDecimalRegister())
@@ -1056,7 +1068,11 @@ pool, err := NewPgxPool(connStr, WithDecimalRegister())
 func SantizeDbConn(connStr string) string
 ```
 
-Strips `user=` and `password=` key-value pairs from a DSN and collapses surrounding whitespace. Safe for logging.
+Returns a logging-safe summary of keyword or Postgres URL DSNs, retaining only
+`host`, `port`, `dbname`, `sslmode`, `application_name`, and `connect_timeout`.
+Credentials (including quoted/escaped passwords and URL user info), arbitrary
+parameters, and fragments are omitted. Malformed input returns a fixed redacted
+marker. The historical function spelling is retained.
 
 ```go
 SantizeDbConn("host=localhost user=admin password=secret dbname=app")
@@ -1772,8 +1788,10 @@ assertion rather than a self-declared request field. `HTTPVerifier` wraps
 fetch, auto-refreshed on key rotation). `LazyVerifier` defers that I/O to the
 first `Verify`, so a daemon boots even while its IdP is briefly unreachable and
 self-heals on the next request — a transient outage at boot surfaces as a 401,
-not a crash. Consumers depend on the `TokenVerifier` interface, so tests inject
-a stub instead of standing up a real issuer.
+not a crash. Concurrent lazy discovery calls share one bounded (10s) fetch;
+each caller can cancel its wait without aborting other callers' discovery.
+Consumers depend on the `TokenVerifier` interface, so tests inject a stub instead
+of standing up a real issuer.
 
 `VerifyLogoutToken` validates an [OIDC Back-Channel Logout 1.0](https://openid.net/specs/openid-connect-backchannel-1_0.html)
 `logout_token` against the same provider/JWKS, preserving signature, issuer,
@@ -1939,6 +1957,9 @@ error — a logout notification for a user the caller doesn't know about needs
 no action, and the OP shouldn't keep retrying it. Every response carries
 `Cache-Control: no-store` and the §2.8-mandated status shape (200 on success,
 4xx for a bad/replayed token, 5xx only for an unexpected internal failure).
+A token ID is reserved while revocation/auditing runs, retained after success,
+and released on failure so retries are possible. Pending reservations do not
+expire during work. Revocation and `OnRevoked` must be idempotent on retries.
 
 ```go
 verifier, _ := oidc.NewLazyHTTPVerifier(issuer, clientID)
@@ -2382,8 +2403,10 @@ func ServerTLS(cfg ServerTLSConfig) (*tls.Config, error)
 ```
 
 The server-side sibling of `ClientConfig` — the `*tls.Config` an HTTPS
-listener needs. A cert+key pair wires a hot-reloading `CertLoader`
-(`GetCertificate`); both empty falls back to an ephemeral
+listener needs. A configured cert+key pair is loaded and validated before
+construction succeeds, then served by a hot-reloading `CertLoader`
+(`GetCertificate`). Bad rotations retain the previous certificate and log a
+warning; both empty falls back to an ephemeral
 [`SelfSignedCert`](#selfsignedcert--ephemeral-dev-fallback) (dev, logged as a
 warning). An optional `ClientCAFile` wires hot-reloading inbound mTLS via
 `NewClientCALoader` — the bundle re-reads mtime-gated with keep-last-good, so

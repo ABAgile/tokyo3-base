@@ -25,14 +25,13 @@ type LoginOptions struct {
 // $XDG_CONFIG_HOME/auth-sso/, and returns the Tokens.
 //
 // Idempotent in the sense that a successful login over-writes any
-// previously-cached tokens. A failed login leaves the cache untouched
-// (Tokens are not persisted until the full flow completes).
+// previously-cached tokens. A failed OAuth flow leaves the cache untouched.
+// Tokens are stored with their issuer/client identity before config.json is
+// updated, so a partial persistence failure cannot refresh against the wrong
+// issuer. Such a mismatch requires another login.
 func Login(ctx context.Context, cfg Config, opt LoginOptions) (*Tokens, error) {
 	if cfg.Issuer == "" || cfg.ClientID == "" {
 		return nil, errors.New("oidcclient.Login: Issuer and ClientID are required")
-	}
-	if err := SaveConfig(cfg); err != nil {
-		return nil, err
 	}
 	var (
 		tokens *Tokens
@@ -46,7 +45,10 @@ func Login(ctx context.Context, cfg Config, opt LoginOptions) (*Tokens, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := SaveTokens(tokens); err != nil {
+	if err := saveTokens(tokens, &cfg); err != nil {
+		return nil, err
+	}
+	if err := SaveConfig(cfg); err != nil {
 		return nil, err
 	}
 	return tokens, nil

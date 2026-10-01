@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"sync"
 	"time"
 )
 
@@ -49,9 +50,14 @@ func LoopbackListener(port int, path string) (net.Listener, string, error) {
 // but this API makes the ordering structural rather than an implicit
 // timing assumption callers have to get right on their own.
 type LoopbackCallback struct {
-	srv     *http.Server
-	valueCh chan string
-	errCh   chan error
+	srv      *http.Server
+	once     sync.Once
+	resultCh chan loopbackResult
+}
+
+type loopbackResult struct {
+	value string
+	err   error
 }
 
 // StartLoopbackCallback starts serving on listener at path and
@@ -68,21 +74,25 @@ type LoopbackCallback struct {
 // OAuth code) — both need identical bind/serve/timeout/shutdown
 // boilerplate around a completely different payload.
 func StartLoopbackCallback(listener net.Listener, path string, handle func(w http.ResponseWriter, r *http.Request) (string, error)) *LoopbackCallback {
-	lc := &LoopbackCallback{
-		valueCh: make(chan string, 1),
-		errCh:   make(chan error, 1),
-	}
+	lc := &LoopbackCallback{resultCh: make(chan loopbackResult, 1)}
 	mux := http.NewServeMux()
 	mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
-		value, err := handle(w, r)
-		if err != nil {
-			lc.errCh <- err
-			return
+		handled := false
+		lc.once.Do(func() {
+			handled = true
+			value, err := handle(w, r)
+			lc.resultCh <- loopbackResult{value, err}
+		})
+		if !handled {
+			http.Error(w, "callback already received", http.StatusConflict)
 		}
-		lc.valueCh <- value
 	})
 	lc.srv = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
-	go func() { _ = lc.srv.Serve(listener) }()
+	go func() {
+		if err := lc.srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			lc.once.Do(func() { lc.resultCh <- loopbackResult{err: err} })
+		}
+	}()
 	return lc
 }
 
@@ -99,14 +109,14 @@ func (lc *LoopbackCallback) Wait(ctx context.Context, timeout time.Duration) (st
 	defer func() {
 		shutCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		_ = lc.srv.Shutdown(shutCtx)
+		if err := lc.srv.Shutdown(shutCtx); err != nil {
+			_ = lc.srv.Close()
+		}
 	}()
 
 	select {
-	case v := <-lc.valueCh:
-		return v, nil
-	case err := <-lc.errCh:
-		return "", err
+	case result := <-lc.resultCh:
+		return result.value, result.err
 	case <-time.After(timeout):
 		return "", fmt.Errorf("login timed out after %s", timeout)
 	case <-ctx.Done():

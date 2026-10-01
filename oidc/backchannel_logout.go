@@ -105,8 +105,9 @@ func NewBackchannelLogoutHandler(cfg BackchannelLogoutConfig) (*BackchannelLogou
 // the JWT signature is the authentication. Per §2.8 the response is
 // Cache-Control: no-store and 200 on success; errors are 4xx (missing
 // or invalid logout_token, replay) or 5xx (an unexpected internal
-// failure). The OP does not retry on failure, so OnRevoked (or the
-// caller's own logging) is the only post-mortem signal.
+// failure). Failed requests release their replay reservation so an OP that
+// retries can try again; concurrent and successfully completed replays are
+// rejected. Revocation and OnRevoked must be idempotent across retries.
 func (h *BackchannelLogoutHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 
@@ -131,6 +132,9 @@ func (h *BackchannelLogoutHandler) ServeHTTP(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "logout_token replay", http.StatusBadRequest)
 		return
 	}
+
+	completed := false
+	defer func() { h.jti.finish(claims.JTI, completed, time.Now()) }()
 
 	var (
 		scope, identity string
@@ -166,6 +170,7 @@ func (h *BackchannelLogoutHandler) ServeHTTP(w http.ResponseWriter, r *http.Requ
 			return
 		}
 	}
+	completed = true
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -179,12 +184,17 @@ func (h *BackchannelLogoutHandler) ServeHTTP(w http.ResponseWriter, r *http.Requ
 // DB-backed table or a shared cache instead of this in-memory map.
 type logoutJTICache struct {
 	mu     sync.Mutex
-	seen   map[string]time.Time
+	seen   map[string]logoutJTIEntry
 	window time.Duration
 }
 
+type logoutJTIEntry struct {
+	at      time.Time
+	pending bool
+}
+
 func newLogoutJTICache(window time.Duration) *logoutJTICache {
-	return &logoutJTICache{seen: map[string]time.Time{}, window: window}
+	return &logoutJTICache{seen: map[string]logoutJTIEntry{}, window: window}
 }
 
 // accept records jti and reports whether this is the first time it's
@@ -195,14 +205,26 @@ func (c *logoutJTICache) accept(jti string, now time.Time) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	cutoff := now.Add(-c.window)
-	for k, t := range c.seen {
-		if t.Before(cutoff) {
+	for k, entry := range c.seen {
+		if !entry.pending && entry.at.Before(cutoff) {
 			delete(c.seen, k)
 		}
 	}
 	if _, dup := c.seen[jti]; dup {
 		return false
 	}
-	c.seen[jti] = now
+	c.seen[jti] = logoutJTIEntry{at: now, pending: true}
 	return true
+}
+
+// finish retains successful requests for window after completion. Pending
+// reservations never expire while work is running; failures release them.
+func (c *logoutJTICache) finish(jti string, success bool, now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if success {
+		c.seen[jti] = logoutJTIEntry{at: now}
+	} else {
+		delete(c.seen, jti)
+	}
 }

@@ -15,6 +15,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/abagile/tokyo3-base/tls/reloader"
 )
 
 // TestAuditTLS verifies which TLS construction each material combination
@@ -27,7 +29,7 @@ func TestAuditTLS(t *testing.T) {
 	certFile, keyFile, caFile := writeAuditCertFiles(t)
 
 	t.Run("pair reloads leaf and CA per handshake", func(t *testing.T) {
-		cfg, err := auditTLS(certFile, keyFile, caFile)
+		cfg, err := reloader.ClientTLS(certFile, keyFile, caFile)
 		if err != nil {
 			t.Fatalf("auditTLS: %v", err)
 		}
@@ -46,7 +48,7 @@ func TestAuditTLS(t *testing.T) {
 	})
 
 	t.Run("ca-only keeps one-shot server-auth TLS", func(t *testing.T) {
-		cfg, err := auditTLS("", "", caFile)
+		cfg, err := reloader.ClientTLS("", "", caFile)
 		if err != nil {
 			t.Fatalf("auditTLS: %v", err)
 		}
@@ -59,7 +61,7 @@ func TestAuditTLS(t *testing.T) {
 	})
 
 	t.Run("no material stays plaintext", func(t *testing.T) {
-		cfg, err := auditTLS("", "", "")
+		cfg, err := reloader.ClientTLS("", "", "")
 		if err != nil {
 			t.Fatalf("auditTLS: %v", err)
 		}
@@ -69,7 +71,7 @@ func TestAuditTLS(t *testing.T) {
 	})
 
 	t.Run("missing pair files fail closed", func(t *testing.T) {
-		if _, err := auditTLS("/no/such/cert.pem", "/no/such/key.pem", ""); err == nil {
+		if _, err := reloader.ClientTLS("/no/such/cert.pem", "/no/such/key.pem", ""); err == nil {
 			t.Error("expected error for missing cert+key files")
 		}
 	})

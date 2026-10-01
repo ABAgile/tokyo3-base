@@ -266,8 +266,8 @@ func (r *Reloader) ExpiryAttrs(attrName string) func() []any {
 	}
 }
 
-// PoolNames returns the registered pool names, sorted-stable across
-// calls is not guaranteed (Go map iteration is randomised). Exposed
+// PoolNames returns the registered pool names in unspecified order
+// (Go map iteration is randomised). Exposed
 // for diagnostics + tests; production callers typically know their
 // pool names statically.
 func (r *Reloader) PoolNames() []string {

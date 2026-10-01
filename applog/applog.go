@@ -126,15 +126,19 @@ type asyncNatsWriter struct {
 }
 
 func newAsyncNatsWriter(cfg Config, nc *nats.Conn) *asyncNatsWriter {
+	return &asyncNatsWriter{writer: &log.AsyncWriter{
+		ChannelSize:   200,
+		DiscardOnFull: true,
+		Writer:        &log.IOWriter{Writer: &NatsWriter{Nc: nc, Subject: logSubject(cfg)}},
+	}}
+}
+
+func logSubject(cfg Config) string {
 	subject := "app_log." + cfg.App
 	if cfg.Instance != "" {
 		subject += "." + cfg.Instance
 	}
-	return &asyncNatsWriter{writer: &log.AsyncWriter{
-		ChannelSize:   200,
-		DiscardOnFull: true,
-		Writer:        &log.IOWriter{Writer: &NatsWriter{Nc: nc, Subject: subject}},
-	}}
+	return subject
 }
 
 func (w *asyncNatsWriter) WriteEntry(e *log.Entry) (int, error) {

@@ -38,22 +38,12 @@ func RunDeviceFlow(ctx context.Context, issuer, clientID string, stderr io.Write
 	form := url.Values{}
 	form.Set("client_id", clientID)
 	form.Set("scope", "openid email profile offline_access")
-	authzCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(authzCtx, http.MethodPost, authzURL, strings.NewReader(form.Encode()))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	status, body, err := postForm(ctx, authzURL, form)
 	if err != nil {
 		return nil, fmt.Errorf("device_authorization: %w", err)
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("device_authorization %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("device_authorization %d: %s", status, strings.TrimSpace(string(body)))
 	}
 	var authz struct {
 		DeviceCode              string `json:"device_code"`
@@ -102,46 +92,12 @@ func RunDeviceFlow(ctx context.Context, issuer, clientID string, stderr io.Write
 		pollForm.Set("device_code", authz.DeviceCode)
 		pollForm.Set("client_id", clientID)
 
-		pollCtx, pollCancel := context.WithTimeout(ctx, 15*time.Second)
-		pollReq, err := http.NewRequestWithContext(pollCtx, http.MethodPost, tokenURL,
-			strings.NewReader(pollForm.Encode()))
+		status, pollBody, err := postForm(ctx, tokenURL, pollForm)
 		if err != nil {
-			pollCancel()
-			return nil, err
-		}
-		pollReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		pollReq.Header.Set("Accept", "application/json")
-		pollResp, err := http.DefaultClient.Do(pollReq)
-		if err != nil {
-			pollCancel()
 			return nil, fmt.Errorf("token poll: %w", err)
 		}
-		pollBody, err := io.ReadAll(io.LimitReader(pollResp.Body, 64*1024))
-		pollResp.Body.Close()
-		pollCancel()
-		if err != nil {
-			return nil, fmt.Errorf("read token poll response: %w", err)
-		}
-
-		if pollResp.StatusCode == http.StatusOK {
-			var raw struct {
-				AccessToken  string `json:"access_token"`
-				RefreshToken string `json:"refresh_token"`
-				IDToken      string `json:"id_token"`
-				ExpiresIn    int64  `json:"expires_in"`
-			}
-			if err := json.Unmarshal(pollBody, &raw); err != nil {
-				return nil, fmt.Errorf("decode token response: %w", err)
-			}
-			if raw.AccessToken == "" {
-				return nil, errors.New("token endpoint returned no access_token")
-			}
-			return &Tokens{
-				AccessToken:  raw.AccessToken,
-				RefreshToken: raw.RefreshToken,
-				IDToken:      raw.IDToken,
-				Expiration:   time.Now().Add(time.Duration(raw.ExpiresIn) * time.Second),
-			}, nil
+		if status == http.StatusOK {
+			return parseTokens(pollBody)
 		}
 		// Non-200: decode the RFC 8628 error code so we can distinguish
 		// "keep polling" from "abort." Anything we don't recognise is

@@ -1,12 +1,10 @@
 package jetstream
 
 import (
-	"crypto/tls"
 	"fmt"
 	"log/slog"
 
 	"github.com/abagile/tokyo3-base/journal"
-	btls "github.com/abagile/tokyo3-base/tls"
 	"github.com/abagile/tokyo3-base/tls/reloader"
 )
 
@@ -27,7 +25,7 @@ import (
 // cert-agentd rotation of the short-TTL workload cert — or of the CA
 // bundle — is picked up on the next reconnect without a daemon
 // restart; CA-only falls back to one-shot server-auth TLS via
-// [btls.FromFiles]. Each binary owns the env-var fallback chain that
+// [reloader.ClientTLS]. Each binary owns the env-var fallback chain that
 // produces these paths — keeping that policy in cmd/ lets daemons
 // share NATS material with other transports without this package
 // having an opinion.
@@ -66,12 +64,12 @@ func NewAuditSink[T any](cfg AuditSinkConfig) (*journal.EncodedSink[T], error) {
 		}
 		return journal.NewJSONSink[T](journal.NoopSink{}), nil
 	}
-	tlsCfg, err := auditTLS(cfg.CertFile, cfg.KeyFile, cfg.CAFile)
+	tlsCfg, err := reloader.ClientTLS(cfg.CertFile, cfg.KeyFile, cfg.CAFile)
 	if err != nil {
 		return nil, fmt.Errorf("nats audit TLS: %w", err)
 	}
 	if cfg.Log != nil {
-		if tlsCfg != nil {
+		if cfg.CertFile != "" && cfg.KeyFile != "" {
 			cfg.Log.Info("audit sink: NATS JetStream with mTLS", "url", cfg.URL)
 		} else {
 			cfg.Log.Warn("audit sink: " + cfg.EnvPrefix + "_CERT not set — connecting without mTLS (not for production)")
@@ -131,7 +129,7 @@ func NewAuditSource(cfg AuditSourceConfig) (journal.Source, error) {
 		}
 		return journal.NoopSource{}, nil
 	}
-	tlsCfg, err := auditTLS(cfg.CertFile, cfg.KeyFile, cfg.CAFile)
+	tlsCfg, err := reloader.ClientTLS(cfg.CertFile, cfg.KeyFile, cfg.CAFile)
 	if err != nil {
 		return nil, fmt.Errorf("nats audit source TLS: %w", err)
 	}
@@ -139,20 +137,4 @@ func NewAuditSource(cfg AuditSourceConfig) (journal.Source, error) {
 		URL: cfg.URL, StreamName: cfg.StreamName, Subject: cfg.Subject,
 		TLS: tlsCfg, Log: cfg.Log,
 	})
-}
-
-// auditTLS builds the NATS connection's TLS config. A full cert+key
-// pair gets a config whose leaf is reloaded from disk on every
-// handshake and whose CA pool is re-read on mtime change — the same
-// contract dialLogNATS gives the log shipper — so both channels
-// survive in-place rotation of the workload cert and the CA bundle.
-// Anything short of a pair falls through to one-shot
-// [btls.FromFiles]: server-auth TLS when only CAFile is set, nil
-// (plaintext) when no material is configured, and the mismatched
-// cert-without-key cases keep FromFiles' fail-closed errors.
-func auditTLS(certFile, keyFile, caFile string) (*tls.Config, error) {
-	if certFile != "" && keyFile != "" {
-		return reloader.ClientConfig(certFile, keyFile, caFile)
-	}
-	return btls.FromFiles(certFile, keyFile, caFile)
 }

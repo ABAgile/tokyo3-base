@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -16,10 +17,9 @@ import (
 type DatabaseConfigOption func(*pgxpool.Config)
 
 var (
-	connStrSanitizer      = regexp.MustCompile(`\b(user|password)=[^\s]+`)
-	multiWhitespaceRegexp = regexp.MustCompile(`\s+`)
-	pgPlaceholderRegexp   = regexp.MustCompile(`\$(\d+)`)
-	byteSliceType         = reflect.TypeFor[[]byte]()
+	connStrFieldRegexp  = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*('(?:\\.|[^'\\])*'|(?:\\.|[^\s'\\])+|)`)
+	pgPlaceholderRegexp = regexp.MustCompile(`\$(\d+)`)
+	byteSliceType       = reflect.TypeFor[[]byte]()
 )
 
 func NewPgxPool(connStr string, opts ...DatabaseConfigOption) (*pgxpool.Pool, error) {
@@ -35,17 +35,64 @@ func NewPgxPool(connStr string, opts ...DatabaseConfigOption) (*pgxpool.Pool, er
 
 func WithDecimalRegister() DatabaseConfigOption {
 	return func(cfg *pgxpool.Config) {
+		previous := cfg.AfterConnect
 		cfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+			if previous != nil {
+				if err := previous(ctx, conn); err != nil {
+					return err
+				}
+			}
 			pgxDecimal.Register(conn.TypeMap())
 			return nil
 		}
 	}
 }
 
+// SantizeDbConn returns a logging-safe connection summary. Only connection
+// routing fields are retained, never credentials or arbitrary parameters.
+// The historical spelling is retained for source compatibility.
 func SantizeDbConn(connStr string) string {
-	cleaned := connStrSanitizer.ReplaceAllString(connStr, "")
-	cleaned = multiWhitespaceRegexp.ReplaceAllString(cleaned, " ")
-	return strings.TrimSpace(cleaned)
+	if strings.Contains(connStr, "://") {
+		u, err := url.Parse(connStr)
+		if err != nil || (u.Scheme != "postgres" && u.Scheme != "postgresql") {
+			return "[invalid database connection string]"
+		}
+		query, err := url.ParseQuery(u.RawQuery)
+		if err != nil {
+			return "[invalid database connection string]"
+		}
+		u.User = nil
+		u.Fragment = ""
+		for key := range query {
+			if !safeConnField(key) {
+				delete(query, key)
+			}
+		}
+		u.RawQuery = query.Encode()
+		u.ForceQuery = false
+		return u.String()
+	}
+	var fields []string
+	for rest := strings.TrimSpace(connStr); rest != ""; {
+		match := connStrFieldRegexp.FindStringSubmatchIndex(rest)
+		if match == nil {
+			return "[invalid database connection string]"
+		}
+		if safeConnField(rest[match[2]:match[3]]) {
+			fields = append(fields, rest[:match[1]])
+		}
+		rest = strings.TrimSpace(rest[match[1]:])
+	}
+	return strings.Join(fields, " ")
+}
+
+func safeConnField(key string) bool {
+	switch strings.ToLower(key) {
+	case "host", "port", "dbname", "sslmode", "application_name", "connect_timeout":
+		return true
+	default:
+		return false
+	}
 }
 
 func ConvertPgPlaceholders(sql string, args ...any) (string, []any, error) {

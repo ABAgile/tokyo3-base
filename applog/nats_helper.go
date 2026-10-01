@@ -129,10 +129,7 @@ func AppLoggerWithNATS(loggerCfg Config, natsCfg NATSConfig, writers ...WriterOp
 		})
 	}
 	log, lv := AppLogger(loggerCfg, allWriters...)
-	subject := "app_log." + loggerCfg.App
-	if loggerCfg.Instance != "" {
-		subject += "." + loggerCfg.Instance
-	}
+	subject := logSubject(loggerCfg)
 	switch {
 	case natsCfg.URL == "":
 		log.Info("operational log shipping skipped", "reason", "no URL configured")
@@ -178,28 +175,16 @@ func dialLogNATS(cfg NATSConfig, opts ...nats.Option) (*nats.Conn, error) {
 	}
 	timing = append(timing, opts...)
 
-	// mTLS path: hand NATS a tls.Config that reloads the leaf on every
-	// handshake and re-reads the CA pool on mtime change, so material
-	// cert-agentd rotates in place is re-read on each reconnect rather
-	// than frozen at dial.
-	// nats.Secure leads the timing opts (empty file args → bnats.Dial
-	// adds no TLS of its own, leaving ours authoritative). Anything
-	// short of a cert+key pair falls through to bnats.Dial's own
-	// handling: server-auth TLS when only CAFile is set, plaintext
-	// when nothing is.
-	var (
-		nc  *nats.Conn
-		err error
-	)
-	if cfg.CertFile != "" && cfg.KeyFile != "" {
-		tlsCfg, terr := reloader.ClientConfig(cfg.CertFile, cfg.KeyFile, cfg.CAFile)
-		if terr != nil {
-			return nil, fmt.Errorf("log shipping: %w", terr)
-		}
-		nc, err = bnats.Dial(cfg.URL, "", "", "", append([]nats.Option{nats.Secure(tlsCfg)}, timing...)...)
-	} else {
-		nc, err = bnats.Dial(cfg.URL, cfg.CertFile, cfg.KeyFile, cfg.CAFile, timing...)
+	// ClientTLS preserves the mTLS reload, static CA-only, plaintext, and
+	// incomplete-pair error cases shared by audit and logging connections.
+	tlsCfg, err := reloader.ClientTLS(cfg.CertFile, cfg.KeyFile, cfg.CAFile)
+	if err != nil {
+		return nil, fmt.Errorf("log shipping: %w", err)
 	}
+	if tlsCfg != nil {
+		timing = append([]nats.Option{nats.Secure(tlsCfg)}, timing...)
+	}
+	nc, err := bnats.Dial(cfg.URL, "", "", "", timing...)
 	if err != nil {
 		return nil, fmt.Errorf("log shipping: %w", err)
 	}

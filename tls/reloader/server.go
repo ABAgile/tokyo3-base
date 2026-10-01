@@ -11,8 +11,9 @@ import (
 // ServerTLSConfig describes the inputs to [ServerTLS].
 type ServerTLSConfig struct {
 	// CertFile and KeyFile are the server leaf cert/key PEM paths. Both
-	// set ⇒ a hot-reloading [CertLoader] serves the cert (mtime-gated, so
-	// a rotation lands within ~1s across handshakes). Both empty ⇒ an
+	// set ⇒ the pair is validated at construction and a hot-reloading
+	// [CertLoader] serves it thereafter (mtime-gated). Failed rotations
+	// keep the previous certificate and log a warning. Both empty ⇒ an
 	// ephemeral self-signed cert is generated (dev only; a warning is
 	// logged). Exactly one set is an error.
 	CertFile string
@@ -52,8 +53,15 @@ func ServerTLS(cfg ServerTLSConfig) (*tls.Config, error) {
 
 	out := &tls.Config{MinVersion: cfg.MinVersion}
 	if cfg.CertFile != "" {
+		loader := NewCertLoader(cfg.CertFile, cfg.KeyFile)
+		if _, err := loader.GetCertificate(nil); err != nil {
+			return nil, fmt.Errorf("server certificate %q: %w", cfg.CertFile, err)
+		}
+		loader.OnError = func(err error) {
+			cfg.Log.Warn("tls: server certificate hot-reload kept previous cert", "cert", cfg.CertFile, "err", err)
+		}
 		cfg.Log.Info("tls: using certificate files (hot-reload enabled)", "cert", cfg.CertFile)
-		out.GetCertificate = NewCertLoader(cfg.CertFile, cfg.KeyFile).GetCertificate
+		out.GetCertificate = loader.GetCertificate
 	} else {
 		cfg.Log.Warn("tls: no certificate configured, using self-signed (not for production)")
 		cert, err := btls.SelfSignedCert()

@@ -1,4 +1,4 @@
-// Package natsutil provides a small dial helper that composes tlsutil + nats.go
+// Package nats provides a small dial helper that composes base/tls + nats.go
 // in the shape three of our internal binaries currently spell out by hand:
 //
 //	tlsCfg, err := tls.FromFiles(certFile, keyFile, caFile)

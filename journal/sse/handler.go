@@ -21,6 +21,7 @@ package sse
 
 import (
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -85,7 +86,8 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	msgs, err := h.Source.Subscribe(r.Context(), replay, startFromSeq)
 	if err != nil {
-		http.Error(w, "subscribe failed: "+err.Error(), http.StatusServiceUnavailable)
+		slog.Default().WarnContext(r.Context(), "journal SSE subscription failed", "err", err)
+		http.Error(w, "subscribe failed", http.StatusServiceUnavailable)
 		return
 	}
 

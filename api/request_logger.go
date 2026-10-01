@@ -167,13 +167,7 @@ func (co *ClientOption) WithRequestLogger(logger *slog.Logger) RestyClientOption
 			}
 			pathParamStr := ""
 			if len(r.PathParams) > 0 {
-				pathParams := make(map[string]string, len(r.PathParams))
-				for key, value := range r.PathParams {
-					if isSensitiveLogField(key) {
-						value = redactedLogValue
-					}
-					pathParams[key] = value
-				}
+				pathParams := sanitizeLogAttrs(r.PathParams)
 				pathParamStr = fmt.Sprintf("%v", pathParams)
 				fullURL += " " + strings.TrimPrefix(pathParamStr, "map")
 			}
