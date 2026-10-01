@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/nats-io/nats.go"
 	"github.com/phuslu/log"
@@ -112,16 +113,47 @@ func WithStdout() WriterOption {
 // Entries are discarded when the 200-entry channel is full.
 func WithAsyncNats(nc *nats.Conn) WriterOption {
 	return func(cfg Config, ws *[]log.Writer) {
-		subject := "app_log." + cfg.App
-		if cfg.Instance != "" {
-			subject += "." + cfg.Instance
-		}
-		*ws = append(*ws, &log.AsyncWriter{
-			ChannelSize:   200,
-			DiscardOnFull: true,
-			Writer:        &log.IOWriter{Writer: &NatsWriter{Nc: nc, Subject: subject}},
-		})
+		*ws = append(*ws, newAsyncNatsWriter(cfg, nc))
 	}
+}
+
+// asyncNatsWriter serializes closing the queue against producers. Logs after
+// Close are discarded rather than panicking on AsyncWriter's closed channel.
+type asyncNatsWriter struct {
+	mu     sync.RWMutex
+	writer *log.AsyncWriter
+	closed bool
+}
+
+func newAsyncNatsWriter(cfg Config, nc *nats.Conn) *asyncNatsWriter {
+	subject := "app_log." + cfg.App
+	if cfg.Instance != "" {
+		subject += "." + cfg.Instance
+	}
+	return &asyncNatsWriter{writer: &log.AsyncWriter{
+		ChannelSize:   200,
+		DiscardOnFull: true,
+		Writer:        &log.IOWriter{Writer: &NatsWriter{Nc: nc, Subject: subject}},
+	}}
+}
+
+func (w *asyncNatsWriter) WriteEntry(e *log.Entry) (int, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.closed {
+		return 0, nil
+	}
+	return w.writer.WriteEntry(e)
+}
+
+func (w *asyncNatsWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return nil
+	}
+	w.closed = true
+	return w.writer.Close()
 }
 
 type NatsWriter struct {

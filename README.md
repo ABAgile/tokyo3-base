@@ -136,7 +136,7 @@ type BearerTokenManager struct { ... }
 type BearerTokenRefresher func(context.Context) (string, time.Time, error)
 ```
 
-Thread-safe token cache with automatic refresh. Calls `Refresher` when the token is within 5 minutes of expiry (default buffer). Override per call via context:
+Thread-safe token cache with automatic refresh. Calls `Refresher` when the token is within 5 minutes of expiry (default buffer). The override is a **signed offset** added to expiry: negative values refresh early, zero refreshes at expiry, and positive values delay refresh past expiry. Override per call via context:
 
 ```go
 tm := &api.BearerTokenManager{
@@ -333,8 +333,12 @@ dial failed →  WARN "operational log shipping skipped"   reason=dial failure  
 dialed      →  INFO "operational log shipping configured" subject=app_log.<App>[.<Instance>]
 ```
 
-The returned drain is always non-nil — safe to defer unconditionally; it's a
-no-op when shipping is disabled.
+The returned drain is always non-nil and idempotent — safe to defer
+unconditionally; it's a no-op when shipping is disabled. Stop producers before
+calling it to retain final logs. It closes and joins the async writer before
+starting the NATS drain, waits for connection closure, and force-closes after
+`DrainTimeout` if the broker does not acknowledge the flush. Subsequent logs to
+that NATS writer are discarded; other configured writers are unaffected.
 
 ```go
 log, _, drain := AppLoggerWithNATS(
@@ -491,7 +495,9 @@ Runs the chosen OAuth flow, persists Config + Tokens, returns the
 fresh `Tokens`. Code flow is the default for desktops with a browser;
 the device flow (`opt.Device = true`) prints a verification URL +
 short code so the user can approve from any other device — required
-on headless hosts (CI runners, containers, jump boxes).
+on headless hosts (CI runners, containers, jump boxes). Device-flow polling
+keeps each request alive through the response-body read and increases the
+polling interval by five seconds for every `slow_down` response (RFC 8628).
 
 ```go
 tokens, err := oidcclient.Login(ctx,
@@ -838,7 +844,9 @@ trusted** (the real client as seen by infrastructure we control) is returned.
 Walking right-to-left and stopping at the first untrusted hop defeats a client
 that pre-seeds `X-Forwarded-For` to spoof its source. With no trusted proxies
 configured, `X-Forwarded-For` is ignored entirely and the peer IP is always
-returned.
+returned. Multiple header lines are combined in wire order before walking the
+chain. A malformed hop encountered during that walk falls back to the peer,
+never to an unvalidated header value.
 
 ```go
 ext := clientip.New(proxies) // proxies from envutil.CIDRList("MYDAEMON_TRUSTED_PROXIES")
@@ -1768,10 +1776,14 @@ not a crash. Consumers depend on the `TokenVerifier` interface, so tests inject
 a stub instead of standing up a real issuer.
 
 `VerifyLogoutToken` validates an [OIDC Back-Channel Logout 1.0](https://openid.net/specs/openid-connect-backchannel-1_0.html)
-`logout_token` over the same JWKS-backed verifier (§2.6: rejects a `nonce`,
-requires the `backchannel-logout` event, requires `jti` and at least one of
-`sub`/`sid`). Pair it with the `SessionID` (`sid`) now surfaced on `Claims` to
-correlate and terminate the right session on a logout callback.
+`logout_token` against the same provider/JWKS, preserving signature, issuer,
+audience, and signing-algorithm checks. It rejects any `nonce` claim (including
+empty or null), requires `iat` within the last five minutes (no future timestamps),
+requires the empty-object `backchannel-logout` event, and requires `jti` and at
+least one of `sub`/`sid`. Unlike ID tokens, `exp` is optional: it and `nbf` are
+validated when present, and `LogoutClaims.ExpiresAt` is zero when `exp` is absent.
+Pair it with the `SessionID` (`sid`) surfaced on `Claims` to correlate and terminate
+the right session on a logout callback.
 
 ```go
 v, err := oidc.NewLazyHTTPVerifier(

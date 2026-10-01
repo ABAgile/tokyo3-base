@@ -3,11 +3,13 @@ package applog
 import (
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	bnats "github.com/abagile/tokyo3-base/nats"
 	"github.com/abagile/tokyo3-base/tls/reloader"
 	"github.com/nats-io/nats.go"
+	"github.com/phuslu/log"
 )
 
 // Default timing knobs for [NATSConfig]. Picked to match the
@@ -94,16 +96,37 @@ type NATSConfig struct {
 //
 // The returned [*slog.LevelVar] controls runtime log-level changes
 // (same as [AppLogger]). The drain callback flushes the async
-// writer and closes the NATS connection; defer it from the caller's
-// run loop so SIGTERM doesn't lose buffered entries. drain is
+// writer and waits for the NATS connection to close, forcing closure after
+// DrainTimeout. Stop producers before draining to retain their final logs;
+// subsequent logs to this NATS writer are discarded. drain is idempotent and
 // always safe to call (no-op when shipping is disabled).
 func AppLoggerWithNATS(loggerCfg Config, natsCfg NATSConfig, writers ...WriterOption) (*slog.Logger, *slog.LevelVar, func()) {
-	nc, dialErr := dialLogNATS(natsCfg)
+	closed := make(chan struct{})
+	nc, dialErr := dialLogNATS(natsCfg, nats.ClosedHandler(func(*nats.Conn) { close(closed) }))
 	drain := func() {}
 	allWriters := writers
 	if nc != nil {
-		drain = func() { _ = nc.Drain() }
-		allWriters = append(append([]WriterOption(nil), writers...), WithAsyncNats(nc))
+		shipper := newAsyncNatsWriter(loggerCfg, nc)
+		allWriters = append(append([]WriterOption(nil), writers...), func(_ Config, ws *[]log.Writer) {
+			*ws = append(*ws, shipper)
+		})
+		drain = sync.OnceFunc(func() {
+			// Publish is buffered/non-blocking: closing the writer first joins
+			// its worker and puts all queued logs into NATS before draining it.
+			_ = shipper.Close()
+			timeout := natsCfg.DrainTimeout
+			if timeout == 0 {
+				timeout = DefaultNATSDrainTimeout
+			}
+			timer := time.NewTimer(timeout)
+			defer timer.Stop()
+			_ = nc.Drain()
+			select {
+			case <-closed:
+			case <-timer.C:
+				nc.Close()
+			}
+		})
 	}
 	log, lv := AppLogger(loggerCfg, allWriters...)
 	subject := "app_log." + loggerCfg.App
@@ -130,7 +153,7 @@ func AppLoggerWithNATS(loggerCfg Config, natsCfg NATSConfig, writers ...WriterOp
 // ssh-tunneld) converged on. Returns (nil, nil) when the URL is
 // empty so callers can use the helper unconditionally and skip
 // wiring NATS only when configured.
-func dialLogNATS(cfg NATSConfig) (*nats.Conn, error) {
+func dialLogNATS(cfg NATSConfig, opts ...nats.Option) (*nats.Conn, error) {
 	if cfg.URL == "" {
 		return nil, nil
 	}
@@ -153,6 +176,7 @@ func dialLogNATS(cfg NATSConfig) (*nats.Conn, error) {
 		nats.MaxReconnects(-1),
 		nats.ReconnectWait(reconnectWait),
 	}
+	timing = append(timing, opts...)
 
 	// mTLS path: hand NATS a tls.Config that reloads the leaf on every
 	// handshake and re-reads the CA pool on mtime change, so material

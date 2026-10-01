@@ -8,6 +8,10 @@ import (
 
 const tokenRefreshBufferKey contextKey = "tokenRefreshBuffer"
 
+// WithTokenRefreshBuffer overrides the signed offset added to the token's
+// expiry when deciding to refresh. Negative values refresh early (e.g. -10m);
+// zero refreshes at expiry, and positive values delay refresh past expiry.
+// The default offset is -5m.
 func WithTokenRefreshBuffer(ctx context.Context, value time.Duration) context.Context {
 	return context.WithValue(ctx, tokenRefreshBufferKey, value)
 }
@@ -28,8 +32,9 @@ func (tm *BearerTokenManager) GetToken(ctx context.Context) (string, error) {
 	}
 	tm.RLock()
 	if time.Now().Before(tm.ExpiresAt.Add(bufferDuration)) {
+		token := tm.Token
 		tm.RUnlock()
-		return tm.Token, nil
+		return token, nil
 	}
 	tm.RUnlock()
 

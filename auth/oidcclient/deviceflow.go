@@ -112,12 +112,16 @@ func RunDeviceFlow(ctx context.Context, issuer, clientID string, stderr io.Write
 		pollReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		pollReq.Header.Set("Accept", "application/json")
 		pollResp, err := http.DefaultClient.Do(pollReq)
-		pollCancel()
 		if err != nil {
+			pollCancel()
 			return nil, fmt.Errorf("token poll: %w", err)
 		}
-		pollBody, _ := io.ReadAll(io.LimitReader(pollResp.Body, 64*1024))
+		pollBody, err := io.ReadAll(io.LimitReader(pollResp.Body, 64*1024))
 		pollResp.Body.Close()
+		pollCancel()
+		if err != nil {
+			return nil, fmt.Errorf("read token poll response: %w", err)
+		}
 
 		if pollResp.StatusCode == http.StatusOK {
 			var raw struct {
@@ -151,7 +155,7 @@ func RunDeviceFlow(ctx context.Context, issuer, clientID string, stderr io.Write
 		case "authorization_pending":
 			continue
 		case "slow_down":
-			interval += time.Duration(authz.Interval) * time.Second
+			interval += 5 * time.Second // RFC 8628 §3.5: add five seconds on every slow_down.
 			continue
 		case "access_denied":
 			return nil, errors.New("authorization denied by user")

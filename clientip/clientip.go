@@ -41,20 +41,24 @@ func New(trustedProxies []*net.IPNet) *Extractor {
 // FromRequest returns the real client IP for r as a bare host without a port:
 // the immediate TCP peer, or — when that peer is a trusted proxy — the
 // rightmost X-Forwarded-For hop that is not itself trusted. When r.RemoteAddr
-// carries no port it is returned verbatim.
+// carries no port it is returned verbatim. All X-Forwarded-For header lines
+// are treated as one list; a malformed hop falls back to the immediate peer.
 func (e *Extractor) FromRequest(r *http.Request) string {
 	peer := hostOnly(r.RemoteAddr)
 	if len(e.trusted) == 0 || !e.isTrusted(peer) {
 		return peer
 	}
-	xff := r.Header.Get("X-Forwarded-For")
+	xff := strings.Join(r.Header.Values("X-Forwarded-For"), ",")
 	if xff == "" {
 		return peer
 	}
 	parts := strings.Split(xff, ",")
 	for _, part := range slices.Backward(parts) {
 		ip := strings.TrimSpace(part)
-		if ip != "" && !e.isTrusted(ip) {
+		if net.ParseIP(ip) == nil {
+			return peer
+		}
+		if !e.isTrusted(ip) {
 			return ip
 		}
 	}

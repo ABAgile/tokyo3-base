@@ -13,6 +13,7 @@ package oidc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -61,10 +62,11 @@ type TokenVerifier interface {
 // single (issuer, audience) pair; create a separate instance per IdP cluster
 // the service should trust.
 type HTTPVerifier struct {
-	verifier *goidc.IDTokenVerifier
-	endpoint oauth2.Endpoint
-	issuer   string
-	audience string
+	verifier       *goidc.IDTokenVerifier
+	logoutVerifier *goidc.IDTokenVerifier
+	endpoint       oauth2.Endpoint
+	issuer         string
+	audience       string
 }
 
 // NewHTTPVerifier discovers issuer's OIDC metadata, fetches its JWKS, and
@@ -90,8 +92,14 @@ func NewHTTPVerifier(ctx context.Context, issuer, audience string) (*HTTPVerifie
 	if err != nil {
 		return nil, fmt.Errorf("discover OIDC provider %q: %w", issuer, err)
 	}
-	v := provider.Verifier(&goidc.Config{ClientID: audience})
-	return &HTTPVerifier{verifier: v, endpoint: provider.Endpoint(), issuer: issuer, audience: audience}, nil
+	return &HTTPVerifier{
+		verifier: provider.Verifier(&goidc.Config{ClientID: audience}),
+		// Logout tokens need not have exp. Only temporal checks are replaced
+		// below; signature, issuer, audience, and signing algorithms stay on
+		// the same provider/JWKS as ID-token verification.
+		logoutVerifier: provider.Verifier(&goidc.Config{ClientID: audience, SkipExpiryCheck: true}),
+		endpoint:       provider.Endpoint(), issuer: issuer, audience: audience,
+	}, nil
 }
 
 // Verify satisfies [TokenVerifier]. Returns the underlying go-oidc errors;
@@ -142,29 +150,59 @@ type LogoutClaims struct {
 	ExpiresAt time.Time
 }
 
+const logoutTokenMaxAge = 5 * time.Minute
+
 // VerifyLogoutToken validates an OIDC Back-Channel Logout 1.0 logout_token
-// per §2.6 using the same JWKS-backed verifier configured for ID tokens.
+// per §2.6 using the same provider/JWKS as ID tokens. iat is required and
+// must be no more than five minutes old or in the future. exp and nbf are
+// validated when present; ExpiresAt is zero when exp is absent.
 func (v *HTTPVerifier) VerifyLogoutToken(ctx context.Context, raw string) (*LogoutClaims, error) {
-	tok, err := v.verifier.Verify(ctx, raw)
+	tok, err := v.logoutVerifier.Verify(ctx, raw)
 	if err != nil {
 		return nil, fmt.Errorf("verify logout token: %w", err)
 	}
 	var body struct {
 		SID    string                    `json:"sid"`
-		Nonce  string                    `json:"nonce"`
+		Nonce  json.RawMessage           `json:"nonce"`
 		JTI    string                    `json:"jti"`
-		IAT    int64                     `json:"iat"`
-		Exp    int64                     `json:"exp"`
+		IAT    *int64                    `json:"iat"`
+		Exp    json.RawMessage           `json:"exp"`
+		NBF    json.RawMessage           `json:"nbf"`
 		Events map[string]map[string]any `json:"events"`
 	}
 	if err := tok.Claims(&body); err != nil {
 		return nil, fmt.Errorf("decode logout claims: %w", err)
 	}
-	if body.Nonce != "" {
+	if len(body.Nonce) != 0 {
 		return nil, fmt.Errorf("logout_token has nonce claim (forbidden by spec §2.6)")
 	}
-	if _, ok := body.Events["http://schemas.openid.net/event/backchannel-logout"]; !ok {
+	if body.IAT == nil {
+		return nil, errors.New("logout_token missing iat")
+	}
+	now := time.Now()
+	issuedAt := time.Unix(*body.IAT, 0).UTC()
+	if issuedAt.After(now) || now.Sub(issuedAt) > logoutTokenMaxAge {
+		return nil, errors.New("logout_token iat is in the future or too old")
+	}
+	var expiresAt time.Time
+	if len(body.Exp) != 0 {
+		expiresAt, err = logoutNumericDate(body.Exp)
+		if err != nil || !expiresAt.After(now) {
+			return nil, errors.New("logout_token exp is invalid or expired")
+		}
+	}
+	if len(body.NBF) != 0 {
+		notBefore, err := logoutNumericDate(body.NBF)
+		if err != nil || notBefore.After(now) {
+			return nil, errors.New("logout_token nbf is invalid or in the future")
+		}
+	}
+	event, ok := body.Events["http://schemas.openid.net/event/backchannel-logout"]
+	if !ok {
 		return nil, fmt.Errorf("logout_token missing backchannel-logout event")
+	}
+	if event == nil || len(event) != 0 {
+		return nil, errors.New("logout_token backchannel-logout event must be an empty object")
 	}
 	if tok.Subject == "" && body.SID == "" {
 		return nil, fmt.Errorf("logout_token missing both sub and sid claims")
@@ -177,9 +215,20 @@ func (v *HTTPVerifier) VerifyLogoutToken(ctx context.Context, raw string) (*Logo
 		Subject:   tok.Subject,
 		SessionID: body.SID,
 		JTI:       body.JTI,
-		IssuedAt:  time.Unix(body.IAT, 0).UTC(),
-		ExpiresAt: time.Unix(body.Exp, 0).UTC(),
+		IssuedAt:  issuedAt,
+		ExpiresAt: expiresAt,
 	}, nil
+}
+
+func logoutNumericDate(raw json.RawMessage) (time.Time, error) {
+	var seconds *int64
+	if err := json.Unmarshal(raw, &seconds); err != nil {
+		return time.Time{}, err
+	}
+	if seconds == nil {
+		return time.Time{}, errors.New("null numeric date")
+	}
+	return time.Unix(*seconds, 0).UTC(), nil
 }
 
 // Issuer and Audience expose the configured pair so callers can include them
