@@ -83,7 +83,12 @@ Executes a request and unmarshals the response body into `result` on success. Re
 `NewRestClient` wraps the transport configured by its options to cap error-body
 reads at 64 KiB before Resty buffers/logs them, including after gzip decoding.
 Success bodies are not capped. Configure custom transports/TLS through the
-constructor options; replacing the embedded client's transport later bypasses
+constructor options (any `func(*resty.Client)` works, e.g.
+`func(c *resty.Client) { c.SetTLSClientConfig(cfg) }`); they run before the
+limiter wraps the transport. Resty's transport setters (`SetTLSClientConfig`,
+`SetProxy`, `SetCertificates`, `SetRootCertificate*`) require a bare
+`*http.Transport`, so calling them on the client after construction is ignored
+(Resty logs an error). Replacing the embedded client's transport later bypasses
 the read limit, although `ApiError.Body` is still truncated to 64 KiB.
 
 ```go
@@ -968,23 +973,27 @@ newWrapped, _ := bcrypto.Rewrap(ctx, kp, newKP, wrappedDEK)
 ```go
 type KeyProviderCache struct { /* ... */ }
 
-func NewKeyProviderCache(master KeyProvider, ttl time.Duration) *KeyProviderCache
+func NewKeyProviderCache(rootKP KeyProvider, ttl time.Duration) *KeyProviderCache
 func (c *KeyProviderCache) ForKey(ctx context.Context, keyID string, wrappedKey []byte) (KeyProvider, error)
 func (c *KeyProviderCache) Invalidate(keyID string)
 ```
 
-For deployments with a tree of envelope keys — the master wraps N
+For deployments with a tree of envelope keys — the root wraps N
 intermediate keys, each of which wraps many DEKs — `KeyProviderCache`
 unwraps each intermediate at most once per `ttl` and hands the resulting
 KeyProvider out for subsequent operations. Concurrent cold misses for
-the same `keyID` are coalesced into one `master.Unwrap` via
+the same `keyID` and wrapped bytes are coalesced into one `rootKP.Unwrap` via
 `golang.org/x/sync/singleflight`, so a thundering herd at startup or
-post-TTL costs one master call, not N. Pass `nil` as `wrappedKey` to get
-the master back directly — handy for callers that mix migrated and
-unmigrated rows.
+post-TTL costs one root call, not N. A cached key is bound to the wrapped bytes
+it was unwrapped from: a different `wrappedKey` for the same `keyID` is a
+miss, so an unwrap in flight during `Invalidate` (e.g. a rotation) can never
+be served to callers holding the new wrapped key. Expired keys are dropped
+whenever another key is cached; a non-positive `ttl` disables caching. Pass
+`nil` as `wrappedKey` to get the root back directly — handy for callers that
+mix migrated and unmigrated rows.
 
 ```go
-cache := bcrypto.NewKeyProviderCache(masterKP, 5*time.Minute)
+cache := bcrypto.NewKeyProviderCache(rootKP, 5*time.Minute)
 
 // On every secret operation: cheap cache hit after the first call per key.
 kp, err := cache.ForKey(ctx, projectID, wrappedProjectKey)

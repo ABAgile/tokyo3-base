@@ -1,6 +1,7 @@
 package crypto
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"sync"
@@ -161,5 +162,109 @@ func TestKeyProviderCache_SingleflightDedupe(t *testing.T) {
 
 	if got := master.calls.Load(); got != 1 {
 		t.Errorf("expected exactly 1 Unwrap call from %d concurrent misses, got %d", concurrency, got)
+	}
+}
+
+// blockingMaster blocks its first Unwrap until release is closed, returning
+// the wrapped bytes as the plaintext key so tests can tell which input won.
+type blockingMaster struct {
+	calls            atomic.Int32
+	entered, release chan struct{}
+}
+
+func (m *blockingMaster) Wrap(_ context.Context, b []byte) ([]byte, error) { return b, nil }
+func (m *blockingMaster) Unwrap(_ context.Context, b []byte) ([]byte, error) {
+	if m.calls.Add(1) == 1 {
+		close(m.entered)
+		<-m.release
+	}
+	return b, nil
+}
+
+// TestKeyProviderCache_StaleUnwrapDoesNotServeNewMaterial: an unwrap of the old
+// wrapped key that is still running when the key is rotated and invalidated
+// must not be served to callers holding the new wrapped key.
+func TestKeyProviderCache_StaleUnwrapDoesNotServeNewMaterial(t *testing.T) {
+	master := &blockingMaster{entered: make(chan struct{}), release: make(chan struct{})}
+	cache := NewKeyProviderCache(master, time.Hour)
+	ctx := context.Background()
+	oldKey, newKey := makeTestKey(1), makeTestKey(2)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = cache.ForKey(ctx, "id", oldKey)
+	}()
+	<-master.entered
+	cache.Invalidate("id") // rotation committed while the old unwrap is running
+
+	kp, err := cache.ForKey(ctx, "id", newKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(kp.(*LocalKeyProvider).masterKey, newKey) {
+		t.Fatal("new material was served the old key")
+	}
+	close(master.release)
+	<-done // stale unwrap finishes and stores its result
+
+	kp, err = cache.ForKey(ctx, "id", newKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(kp.(*LocalKeyProvider).masterKey, newKey) {
+		t.Fatal("stale unwrap repopulated the cache with the old key")
+	}
+}
+
+// TestKeyProviderCache_ChangedMaterialMisses: different wrapped bytes for the
+// same id are never answered from the cache.
+func TestKeyProviderCache_ChangedMaterialMisses(t *testing.T) {
+	master := &blockingMaster{entered: make(chan struct{}), release: make(chan struct{})}
+	close(master.release)
+	cache := NewKeyProviderCache(master, time.Hour)
+	ctx := context.Background()
+
+	a, _ := cache.ForKey(ctx, "id", makeTestKey(1))
+	b, err := cache.ForKey(ctx, "id", makeTestKey(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a == b || !bytes.Equal(b.(*LocalKeyProvider).masterKey, makeTestKey(2)) {
+		t.Fatal("changed wrapped material was served from cache")
+	}
+}
+
+// TestKeyProviderCache_ExpiredEntriesAreSwept: expired entries for other ids
+// are dropped when a new entry is stored, and ttl <= 0 retains nothing.
+func TestKeyProviderCache_ExpiredEntriesAreSwept(t *testing.T) {
+	master := NewLocalKeyProvider(makeTestKey(1))
+	cache := NewKeyProviderCache(master, 20*time.Millisecond)
+	ctx := context.Background()
+	wrapped, _ := master.Wrap(ctx, makeTestKey(5))
+
+	if _, err := cache.ForKey(ctx, "a", wrapped); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(40 * time.Millisecond)
+	if _, err := cache.ForKey(ctx, "b", wrapped); err != nil {
+		t.Fatal(err)
+	}
+	cache.mu.RLock()
+	_, stale := cache.entries["a"]
+	n := len(cache.entries)
+	cache.mu.RUnlock()
+	if stale || n != 1 {
+		t.Fatalf("expired entry retained: stale=%v entries=%d", stale, n)
+	}
+
+	for _, ttl := range []time.Duration{0, -time.Second} {
+		c := NewKeyProviderCache(master, ttl)
+		if _, err := c.ForKey(ctx, "id", wrapped); err != nil {
+			t.Fatal(err)
+		}
+		if len(c.entries) != 0 {
+			t.Fatalf("ttl %v retained an entry", ttl)
+		}
 	}
 }
