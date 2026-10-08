@@ -38,6 +38,10 @@ const DefaultReplay = 100
 // while not flooding the connection.
 const DefaultHeartbeat = 30 * time.Second
 
+// DefaultWriteTimeout bounds each write+flush to a client when
+// Handler.WriteTimeout is zero.
+const DefaultWriteTimeout = 10 * time.Second
+
 // Handler streams journal.Msg records to a browser as Server-Sent Events.
 // Zero values for Replay and Heartbeat fall back to DefaultReplay /
 // DefaultHeartbeat. A nil Source panics on first request — wire one
@@ -57,20 +61,32 @@ type Handler struct {
 	// reconnect after a non-200 response, so size the caps above what a
 	// client legitimately needs.
 	Limits *Limits
+	// WriteTimeout bounds each write (event or heartbeat) to the client, so a
+	// reader that stops draining its socket cannot hold a stream and its
+	// transport consumer open forever. Zero ⇒ [DefaultWriteTimeout]; negative
+	// disables the per-write deadline. Only effective when the underlying
+	// ResponseWriter supports write deadlines (net/http's does, including
+	// through wrappers that implement Unwrap).
+	WriteTimeout time.Duration
+	// Log receives refusals and subscription failures. nil ⇒ slog.Default().
+	Log *slog.Logger
 }
 
 // ServeHTTP implements http.Handler. Returns 500 if the response writer
 // doesn't support flushing, 503 if the Source rejects the subscription,
 // otherwise streams until the client disconnects.
 func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	if _, ok := w.(http.Flusher); !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
+	log := h.Log
+	if log == nil {
+		log = slog.Default()
+	}
 	release, scope, ok := h.Limits.acquire(r)
 	if !ok {
-		slog.Default().WarnContext(r.Context(), "journal SSE stream refused: limit reached", "scope", string(scope), "path", r.URL.Path)
+		log.WarnContext(r.Context(), "journal SSE stream refused: limit reached", "scope", string(scope), "path", r.URL.Path)
 		h.Limits.reject(w)
 		return
 	}
@@ -105,12 +121,39 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	msgs, err := h.Source.Subscribe(r.Context(), replay, startFromSeq)
 	if err != nil {
-		slog.Default().WarnContext(r.Context(), "journal SSE subscription failed", "err", err)
+		log.WarnContext(r.Context(), "journal SSE subscription failed", "err", err)
 		http.Error(w, "subscribe failed", http.StatusServiceUnavailable)
 		return
 	}
 
-	flusher.Flush() // emit headers immediately so the client knows we're alive
+	writeTimeout := h.WriteTimeout
+	if writeTimeout == 0 {
+		writeTimeout = DefaultWriteTimeout
+	}
+	rc := http.NewResponseController(w)
+	// arm sets a fresh write deadline; call it before each write, since a
+	// large event can block on the socket before the flush. The deadline is
+	// best-effort: ErrNotSupported just leaves the write unbounded.
+	arm := func() {
+		if writeTimeout > 0 {
+			_ = rc.SetWriteDeadline(time.Now().Add(writeTimeout))
+		}
+	}
+	// flush pushes buffered output to the client; an error means the client
+	// is gone or too slow and the stream must end.
+	flush := func() error {
+		arm()
+		return rc.Flush()
+	}
+
+	// Leave a fresh deadline in place on the way out: the last armed one has
+	// usually expired by now, which would make net/http fail to write the
+	// response terminator and drop a connection that could be reused.
+	defer arm()
+
+	if err := flush(); err != nil { // emit headers immediately so the client knows we're alive
+		return
+	}
 
 	var ticker *time.Ticker
 	var tickC <-chan time.Time
@@ -128,18 +171,24 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-tickC:
 			// SSE comment line — clients ignore it; proxies see traffic.
+			arm()
 			if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
 				return
 			}
-			flusher.Flush()
+			if err := flush(); err != nil {
+				return
+			}
 		case m, ok := <-msgs:
 			if !ok {
 				return
 			}
+			arm()
 			if err := writeSSEEvent(w, m); err != nil {
 				return
 			}
-			flusher.Flush()
+			if err := flush(); err != nil {
+				return
+			}
 		}
 	}
 }
