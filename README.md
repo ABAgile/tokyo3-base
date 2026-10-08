@@ -1119,7 +1119,7 @@ sql, args, err := ConvertPgPlaceholders(
 // args → []any{userID, status}
 ```
 
-Returns an error if a placeholder index is out of range or malformed. Positional args may be repeated (`$1` used twice maps the same argument into both positions).
+Text that only looks like a placeholder is left alone: single-quoted strings, quoted identifiers, `--` and `/* */` comments, and dollar-quoted bodies (`$$…$$`, `$tag$…$tag$`). (`E'…'` backslash escapes are not interpreted.) Returns an error if a placeholder index is out of range or malformed. Positional args may be repeated (`$1` used twice maps the same argument into both positions).
 
 ### Struct copy with dereferencing
 
@@ -1303,19 +1303,22 @@ defer guard.Close(sink)
 import "github.com/abagile/tokyo3-base/httpauth"
 
 type BasicAuthConfig struct {
-    Username string  // empty (either field) ⇒ gate disabled
+    Username string  // both empty ⇒ gate disabled; exactly one set ⇒ misconfigured
     Password string
     Realm    string  // WWW-Authenticate realm; empty ⇒ "restricted"
 }
 
 func (c BasicAuthConfig) Enabled() bool
+func (c BasicAuthConfig) Validate() error // error when exactly one credential is set
 func BasicAuth(cfg BasicAuthConfig, next http.Handler, exempt ...string) http.Handler
 ```
 
-The HTTP Basic gate the daemons' admin portals share. When either credential
-is empty the gate is disabled and `next` is served unguarded — operators
+The HTTP Basic gate the daemons' admin portals share. When both credentials
+are empty the gate is disabled and `next` is served unguarded — operators
 front the service with oauth2-proxy, an mTLS reverse proxy, or another
-identity-aware edge instead. When enabled, each request is constant-time
+identity-aware edge instead. Setting exactly one (e.g. a missing password env
+var) is a misconfiguration: call `Validate()` at startup to fail fast;
+`BasicAuth` itself fails closed, answering every non-exempt request `503`. When enabled, each request is constant-time
 compared against the configured credentials (a sha256 digest of each side, so
 an attacker's guess length doesn't leak). Paths in `exempt` (exact match)
 bypass the gate — pass `"/healthz"` so external watchdogs can probe without
@@ -1616,7 +1619,8 @@ URL empty returns a typed sink wrapping `journal.NoopSink` — safe to
 `Append` against; drops every entry. `NewAuditSource` mirrors the
 shape for the read side and returns `journal.NoopSource{}` when URL
 is empty (downstream UI renders empty, mirroring the no-broker
-dev story).
+dev story). Set `AuditSinkConfig.Required` to turn an empty URL into an
+error so a production daemon can't boot with audit silently disabled.
 
 With a full cert+key pair, the connection's TLS config reloads the
 leaf from disk on every handshake and re-reads the CA pool when its
@@ -1685,6 +1689,7 @@ type TrackerConfig[T any] struct {
     Less   func(a, b T) bool   // optional: newest-first comparator ⇒ sorted; nil ⇒ arrival order
     Max    int                 // ring cap; 0 ⇒ DefaultTrackerSize (500)
     Label  string              // optional, for the "subscribed" log line
+    ResubscribeWait time.Duration // >0 ⇒ resubscribe (from last Seq) after the source drops; 0 ⇒ Run returns nil on close
     Log    *slog.Logger
 }
 
@@ -2289,7 +2294,9 @@ doesn't silently disable trust.
 
 `VerifyPeerChain` runs chain + hostname verification of a peer against a
 root pool (roots as anchors, intermediates from the rest of the peer
-chain, SNI as the DNS name). Standalone it's a one-shot check; it's also
+chain, SNI as the DNS name). An empty server name is an error — x509 would
+otherwise skip hostname verification — so dial IP literals with
+`reloader.WithServerName` set to a name on the cert. Standalone it's a one-shot check; it's also
 the verification primitive the hot-reload loaders in `tls/reloader` pair
 with `InsecureSkipVerify` to verify against a live, swappable pool.
 
