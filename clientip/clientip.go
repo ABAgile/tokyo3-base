@@ -68,6 +68,20 @@ func (e *Extractor) FromRequest(r *http.Request) string {
 	return peer
 }
 
+// HasTrustedProxies reports whether any trusted proxy CIDR is configured. A
+// nil Extractor has none.
+func (e *Extractor) HasTrustedProxies() bool {
+	return e != nil && len(e.trusted) > 0
+}
+
+// IsTrustedPeer reports whether r's immediate TCP peer is a configured
+// trusted proxy — the same test [Extractor.FromRequest] applies before it
+// believes X-Forwarded-For, for callers that need to apply it to other
+// forwarded headers (e.g. X-Forwarded-Proto). False for a nil Extractor.
+func (e *Extractor) IsTrustedPeer(r *http.Request) bool {
+	return e.HasTrustedProxies() && e.isTrusted(canonical(hostOnly(r.RemoteAddr)))
+}
+
 func (e *Extractor) isTrusted(ip string) bool {
 	parsed := net.ParseIP(ip)
 	if parsed == nil {

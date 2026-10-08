@@ -2129,7 +2129,9 @@ sealed into a cookie, for some TTL"; `session` and `oidc` each compose one
 for their own payload type.
 
 Cookies are HttpOnly, SameSite=Lax, and Secure when the request arrived over
-HTTPS — including behind a TLS-terminating proxy (`X-Forwarded-Proto`).
+HTTPS — including behind a TLS-terminating proxy (`X-Forwarded-Proto`). Set
+`Cookie.Proxies` (a `*clientip.Extractor`) to honor that header only from
+trusted proxy peers; unset, it is believed from any peer.
 `ttl <= 0` sets no Expires/Max-Age (a browser-session cookie). `Read` returns
 one uniform error whether the cookie is absent, malformed, or fails to open,
 so callers treat "no valid value" as a single case.
@@ -2163,6 +2165,7 @@ type Config struct {
     BasePath       string        // browser-visible mount prefix under StripPrefix
     IdleTimeout    time.Duration // > 0 ⇒ sliding idle expiry, capped at AbsoluteExpiry
     TrustedOrigins *[]string     // non-nil ⇒ Origin/Sec-Fetch-Site verification on
+    TrustedProxies []*net.IPNet  // peers allowed to vouch for TLS via X-Forwarded-Proto (empty ⇒ any)
     Now            func() time.Time
     Log            *slog.Logger
 }

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/abagile/tokyo3-base/clientip"
 	"github.com/abagile/tokyo3-base/crypto"
 )
 
@@ -24,6 +25,14 @@ type Cookie struct {
 	Name string           // cookie name
 	Path string           // cookie Path scope
 	Now  func() time.Time // nil ⇒ time.Now
+
+	// Proxies, when it has trusted proxies configured, restricts which peers
+	// may vouch for TLS via X-Forwarded-Proto when deciding the Secure flag —
+	// the same trust model clientip applies to X-Forwarded-For. nil, or an
+	// Extractor with no trusted proxies, keeps the legacy behaviour: the
+	// header is believed from any peer. Direct TLS (r.TLS) always marks the
+	// cookie Secure.
+	Proxies *clientip.Extractor
 }
 
 func (c Cookie) now() time.Time {
@@ -46,7 +55,7 @@ func (c Cookie) Set(w http.ResponseWriter, r *http.Request, v any, ttl time.Dura
 		Value:    sealed,
 		Path:     c.Path,
 		HttpOnly: true,
-		Secure:   isHTTPS(r),
+		Secure:   c.isHTTPS(r),
 		SameSite: http.SameSiteLaxMode,
 	}
 	if ttl > 0 {
@@ -64,7 +73,7 @@ func (c Cookie) Clear(w http.ResponseWriter, r *http.Request) {
 		Value:    "",
 		Path:     c.Path,
 		HttpOnly: true,
-		Secure:   isHTTPS(r),
+		Secure:   c.isHTTPS(r),
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 	})
@@ -139,6 +148,16 @@ func open(key []byte, val string, dst any, aad []byte) error {
 // (a common deployment shape: traefik/nginx/an ALB terminates TLS at the
 // edge), r.TLS is nil even though the browser-facing connection is
 // genuinely HTTPS, which would incorrectly mark the cookie non-Secure.
-func isHTTPS(r *http.Request) bool {
-	return r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
+//
+// When [Cookie.Proxies] lists trusted proxies, X-Forwarded-Proto is honoured
+// only from those peers, so a client can't assert it itself. Without a list
+// it is honoured from any peer (legacy behaviour).
+func (c Cookie) isHTTPS(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	if r.Header.Get("X-Forwarded-Proto") != "https" {
+		return false
+	}
+	return !c.Proxies.HasTrustedProxies() || c.Proxies.IsTrustedPeer(r)
 }

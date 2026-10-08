@@ -94,3 +94,20 @@ func TestFromRequest(t *testing.T) {
 		})
 	}
 }
+
+func TestIsTrustedPeer(t *testing.T) {
+	e := clientip.New([]*net.IPNet{mustCIDR(t, "10.0.0.0/8")})
+	if !e.HasTrustedProxies() || !e.IsTrustedPeer(req("10.0.0.5:80", "")) {
+		t.Error("10.0.0.5 should be a trusted peer")
+	}
+	if e.IsTrustedPeer(req("203.0.113.9:80", "10.0.0.5")) {
+		t.Error("untrusted peer must not be trusted even if XFF names a proxy")
+	}
+	var nilE *clientip.Extractor
+	if nilE.HasTrustedProxies() || nilE.IsTrustedPeer(req("10.0.0.5:80", "")) {
+		t.Error("nil extractor trusts nothing")
+	}
+	if clientip.New(nil).HasTrustedProxies() {
+		t.Error("empty extractor has no trusted proxies")
+	}
+}

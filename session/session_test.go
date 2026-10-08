@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/abagile/tokyo3-base/csrf"
+	"github.com/abagile/tokyo3-base/sealedcookie"
+	"net"
 )
 
 var testKey = bytes.Repeat([]byte{0x42}, 32)
@@ -815,5 +817,24 @@ func TestSiblingCookie_NotInterchangeableWithSession(t *testing.T) {
 	r.AddCookie(&http.Cookie{Name: m.cookie.Name, Value: sealedFlow})
 	if _, ok := m.readSession(r); ok {
 		t.Error("flow cookie value accepted as a session")
+	}
+}
+
+func TestTrustedProxies_GovernForwardedProtoForSessionAndSiblingCookies(t *testing.T) {
+	_, cidr, _ := net.ParseCIDR("10.0.0.0/8")
+	m := testManager(t, func(c *Config) { c.TrustedProxies = []*net.IPNet{cidr} })
+	for name, ck := range map[string]sealedcookie.Cookie{"session": m.cookie, "sibling": m.SiblingCookie("flow")} {
+		for remote, want := range map[string]bool{"10.0.0.5:1": true, "203.0.113.9:1": false} {
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
+			r.RemoteAddr = remote
+			r.Header.Set("X-Forwarded-Proto", "https")
+			w := httptest.NewRecorder()
+			if err := ck.Set(w, r, "v", time.Hour); err != nil {
+				t.Fatal(err)
+			}
+			if got := w.Result().Cookies()[0].Secure; got != want {
+				t.Errorf("%s cookie from %s: Secure = %v, want %v", name, remote, got, want)
+			}
+		}
 	}
 }

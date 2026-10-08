@@ -3,10 +3,13 @@ package sealedcookie
 import (
 	"bytes"
 	"crypto/tls"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/abagile/tokyo3-base/clientip"
 )
 
 var testKey = bytes.Repeat([]byte{0x42}, 32)
@@ -116,6 +119,7 @@ func TestSealOpen_RoundTripAndTamper(t *testing.T) {
 }
 
 func TestIsHTTPS(t *testing.T) {
+	isHTTPS := Cookie{}.isHTTPS // no Proxies: legacy behaviour
 	plain := httptest.NewRequest(http.MethodGet, "/", nil)
 	if isHTTPS(plain) {
 		t.Error("plain request reported as HTTPS")
@@ -209,5 +213,52 @@ func TestCookie_SealIsBoundToName(t *testing.T) {
 	plain, _ := Seal(key, map[string]string{"k": "v"})
 	if err := a.Open(plain, &got); err == nil {
 		t.Fatal("unbound value opened as a named cookie")
+	}
+}
+
+func TestCookie_SecureFlagTrustsForwardedProtoPerProxies(t *testing.T) {
+	_, trusted, _ := net.ParseCIDR("10.0.0.0/8")
+	withList := clientip.New([]*net.IPNet{trusted})
+
+	tests := []struct {
+		name    string
+		proxies *clientip.Extractor
+		remote  string
+		xfp     string
+		tls     bool
+		want    bool
+	}{
+		{"legacy: no extractor honours XFP", nil, "203.0.113.9:1", "https", false, true},
+		{"legacy: empty list honours XFP", clientip.New(nil), "203.0.113.9:1", "https", false, true},
+		{"trusted peer XFP https", withList, "10.0.0.5:1", "https", false, true},
+		{"untrusted peer cannot assert XFP", withList, "203.0.113.9:1", "https", false, false},
+		{"trusted peer XFP http", withList, "10.0.0.5:1", "http", false, false},
+		{"no XFP", withList, "10.0.0.5:1", "", false, false},
+		{"direct TLS always secure", withList, "203.0.113.9:1", "", true, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := Cookie{Key: testKey, Name: "c", Path: "/", Proxies: tt.proxies}
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
+			r.RemoteAddr = tt.remote
+			if tt.xfp != "" {
+				r.Header.Set("X-Forwarded-Proto", tt.xfp)
+			}
+			if tt.tls {
+				r.TLS = &tls.ConnectionState{}
+			}
+			w := httptest.NewRecorder()
+			if err := c.Set(w, r, "v", time.Hour); err != nil {
+				t.Fatal(err)
+			}
+			if got := w.Result().Cookies()[0].Secure; got != tt.want {
+				t.Errorf("Set Secure = %v, want %v", got, tt.want)
+			}
+			w = httptest.NewRecorder()
+			c.Clear(w, r)
+			if got := w.Result().Cookies()[0].Secure; got != tt.want {
+				t.Errorf("Clear Secure = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }

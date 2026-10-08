@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"path"
@@ -22,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/abagile/tokyo3-base/clientip"
 	"github.com/abagile/tokyo3-base/csrf"
 	"github.com/abagile/tokyo3-base/sealedcookie"
 )
@@ -155,6 +157,12 @@ type Config struct {
 	// CSRF token remains the layer that must hold on its own.
 	TrustedOrigins *[]string
 
+	// TrustedProxies are reverse-proxy CIDRs allowed to vouch for TLS via
+	// X-Forwarded-Proto when the session (and sibling) cookies' Secure flag is
+	// decided — pass the same list given to clientip/ratelimit. Empty ⇒
+	// X-Forwarded-Proto is believed from any peer (legacy behaviour).
+	TrustedProxies []*net.IPNet
+
 	Now func() time.Time // injectable clock; nil ⇒ time.Now
 	Log *slog.Logger     // nil ⇒ slog.Default
 }
@@ -162,9 +170,10 @@ type Config struct {
 // Manager owns the sealed session cookie: issuance, the access gate,
 // CSRF tokens, and (optionally) Origin verification. Build with [New].
 type Manager struct {
-	cfg    Config
-	cookie sealedcookie.Cookie
-	exempt map[string]struct{}
+	cfg     Config
+	cookie  sealedcookie.Cookie
+	proxies *clientip.Extractor
+	exempt  map[string]struct{}
 	// originCheck is nil unless Config.TrustedOrigins is set.
 	originCheck *http.CrossOriginProtection
 }
@@ -200,14 +209,16 @@ func New(cfg Config) (*Manager, error) {
 		return nil, errors.New("session: BasePath must start with '/'")
 	}
 	m := &Manager{
-		cfg:    cfg,
-		exempt: make(map[string]struct{}),
+		cfg:     cfg,
+		proxies: clientip.New(cfg.TrustedProxies),
+		exempt:  make(map[string]struct{}),
 	}
 	m.cookie = sealedcookie.Cookie{
-		Key:  cfg.SessionKey,
-		Name: cfg.CookiePrefix + "_session",
-		Path: m.cookiePath(),
-		Now:  cfg.Now,
+		Key:     cfg.SessionKey,
+		Name:    cfg.CookiePrefix + "_session",
+		Path:    m.cookiePath(),
+		Now:     cfg.Now,
+		Proxies: m.proxies,
 	}
 	for _, p := range append([]string{cfg.LoginPath, cfg.LogoutPath}, cfg.ExemptPaths...) {
 		m.exempt[p] = struct{}{}
@@ -368,10 +379,11 @@ func (m *Manager) Gate(next http.Handler) http.Handler {
 // duplicating SessionKey/CookiePrefix/Now into the caller's own config.
 func (m *Manager) SiblingCookie(suffix string) sealedcookie.Cookie {
 	return sealedcookie.Cookie{
-		Key:  m.cfg.SessionKey,
-		Name: m.cfg.CookiePrefix + "_" + suffix,
-		Path: m.cookiePath(),
-		Now:  m.cfg.Now,
+		Key:     m.cfg.SessionKey,
+		Name:    m.cfg.CookiePrefix + "_" + suffix,
+		Path:    m.cookiePath(),
+		Now:     m.cfg.Now,
+		Proxies: m.proxies,
 	}
 }
 
