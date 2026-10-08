@@ -63,3 +63,32 @@ func TestBasicAuth_ExemptPathBypasses(t *testing.T) {
 		t.Fatalf("exempt path should bypass gate; got %d", rec.Code)
 	}
 }
+
+func TestBasicAuth_HalfConfiguredFailsClosed(t *testing.T) {
+	for _, cfg := range []httpauth.BasicAuthConfig{
+		{Username: "admin"},
+		{Password: "s3cret"},
+	} {
+		if cfg.Validate() == nil {
+			t.Errorf("Validate(%+v) = nil, want error", cfg)
+		}
+		h := httpauth.BasicAuth(cfg, okHandler(), "/healthz")
+
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/secret", nil))
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("%+v: half-configured gate served %d, want 503", cfg, rec.Code)
+		}
+
+		rec = httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+		if rec.Code != http.StatusTeapot {
+			t.Errorf("%+v: exempt path got %d, want it served", cfg, rec.Code)
+		}
+	}
+	for _, cfg := range []httpauth.BasicAuthConfig{{}, {Username: "a", Password: "b"}} {
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("Validate(%+v) = %v, want nil", cfg, err)
+		}
+	}
+}

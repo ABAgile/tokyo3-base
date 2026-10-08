@@ -6,18 +6,22 @@ package httpauth
 import (
 	"crypto/sha256"
 	"crypto/subtle"
+	"errors"
 	"net/http"
+	"slices"
 )
 
-// BasicAuthConfig wires the optional HTTP Basic auth gate. When either
-// credential is empty the gate is disabled and the wrapped handler is served
+// BasicAuthConfig wires the optional HTTP Basic auth gate. When BOTH
+// credentials are empty the gate is disabled and the wrapped handler is served
 // unguarded — operators front the service with oauth2-proxy, an mTLS reverse
-// proxy, or another identity-aware edge instead.
+// proxy, or another identity-aware edge instead. Setting exactly one is a
+// misconfiguration (e.g. a missing password env var): [BasicAuthConfig.Validate]
+// reports it and [BasicAuth] fails closed rather than serve unguarded.
 type BasicAuthConfig struct {
-	// Username is the only accepted login. Empty disables the gate.
+	// Username is the only accepted login.
 	Username string
 
-	// Password is the corresponding secret. Empty disables the gate.
+	// Password is the corresponding secret.
 	Password string
 
 	// Realm is sent in the WWW-Authenticate header on rejection. Empty ⇒
@@ -25,15 +29,27 @@ type BasicAuthConfig struct {
 	Realm string
 }
 
-// Enabled reports whether the gate is configured. False when either
-// credential is empty so an accidental half-config doesn't silently lock
-// everyone out.
+// Enabled reports whether the gate is configured: both credentials set. A
+// half-configured gate is not enabled but is invalid — see
+// [BasicAuthConfig.Validate].
 func (c BasicAuthConfig) Enabled() bool {
 	return c.Username != "" && c.Password != ""
 }
 
+// Validate returns an error when exactly one of Username and Password is set.
+// Call it at startup to fail fast on a half-configured gate instead of
+// silently serving the portal unauthenticated.
+func (c BasicAuthConfig) Validate() error {
+	if (c.Username == "") != (c.Password == "") {
+		return errors.New("httpauth: basic auth username and password must be set together")
+	}
+	return nil
+}
+
 // BasicAuth wraps next with an HTTP Basic gate. When the config is disabled
-// it returns next unchanged. When enabled, every request must present the
+// it returns next unchanged. A half-configured gate (see
+// [BasicAuthConfig.Validate]) fails closed: every non-exempt request is
+// answered 503. When enabled, every request must present the
 // configured Username + Password — constant-time compared on a sha256 digest
 // of each side, so equal-length inputs reach subtle.ConstantTimeCompare
 // regardless of attacker guess length.
@@ -41,6 +57,15 @@ func (c BasicAuthConfig) Enabled() bool {
 // Paths in exempt (exact match) bypass the gate — pass "/healthz" so external
 // watchdogs can probe without sharing the admin credentials.
 func BasicAuth(cfg BasicAuthConfig, next http.Handler, exempt ...string) http.Handler {
+	if cfg.Validate() != nil {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if slices.Contains(exempt, r.URL.Path) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			http.Error(w, "authentication misconfigured", http.StatusServiceUnavailable)
+		})
+	}
 	if !cfg.Enabled() {
 		return next
 	}
