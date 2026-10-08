@@ -465,12 +465,23 @@ func TestEnsureFreshTokens_UnboundCacheRequiresMatchingConfig(t *testing.T) {
 	if hits != 0 {
 		t.Fatalf("refresh token was sent to the token endpoint %d times, want 0", hits)
 	}
-	// A still-valid unbound token is returned without any refresh.
+	// A still-valid unbound token is not returned for an issuer config.json
+	// doesn't name, either.
 	if err := oidcclient.SaveTokens(&oidcclient.Tokens{AccessToken: "ok", Expiration: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := oidcclient.EnsureFreshTokens(t.Context(), cfg, 30*time.Second); err == nil {
+		t.Fatalf("valid unbound token for an unrelated issuer was returned: %+v", got)
+	}
+	// Once config.json vouches for the issuer, it is returned without any refresh.
+	if err := oidcclient.SaveConfig(cfg); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := oidcclient.EnsureFreshTokens(t.Context(), cfg, 30*time.Second); err != nil || got.AccessToken != "ok" {
 		t.Fatalf("valid unbound token = %+v, %v", got, err)
+	}
+	if hits != 0 {
+		t.Fatalf("token endpoint hit %d times, want 0", hits)
 	}
 }
 

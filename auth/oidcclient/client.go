@@ -279,16 +279,6 @@ func EnsureFreshTokens(ctx context.Context, cfg Config, accessSkew time.Duration
 	if time.Until(tokens.Expiration) >= accessSkew {
 		return tokens, nil
 	}
-	// A cache that was never bound to an issuer/client (written by SaveTokens,
-	// or before binding existed) can't be shown to belong to cfg by itself;
-	// sending its refresh token to cfg's issuer could hand it to the wrong
-	// party. Fall back to the config.json recorded at login: it must name the
-	// same issuer/client. The refresh below then binds the cache.
-	if cached.Config == nil {
-		if saved, err := LoadConfig(); err != nil || *saved != cfg {
-			return nil, errors.New("SSO cache is not bound to this issuer/client; run login again")
-		}
-	}
 	if tokens.RefreshToken == "" {
 		return nil, errors.New("access token expired and no refresh token is cached (run login again)")
 	}
@@ -310,15 +300,27 @@ func EnsureFreshTokens(ctx context.Context, cfg Config, accessSkew time.Duration
 	return fresh, nil
 }
 
-// loadMatchingTokens loads the cached tokens and rejects a cache bound to a
-// different issuer/client than cfg.
+// loadMatchingTokens loads the cached tokens and rejects a cache that is bound
+// to a different issuer/client than cfg.
+//
+// A cache that was never bound (written by SaveTokens, or before binding
+// existed) can't be shown to belong to cfg by itself: returning its access
+// token, or sending its refresh token to cfg's issuer, could hand credentials
+// to the wrong party. Fall back to the config.json recorded at login, which
+// must name the same issuer/client. A refresh then binds the cache.
 func loadMatchingTokens(cfg Config) (*cachedTokens, error) {
 	cached, err := loadCachedTokens()
 	if err != nil {
 		return nil, err
 	}
-	if cached.Config != nil && *cached.Config != cfg {
-		return nil, errors.New("SSO cache issuer/client mismatch; run login again")
+	if cached.Config != nil {
+		if *cached.Config != cfg {
+			return nil, errors.New("SSO cache issuer/client mismatch; run login again")
+		}
+		return cached, nil
+	}
+	if saved, err := LoadConfig(); err != nil || *saved != cfg {
+		return nil, errors.New("SSO cache is not bound to this issuer/client; run login again")
 	}
 	return cached, nil
 }

@@ -595,7 +595,9 @@ value is retained. Failed OAuth flows do not change either cache file. Login
 and refresh store an issuer/client binding inside `tokens.json`; mismatched
 configuration is rejected before returning tokens or contacting an issuer.
 This also fails closed if updating `config.json` after token persistence fails.
-Legacy unbound cache files remain readable and acquire a binding on refresh.
+Legacy or `SaveTokens`-written unbound cache files are only used (returned or
+refreshed) when `config.json` names the same issuer/client; a refresh then
+binds them.
 
 ```go
 cfg, err := oidcclient.LoadConfig()      // run-login prompt if missing
