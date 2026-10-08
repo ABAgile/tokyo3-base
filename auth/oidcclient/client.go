@@ -353,10 +353,29 @@ func PostTokenAt(ctx context.Context, tokenURL string, form url.Values) (*Tokens
 		return nil, err
 	}
 	if status != http.StatusOK {
-		return nil, fmt.Errorf("token endpoint %d: %s", status, strings.TrimSpace(string(body)))
+		return nil, fmt.Errorf("token endpoint %d: %s", status, errorBodyText(body))
 	}
 	return parseTokens(body)
 }
+
+// maxErrorBody caps how much of an IdP error body is echoed into an error.
+const maxErrorBody = 512
+
+// errorBodyText renders an IdP error body for an error message, bounded to
+// maxErrorBody bytes.
+func errorBodyText(body []byte) string {
+	msg := strings.TrimSpace(string(body))
+	if len(msg) > maxErrorBody {
+		msg = msg[:maxErrorBody] + "…"
+	}
+	return msg
+}
+
+// defaultTokenTTL is the access-token lifetime assumed when the response omits
+// expires_in (optional per RFC 6749 §5.1). Zero would mark the token already
+// expired and force a refresh — burning the rotating refresh token — on every
+// use.
+const defaultTokenTTL = time.Hour
 
 // noRedirectClient is used for credential-bearing POSTs: a redirect would
 // replay the form (codes, refresh tokens, device codes) to another URL.
@@ -426,11 +445,15 @@ func parseTokens(body []byte) (*Tokens, error) {
 	if raw.AccessToken == "" {
 		return nil, errors.New("token endpoint returned no access_token")
 	}
+	ttl := time.Duration(raw.ExpiresIn) * time.Second
+	if ttl <= 0 {
+		ttl = defaultTokenTTL
+	}
 	return &Tokens{
 		AccessToken:  raw.AccessToken,
 		RefreshToken: raw.RefreshToken,
 		IDToken:      raw.IDToken,
-		Expiration:   time.Now().Add(time.Duration(raw.ExpiresIn) * time.Second),
+		Expiration:   time.Now().Add(ttl),
 	}, nil
 }
 

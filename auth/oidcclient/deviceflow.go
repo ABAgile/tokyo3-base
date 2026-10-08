@@ -43,7 +43,7 @@ func RunDeviceFlow(ctx context.Context, issuer, clientID string, stderr io.Write
 		return nil, fmt.Errorf("device_authorization: %w", err)
 	}
 	if status != http.StatusOK {
-		return nil, fmt.Errorf("device_authorization %d: %s", status, strings.TrimSpace(string(body)))
+		return nil, fmt.Errorf("device_authorization %d: %s", status, errorBodyText(body))
 	}
 	var authz struct {
 		DeviceCode              string `json:"device_code"`
