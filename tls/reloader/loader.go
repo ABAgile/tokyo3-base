@@ -42,6 +42,21 @@ type CertLoader struct {
 	cert       *tls.Certificate
 	modTime    time.Time // cert file mtime at the last successful load
 	keyModTime time.Time // key file mtime at the last successful load
+
+	// failCertM/failKeyM are the mtimes of the last pair that failed to load
+	// while a previous cert was kept, so the same bad pair isn't re-parsed
+	// (and re-logged) on every handshake until a file changes again.
+	failCertM, failKeyM time.Time
+}
+
+// settledLocked reports whether the files are unchanged since the last load
+// attempt (successful, or failed with a previous cert kept). Caller holds c.mu.
+func (c *CertLoader) settledLocked(certM, keyM time.Time, statOK bool) bool {
+	if c.cert == nil || !statOK {
+		return false
+	}
+	return certM.Equal(c.modTime) && keyM.Equal(c.keyModTime) ||
+		certM.Equal(c.failCertM) && keyM.Equal(c.failKeyM)
 }
 
 // NewCertLoader creates a CertLoader. The cert/key are loaded lazily on first
@@ -73,8 +88,7 @@ func (c *CertLoader) current() (*tls.Certificate, error) {
 	certM, keyM, statOK := c.mtimes()
 
 	c.mu.RLock()
-	upToDate := c.cert != nil && statOK && certM.Equal(c.modTime) && keyM.Equal(c.keyModTime)
-	if upToDate {
+	if c.settledLocked(certM, keyM, statOK) {
 		cert := c.cert
 		c.mu.RUnlock()
 		return cert, nil
@@ -123,7 +137,7 @@ func (c *CertLoader) reload(forced bool) (*tls.Certificate, error) {
 
 	c.mu.Lock()
 	// Double-check under write lock.
-	if !forced && c.cert != nil && statOK && certM.Equal(c.modTime) && keyM.Equal(c.keyModTime) {
+	if !forced && c.settledLocked(certM, keyM, statOK) {
 		cert := c.cert
 		c.mu.Unlock()
 		return cert, nil
@@ -131,6 +145,9 @@ func (c *CertLoader) reload(forced bool) (*tls.Certificate, error) {
 	newCert, err := tls.LoadX509KeyPair(c.certFile, c.keyFile)
 	if err != nil {
 		prev := c.cert
+		if prev != nil && statOK {
+			c.failCertM, c.failKeyM = certM, keyM
+		}
 		c.mu.Unlock()
 		err = fmt.Errorf("load cert pair: %w", err)
 		if prev != nil && !forced && c.OnError != nil {
@@ -179,6 +196,10 @@ type CALoader struct {
 	mu      sync.RWMutex
 	pool    *x509.CertPool
 	modTime time.Time
+	// failModTime is the mtime of the last bundle that failed to load while a
+	// previous pool was kept; it stops the same bad file being re-parsed and
+	// re-logged on every call.
+	failModTime time.Time
 }
 
 // NewCALoader creates a CALoader. The bundle is loaded lazily on
@@ -186,6 +207,13 @@ type CALoader struct {
 // or malformed file.
 func NewCALoader(caFile string) *CALoader {
 	return &CALoader{caFile: caFile}
+}
+
+// settledLocked reports whether the file is unchanged since the last load
+// attempt (successful, or failed with a previous pool kept). Caller holds l.mu.
+func (l *CALoader) settledLocked(mtime time.Time, statErr error) bool {
+	return l.pool != nil && statErr == nil &&
+		(mtime.Equal(l.modTime) || mtime.Equal(l.failModTime))
 }
 
 // Pool returns the loaded CA pool, re-reading the file when its
@@ -201,8 +229,7 @@ func (l *CALoader) Pool() (*x509.CertPool, error) {
 	}
 
 	l.mu.RLock()
-	upToDate := l.pool != nil && statErr == nil && mtime.Equal(l.modTime)
-	if upToDate {
+	if l.settledLocked(mtime, statErr) {
 		pool := l.pool
 		l.mu.RUnlock()
 		return pool, nil
@@ -211,7 +238,7 @@ func (l *CALoader) Pool() (*x509.CertPool, error) {
 
 	l.mu.Lock()
 	// Double-check under write lock.
-	if l.pool != nil && statErr == nil && mtime.Equal(l.modTime) {
+	if l.settledLocked(mtime, statErr) {
 		pool := l.pool
 		l.mu.Unlock()
 		return pool, nil
@@ -230,6 +257,9 @@ func (l *CALoader) Pool() (*x509.CertPool, error) {
 	if err != nil {
 		// Keep the previous pool live across a failed reload.
 		prev := l.pool
+		if prev != nil && statErr == nil {
+			l.failModTime = mtime
+		}
 		l.mu.Unlock()
 		if prev != nil {
 			if l.OnError != nil {

@@ -282,12 +282,18 @@ func TestRunPoll_RefreshesCABundleOnMtimeChange(t *testing.T) {
 	writePEMCertKey(t, certPath, keyPath, "client", 1)
 	writePEMCertKey(t, caPath, filepath.Join(dir, "ca-key.pem"), "ca-old", 100)
 
+	buf := &syncBuffer{}
 	r, err := reloader.New(reloader.Config{
 		CertPath: certPath, KeyPath: keyPath,
 		Pools: map[string]string{"ca": caPath},
+		Log:   slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelInfo})),
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
+	}
+	const reloaded = `"CA bundle reloaded"`
+	if n := strings.Count(buf.String(), reloaded); n != 1 {
+		t.Fatalf("initial load logged %d times, want 1:\n%s", n, buf.String())
 	}
 
 	// Overwrite the bundle, advance mtime explicitly so the
@@ -301,18 +307,39 @@ func TestRunPoll_RefreshesCABundleOnMtimeChange(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- r.RunPoll(ctx, 20*time.Millisecond) }()
-	// Give the poll a couple of ticks.
-	time.Sleep(120 * time.Millisecond)
+
+	// The poll's own probe must swap in the new bundle (a second reload line)
+	// with no handshake involved.
+	deadline := time.Now().Add(2 * time.Second)
+	for strings.Count(buf.String(), reloaded) < 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
 	cancel()
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Errorf("RunPoll err = %v, want context.Canceled", err)
 	}
+	if n := strings.Count(buf.String(), reloaded); n != 2 {
+		t.Fatalf("RunPoll did not reload the changed bundle (reload lines = %d):\n%s", n, buf.String())
+	}
+}
 
-	// Verify the new bundle is now in effect by attempting to verify
-	// a peer cert that chains to ca-new — easiest done indirectly
-	// through TLSConfig + a fake server, but here we just confirm the
-	// reload happened by reading the log buffer in the next test.
-	// This test only asserts no error came out.
+// syncBuffer is a bytes.Buffer safe for a logger writing from RunPoll's
+// goroutine while the test reads it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // ── RunPoll: cert mtime polling (PollCert=true) ───────────────────────────────

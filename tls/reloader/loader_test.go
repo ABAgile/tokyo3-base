@@ -735,3 +735,42 @@ func TestCALoader_WireClientCAs_FiresHookOnInitialLoad(t *testing.T) {
 		t.Errorf("cfg not fully wired: auth=%v clientCAs=%v getCfg=%v", cfg.ClientAuth, cfg.ClientCAs != nil, cfg.GetConfigForClient != nil)
 	}
 }
+
+// A bad pair must be reported once, not on every handshake until a file changes.
+func TestCertLoader_FailedReloadNotRetriedUntilFilesChange(t *testing.T) {
+	certFile, keyFile, _ := writeCertKeyFiles(t)
+	loader := reloader.NewCertLoader(certFile, keyFile)
+	var errs int
+	loader.OnError = func(error) { errs++ }
+	if _, err := loader.GetCertificate(&tls.ClientHelloInfo{}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(keyFile, []byte("not a key"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(certFile, future, future); err != nil {
+		t.Fatal(err)
+	}
+	for range 5 {
+		if _, err := loader.GetCertificate(&tls.ClientHelloInfo{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if errs != 1 {
+		t.Fatalf("OnError called %d times, want 1", errs)
+	}
+
+	// A further change to the files triggers a fresh attempt.
+	later := future.Add(2 * time.Second)
+	if err := os.Chtimes(keyFile, later, later); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loader.GetCertificate(&tls.ClientHelloInfo{}); err != nil {
+		t.Fatal(err)
+	}
+	if errs != 2 {
+		t.Fatalf("OnError called %d times after files changed, want 2", errs)
+	}
+}
