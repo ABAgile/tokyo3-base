@@ -61,12 +61,12 @@ func TestBearerToken_ExpiredFailureIsReturnedAndBacksOff(t *testing.T) {
 	}
 
 	// Once the pause has elapsed the refresher runs again and can recover.
-	tm.Lock()
+	tm.mu.Lock()
 	tm.nextAttempt = time.Now().Add(-time.Second)
 	tm.Refresher = func(context.Context) (string, time.Time, error) {
 		return "new", time.Now().Add(time.Hour), nil
 	}
-	tm.Unlock()
+	tm.mu.Unlock()
 	if tok, err := tm.GetToken(context.Background()); err != nil || tok != "new" {
 		t.Fatalf("after backoff GetToken = %q, %v", tok, err)
 	}

@@ -42,7 +42,11 @@ const (
 // short, bounded interval, so a broken token endpoint is not hit on every
 // request.
 type BearerTokenManager struct {
-	sync.RWMutex
+	mu sync.RWMutex // guards every field below, exported or not
+
+	// Token and ExpiresAt seed the cache; set them only before the first
+	// GetToken call. A seeded Token needs a non-zero ExpiresAt: the zero
+	// time counts as already expired.
 	Token     string
 	ExpiresAt time.Time
 	Refresher BearerTokenRefresher
@@ -53,7 +57,7 @@ type BearerTokenManager struct {
 	// released, so keep it quick.
 	OnRefreshError func(err error, tokenStillValid bool)
 
-	inflight    *refreshCall  // guarded by the embedded lock
+	inflight    *refreshCall  // guarded by mu
 	nextAttempt time.Time     // earliest next Refresher call after a failure
 	lifetime    time.Duration // lifetime of the token the last successful refresh returned; 0 if unknown
 	lastErr     error         // most recent refresh failure; cleared on success
@@ -85,18 +89,18 @@ func (tm *BearerTokenManager) GetToken(ctx context.Context) (string, error) {
 	if !ok {
 		bufferDuration = -5 * time.Minute // default to refresh token 5 mins before expiry
 	}
-	tm.RLock()
+	tm.mu.RLock()
 	if tm.fresh(bufferDuration) {
 		token := tm.Token
-		tm.RUnlock()
+		tm.mu.RUnlock()
 		return token, nil
 	}
-	tm.RUnlock()
+	tm.mu.RUnlock()
 
-	tm.Lock()
+	tm.mu.Lock()
 	if tm.fresh(bufferDuration) {
 		token := tm.Token
-		tm.Unlock()
+		tm.mu.Unlock()
 		return token, nil
 	}
 	now := time.Now()
@@ -109,11 +113,11 @@ func (tm *BearerTokenManager) GetToken(ctx context.Context) (string, error) {
 	case call != nil:
 		// Another caller is already refreshing.
 		if usable {
-			tm.Unlock()
+			tm.mu.Unlock()
 			return stale, nil
 		}
 	case tm.Refresher == nil:
-		tm.Unlock()
+		tm.mu.Unlock()
 		if usable {
 			return stale, nil
 		}
@@ -121,7 +125,7 @@ func (tm *BearerTokenManager) GetToken(ctx context.Context) (string, error) {
 	case now.Before(tm.nextAttempt):
 		// Backing off after a failed refresh.
 		lastErr := tm.lastErr
-		tm.Unlock()
+		tm.mu.Unlock()
 		if usable {
 			return stale, nil
 		}
@@ -132,7 +136,7 @@ func (tm *BearerTokenManager) GetToken(ctx context.Context) (string, error) {
 		leader = true
 	}
 	refresher := tm.Refresher
-	tm.Unlock()
+	tm.mu.Unlock()
 
 	if leader {
 		go tm.runRefresh(context.WithoutCancel(ctx), call, refresher)
@@ -149,8 +153,8 @@ func (tm *BearerTokenManager) GetToken(ctx context.Context) (string, error) {
 		}
 		return "", call.err
 	}
-	tm.RLock()
-	defer tm.RUnlock()
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
 	return tm.Token, nil
 }
 
@@ -172,7 +176,7 @@ func (tm *BearerTokenManager) runRefresh(ctx context.Context, call *refreshCall,
 		err = errors.New("api: bearer token refresher returned an empty token")
 	}
 
-	tm.Lock()
+	tm.mu.Lock()
 	now := time.Now()
 	if err == nil {
 		tm.Token, tm.ExpiresAt = token, expiresAt
@@ -187,7 +191,7 @@ func (tm *BearerTokenManager) runRefresh(ctx context.Context, call *refreshCall,
 	onErr := tm.OnRefreshError
 	tm.inflight = nil
 	call.err = err
-	tm.Unlock()
+	tm.mu.Unlock()
 
 	// Report before releasing waiters so the callback has completed by the time
 	// the triggering GetToken returns. It must therefore be quick (log, count).
