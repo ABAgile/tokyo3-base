@@ -185,3 +185,10 @@ func (r *recordingCloser) Close() error {
 	r.closed = true
 	return nil
 }
+
+func TestNilLoggerStillRecovers(t *testing.T) {
+	done := make(chan struct{})
+	Guarded(nil, "w", func() { defer close(done); panic("boom") })()
+	<-done
+	Tick(nil, "w", func() { panic("boom") })
+}

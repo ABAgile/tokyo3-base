@@ -23,6 +23,9 @@ import (
 // [sync.WaitGroup.Go] (so a recovered goroutine can also be joined at shutdown)
 // or golang.org/x/sync/errgroup. When you just need fire-and-forget, use [Go].
 func Guarded(log *slog.Logger, name string, fn func()) func() {
+	if log == nil {
+		log = slog.Default() // a nil logger would panic inside the recover handler
+	}
 	return func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -55,6 +58,9 @@ func Go(log *slog.Logger, name string, fn func()) {
 // goroutine level would kill the loop; recovering per-tick keeps it alive).
 // Pair it with Go for the outer backstop.
 func Tick(log *slog.Logger, name string, fn func()) {
+	if log == nil {
+		log = slog.Default()
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			log.Error("tick panic recovered — loop continues",
