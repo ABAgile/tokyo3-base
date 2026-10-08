@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"os"
 	"runtime"
 	"runtime/pprof"
 	"runtime/trace"
@@ -82,12 +81,13 @@ func Start(ctx context.Context, cfg Config) {
 }
 
 // Handler returns the diagnostics mux (profiles under /debug/pprof/),
-// built from runtime/pprof + runtime/trace. Exported so callers can mount
+// built from runtime/pprof + runtime/trace. It deliberately omits
+// net/http/pprof's /cmdline, which would expose process arguments (and any
+// secrets passed as flags). Exported so callers can mount
 // it on an existing admin server instead of using a dedicated listener.
 func Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/debug/pprof/", profileIndex)
-	mux.HandleFunc("/debug/pprof/cmdline", cmdline)
 	mux.HandleFunc("/debug/pprof/profile", cpuProfile)
 	mux.HandleFunc("/debug/pprof/trace", traceProfile)
 	return mux
@@ -123,11 +123,6 @@ func profileIndex(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	}
 	_ = p.WriteTo(w, dbg)
-}
-
-func cmdline(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	fmt.Fprint(w, strings.Join(os.Args, "\x00"))
 }
 
 func cpuProfile(w http.ResponseWriter, r *http.Request) {

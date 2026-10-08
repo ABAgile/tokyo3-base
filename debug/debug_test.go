@@ -43,8 +43,9 @@ func TestHandlerProfiles(t *testing.T) {
 	if code, _ := get(t, srv, "/debug/pprof/nope"); code != http.StatusNotFound {
 		t.Fatalf("unknown profile: want 404, got %d", code)
 	}
-	if code, body := get(t, srv, "/debug/pprof/cmdline"); code != http.StatusOK || body == "" {
-		t.Fatalf("cmdline: code=%d body=%q", code, body)
+	// /cmdline would leak process arguments (and any secrets in them).
+	if code, _ := get(t, srv, "/debug/pprof/cmdline"); code != http.StatusNotFound {
+		t.Fatalf("cmdline: want 404, got %d", code)
 	}
 }
 
