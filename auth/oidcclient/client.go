@@ -279,6 +279,16 @@ func EnsureFreshTokens(ctx context.Context, cfg Config, accessSkew time.Duration
 	if time.Until(tokens.Expiration) >= accessSkew {
 		return tokens, nil
 	}
+	// A cache that was never bound to an issuer/client (written by SaveTokens,
+	// or before binding existed) can't be shown to belong to cfg by itself;
+	// sending its refresh token to cfg's issuer could hand it to the wrong
+	// party. Fall back to the config.json recorded at login: it must name the
+	// same issuer/client. The refresh below then binds the cache.
+	if cached.Config == nil {
+		if saved, err := LoadConfig(); err != nil || *saved != cfg {
+			return nil, errors.New("SSO cache is not bound to this issuer/client; run login again")
+		}
+	}
 	if tokens.RefreshToken == "" {
 		return nil, errors.New("access token expired and no refresh token is cached (run login again)")
 	}
@@ -500,7 +510,9 @@ type IDTokenSubjectClaims struct {
 // re-typing flags.
 //
 // extras may be either absolute paths or paths relative to CacheDir.
-// Missing files are not errors (best-effort cleanup).
+// A relative path must stay inside CacheDir (no "..", and not "." itself);
+// offenders are skipped and reported in the returned error. Missing files
+// are not errors (best-effort cleanup).
 func Logout(extras ...string) error {
 	dir, err := CacheDir()
 	if err != nil {
@@ -515,16 +527,27 @@ func Logout(extras ...string) error {
 		defer unlock()
 	}
 	_ = os.Remove(filepath.Join(dir, "tokens.json"))
+	var escaped []string
 	for _, p := range extras {
 		if !filepath.IsAbs(p) {
+			if !filepath.IsLocal(p) || filepath.Clean(p) == "." {
+				// ".." (or "." / empty) would delete outside, or all of, the
+				// cache dir; only absolute paths may leave it.
+				escaped = append(escaped, p)
+				continue
+			}
 			p = filepath.Join(dir, p)
 		}
 		_ = os.RemoveAll(p)
 	}
-	if lockErr != nil {
-		return fmt.Errorf("cache removed without the refresh lock; a concurrent refresh may have restored tokens: %w", lockErr)
+	var errs []error
+	if len(escaped) > 0 {
+		errs = append(errs, fmt.Errorf("refused to remove relative paths outside the cache dir: %q", escaped))
 	}
-	return nil
+	if lockErr != nil {
+		errs = append(errs, fmt.Errorf("cache removed without the refresh lock; a concurrent refresh may have restored tokens: %w", lockErr))
+	}
+	return errors.Join(errs...)
 }
 
 // logoutLockTimeout bounds how long Logout waits for an in-flight refresh.

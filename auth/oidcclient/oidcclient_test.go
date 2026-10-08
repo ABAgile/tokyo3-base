@@ -429,3 +429,83 @@ func TestWriteFileAtomic_SetsModeAndContent(t *testing.T) {
 		t.Errorf("content = %q", got)
 	}
 }
+
+// An unbound cache (SaveTokens, no issuer binding) must not have its refresh
+// token sent to an issuer that config.json doesn't vouch for.
+func TestEnsureFreshTokens_UnboundCacheRequiresMatchingConfig(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", tmp)
+	t.Setenv("HOME", tmp)
+
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		_, _ = w.Write([]byte(`{"access_token":"new","expires_in":3600}`))
+	}))
+	defer srv.Close()
+
+	if err := oidcclient.SaveTokens(&oidcclient.Tokens{
+		AccessToken: "old", RefreshToken: "rt", Expiration: time.Now().Add(-time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := oidcclient.Config{Issuer: srv.URL, ClientID: "c"}
+
+	// No config.json at all.
+	if _, err := oidcclient.EnsureFreshTokens(t.Context(), cfg, 30*time.Second); err == nil {
+		t.Fatal("refresh with no config.json should be refused")
+	}
+	// config.json names a different issuer.
+	if err := oidcclient.SaveConfig(oidcclient.Config{Issuer: "https://other.example", ClientID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := oidcclient.EnsureFreshTokens(t.Context(), cfg, 30*time.Second); err == nil {
+		t.Fatal("refresh against an issuer config.json doesn't name should be refused")
+	}
+	if hits != 0 {
+		t.Fatalf("refresh token was sent to the token endpoint %d times, want 0", hits)
+	}
+	// A still-valid unbound token is returned without any refresh.
+	if err := oidcclient.SaveTokens(&oidcclient.Tokens{AccessToken: "ok", Expiration: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := oidcclient.EnsureFreshTokens(t.Context(), cfg, 30*time.Second); err != nil || got.AccessToken != "ok" {
+		t.Fatalf("valid unbound token = %+v, %v", got, err)
+	}
+}
+
+func TestLogout_RefusesRelativeExtrasOutsideCacheDir(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", tmp)
+	t.Setenv("HOME", tmp)
+
+	dir, err := oidcclient.CacheDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := oidcclient.SaveConfig(oidcclient.Config{Issuer: "i", ClientID: "c"}); err != nil {
+		t.Fatal(err)
+	}
+	victim := filepath.Join(tmp, "victim")
+	if err := os.MkdirAll(victim, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sub := filepath.Join(dir, "sub")
+	if err := os.MkdirAll(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	err = oidcclient.Logout("../victim", ".", "sub")
+	if err == nil {
+		t.Fatal("Logout should report the refused paths")
+	}
+	if _, statErr := os.Stat(victim); statErr != nil {
+		t.Errorf("path outside the cache dir was removed: %v", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "config.json")); statErr != nil {
+		t.Errorf(`"." must not wipe the cache dir: %v`, statErr)
+	}
+	if _, statErr := os.Stat(sub); !os.IsNotExist(statErr) {
+		t.Errorf("valid extra should still be removed, err=%v", statErr)
+	}
+}
