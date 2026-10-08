@@ -279,6 +279,9 @@ func EnsureFreshTokens(ctx context.Context, cfg Config, accessSkew time.Duration
 	if time.Until(tokens.Expiration) >= accessSkew {
 		return tokens, nil
 	}
+	if tokens.RefreshToken == "" {
+		return nil, errors.New("access token expired and no refresh token is cached (run login again)")
+	}
 	fresh, err := Refresh(ctx, cfg.Issuer, cfg.ClientID, tokens.RefreshToken)
 	if err != nil {
 		return nil, fmt.Errorf("refresh token failed: %w (run login again)", err)

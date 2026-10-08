@@ -39,3 +39,15 @@ func TestPostTokenAt_TruncatesErrorBody(t *testing.T) {
 		t.Fatalf("error is %d bytes, want it bounded", len(err.Error()))
 	}
 }
+
+func TestEnsureFreshTokens_ExpiredWithoutRefreshTokenAsksForLogin(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	cfg := Config{Issuer: "https://idp.example", ClientID: "c"}
+	if err := saveTokens(&Tokens{AccessToken: "at", Expiration: time.Now().Add(-time.Hour)}, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	_, err := EnsureFreshTokens(t.Context(), cfg, time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "run login again") {
+		t.Fatalf("err = %v, want a run-login hint without contacting the IdP", err)
+	}
+}
