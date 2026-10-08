@@ -1,6 +1,11 @@
 package jetstream
 
 import (
+	"bytes"
+	"context"
+	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/nats-io/nats.go/jetstream"
@@ -122,3 +127,52 @@ func TestPickDeliverPolicy(t *testing.T) {
 // require a running NATS server with JetStream enabled and a stream
 // covering the test subject. Cover that in an integration test (build tag)
 // or via the docker compose stack already used by the broader project.
+
+// ── Subscription cleanup ─────────────────────────────────────────────────────
+
+type fakeDeleter struct {
+	name   string
+	ctxErr error
+	hasDL  bool
+	retErr error
+	called int
+}
+
+func (f *fakeDeleter) DeleteConsumer(ctx context.Context, name string) error {
+	f.called++
+	f.name, f.ctxErr = name, ctx.Err()
+	_, f.hasDL = ctx.Deadline()
+	return f.retErr
+}
+
+// The subscription's context is normally cancelled by the time cleanup runs;
+// the delete must still go out, under its own deadline.
+func TestReleaseConsumer_DetachedFromCancelledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	d := &fakeDeleter{}
+	releaseConsumer(ctx, d, "cons-1", nil)
+	if d.called != 1 || d.name != "cons-1" {
+		t.Fatalf("DeleteConsumer calls=%d name=%q", d.called, d.name)
+	}
+	if d.ctxErr != nil {
+		t.Errorf("delete ran on a cancelled context: %v", d.ctxErr)
+	}
+	if !d.hasDL {
+		t.Error("delete has no deadline")
+	}
+}
+
+func TestReleaseConsumer_LogsFailureExceptNotFound(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+
+	releaseConsumer(context.Background(), &fakeDeleter{retErr: jetstream.ErrConsumerNotFound}, "gone", log)
+	if buf.Len() != 0 {
+		t.Errorf("already-deleted consumer was logged: %q", buf.String())
+	}
+	releaseConsumer(context.Background(), &fakeDeleter{retErr: errors.New("boom")}, "c", log)
+	if !strings.Contains(buf.String(), "cleanup failed") {
+		t.Errorf("failure not logged: %q", buf.String())
+	}
+}

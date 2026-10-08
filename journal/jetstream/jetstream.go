@@ -293,8 +293,13 @@ func (s *Source) Subscribe(ctx context.Context, replay int, startFromSeq uint64)
 	if err != nil {
 		return nil, fmt.Errorf("create ephemeral consumer: %w", err)
 	}
+	// The consumer is ephemeral but outlives its iterator until the server's
+	// InactiveThreshold lapses, so delete it ourselves once the subscription
+	// ends — otherwise every (re)connect leaves one behind for minutes.
+	consumerName := cons.CachedInfo().Name
 	mc, err := cons.Messages()
 	if err != nil {
+		releaseConsumer(ctx, stream, consumerName, s.log)
 		return nil, fmt.Errorf("open messages iterator: %w", err)
 	}
 	// Stop the iterator when the caller cancels: Next() blocks otherwise.
@@ -311,6 +316,13 @@ func (s *Source) Subscribe(ctx context.Context, replay int, startFromSeq uint64)
 
 	ch := make(chan journal.Msg)
 	go func() {
+		// Deferred first so it runs last: the consumer is deleted after the
+		// iterator has stopped and the channel has closed, so a slow broker
+		// delays only this goroutine, not the caller.
+		defer func() {
+			mc.Stop()
+			releaseConsumer(ctx, stream, consumerName, s.log)
+		}()
 		defer close(ch)
 		defer close(done)
 		for {
@@ -345,6 +357,26 @@ func (s *Source) Subscribe(ctx context.Context, replay int, startFromSeq uint64)
 		}
 	}()
 	return ch, nil
+}
+
+// releaseConsumerTimeout bounds the best-effort consumer cleanup.
+const releaseConsumerTimeout = 5 * time.Second
+
+// consumerDeleter is the part of jetstream.Stream releaseConsumer needs.
+type consumerDeleter interface {
+	DeleteConsumer(ctx context.Context, consumer string) error
+}
+
+// releaseConsumer deletes the ephemeral consumer behind a finished
+// subscription. It runs detached from ctx — normally already cancelled by the
+// time the subscription ends — under its own timeout. Failure is only logged:
+// the server's InactiveThreshold reaps the consumer eventually.
+func releaseConsumer(ctx context.Context, stream consumerDeleter, name string, log *slog.Logger) {
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseConsumerTimeout)
+	defer cancel()
+	if err := stream.DeleteConsumer(dctx, name); err != nil && !errors.Is(err, jetstream.ErrConsumerNotFound) && log != nil {
+		log.Warn("jetstream consumer cleanup failed; it expires after InactiveThreshold", "consumer", name, "err", err)
+	}
 }
 
 // Close drains the NATS connection. Outstanding Subscribe channels close
