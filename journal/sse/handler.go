@@ -51,6 +51,12 @@ type Handler struct {
 	// graceful shutdown until its timeout; pass a channel closed when the
 	// server begins shutting down (e.g. ctx.Done() of the run.Group).
 	Done <-chan struct{}
+	// Limits, when non-nil, caps concurrent streams (globally and/or per
+	// client); a request over a cap gets 429 with Retry-After before any
+	// transport consumer is created. Note that browsers' EventSource does not
+	// reconnect after a non-200 response, so size the caps above what a
+	// client legitimately needs.
+	Limits *Limits
 }
 
 // ServeHTTP implements http.Handler. Returns 500 if the response writer
@@ -62,6 +68,14 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
+	release, scope, ok := h.Limits.acquire(r)
+	if !ok {
+		slog.Default().WarnContext(r.Context(), "journal SSE stream refused: limit reached", "scope", string(scope), "path", r.URL.Path)
+		h.Limits.reject(w)
+		return
+	}
+	defer release()
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
