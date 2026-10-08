@@ -31,6 +31,9 @@ import (
 	"io"
 )
 
+// keySize is the AES-256 key length every helper here requires.
+const keySize = 32
+
 // RandomBytes returns n cryptographically random bytes from crypto/rand.
 // Used to mint master keys, DEKs, and AES-GCM nonces — any place uniformly
 // random material is required.
@@ -110,6 +113,11 @@ func OpenAAD(key, ciphertext, aad []byte) ([]byte, error) {
 }
 
 func newGCM(key []byte) (cipher.AEAD, error) {
+	// aes.NewCipher also accepts 16- and 24-byte keys, which would silently
+	// downgrade to AES-128/192; this package promises AES-256.
+	if len(key) != keySize {
+		return nil, fmt.Errorf("key must be %d bytes, got %d", keySize, len(key))
+	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, fmt.Errorf("new cipher: %w", err)

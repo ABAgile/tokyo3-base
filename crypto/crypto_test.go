@@ -315,3 +315,15 @@ func TestEnvelopeAAD_RejectsSwappedContext(t *testing.T) {
 		t.Error("decrypt succeeded under a different row's aad")
 	}
 }
+
+func TestSeal_RejectsNon256BitKeys(t *testing.T) {
+	for _, n := range []int{0, 16, 24, 31, 33, 64} {
+		key := make([]byte, n)
+		if _, err := Seal(key, []byte("x")); err == nil {
+			t.Errorf("Seal accepted a %d-byte key", n)
+		}
+		if _, err := Open(key, make([]byte, 64)); err == nil {
+			t.Errorf("Open accepted a %d-byte key", n)
+		}
+	}
+}
