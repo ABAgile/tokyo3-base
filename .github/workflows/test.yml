@@ -11,32 +11,41 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Caches the module cache and the build cache. Dev tools are pinned in
+      # _tools/go.mod and run with `go tool`; their binaries live in the
+      # build cache, keyed by both go.sum files and the Go version.
       - uses: actions/setup-go@v6
-        id: setup-go
         with:
           go-version-file: go.mod
           cache: true
+          cache-dependency-path: |
+            go.sum
+            _tools/go.sum
 
-      - uses: actions/cache@v5
-        id: cache-go-tools
-        with:
-          path: ~/go/bin
-          key: go-tools-${{ hashFiles('go.mod', '.github/workflows/test.yml') }}-${{ steps.setup-go.outputs.go-version }}
-
-      - if: steps.cache-go-tools.outputs.cache-hit != 'true'
+      # base is a library with no Makefile: each step below is the command to
+      # run locally. The tool commands use `go tool -modfile=_tools/go.mod`
+      # so local runs and CI use identical versions (see _tools/go.mod
+      # before bumping them).
+      - name: Check formatting
         run: |
-          go install honnef.co/go/tools/cmd/staticcheck@v0.8.1
-          go install golang.org/x/tools/gopls@v0.23.0
-          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+          out=$(gofmt -s -l .)
+          if [ -n "$out" ]; then echo "$out"; echo "gofmt: files need formatting (above); run gofmt -s -w ."; exit 1; fi
 
-      - run: go vet ./...
-      - run: staticcheck ./...
-      - run: find . -type f -name "*.go" -print0 | xargs -0 -n 100 gopls check -severity=hint
-      - run: govulncheck ./...
+      - name: Check go.mod and go.sum are tidy
+        run: |
+          go mod tidy
+          go -C _tools mod tidy
+          go -C _tools build tool
+          git diff --exit-code -- go.mod go.sum _tools/go.mod _tools/go.sum || { echo "go mod tidy changed module files; commit the result"; exit 1; }
 
-      - run: go test ./... -coverprofile=coverage.out
+      - run: go test ./... -count=1 -race -coverprofile=coverage.out
 
       - uses: codecov/codecov-action@v6
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage.out
+
+      - run: go vet ./...
+      - run: go tool -modfile=_tools/go.mod staticcheck ./...
+      - run: find . -type f -name "*.go" -print0 | xargs -0 -n 100 go tool -modfile=_tools/go.mod gopls check -severity=hint
+      - run: go tool -modfile=_tools/go.mod govulncheck ./...
