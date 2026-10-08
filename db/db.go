@@ -17,9 +17,8 @@ import (
 type DatabaseConfigOption func(*pgxpool.Config)
 
 var (
-	connStrFieldRegexp  = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*('(?:\\.|[^'\\])*'|(?:\\.|[^\s'\\])+|)`)
-	pgPlaceholderRegexp = regexp.MustCompile(`\$(\d+)`)
-	byteSliceType       = reflect.TypeFor[[]byte]()
+	connStrFieldRegexp = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*('(?:\\.|[^'\\])*'|(?:\\.|[^\s'\\])+|)`)
+	byteSliceType      = reflect.TypeFor[[]byte]()
 )
 
 func NewPgxPool(connStr string, opts ...DatabaseConfigOption) (*pgxpool.Pool, error) {
@@ -95,38 +94,107 @@ func safeConnField(key string) bool {
 	}
 }
 
+// ConvertPgPlaceholders rewrites PostgreSQL-style $n placeholders to "?" and
+// returns the args reordered to match. Text that merely looks like a
+// placeholder is left alone: single-quoted strings, quoted identifiers,
+// -- and /* */ comments, and dollar-quoted bodies ($$…$$, $tag$…$tag$).
 func ConvertPgPlaceholders(sql string, args ...any) (string, []any, error) {
-	matches := pgPlaceholderRegexp.FindAllStringSubmatchIndex(sql, -1)
+	var (
+		b           strings.Builder
+		orderedArgs []any
+		found       bool
+	)
+	b.Grow(len(sql))
 
-	if len(matches) == 0 {
+	for i := 0; i < len(sql); {
+		end := skipLiteral(sql, i)
+		if end > i {
+			b.WriteString(sql[i:end])
+			i = end
+			continue
+		}
+		if sql[i] == '$' {
+			j := i + 1
+			for j < len(sql) && sql[j] >= '0' && sql[j] <= '9' {
+				j++
+			}
+			if j > i+1 {
+				numStr := sql[i+1 : j]
+				n, err := strconv.Atoi(numStr)
+				if err != nil || n < 1 || n > len(args) {
+					return "", nil, fmt.Errorf("invalid placeholder $%s", numStr)
+				}
+				found = true
+				b.WriteByte('?')
+				orderedArgs = append(orderedArgs, args[n-1])
+				i = j
+				continue
+			}
+		}
+		b.WriteByte(sql[i])
+		i++
+	}
+
+	if !found {
 		return sql, args, nil
 	}
-
-	var b strings.Builder
-	b.Grow(len(sql))
-	orderedArgs := make([]any, 0, len(matches))
-
-	last := 0
-	for _, m := range matches {
-		start, end := m[0], m[1]
-		numStart, numEnd := m[2], m[3]
-
-		b.WriteString(sql[last:start])
-		b.WriteString("?")
-		last = end
-
-		numStr := sql[numStart:numEnd]
-		n, err := strconv.Atoi(numStr)
-		if err != nil || n < 1 || n > len(args) {
-			return "", nil, fmt.Errorf("invalid placeholder $%s", numStr)
-		}
-
-		orderedArgs = append(orderedArgs, args[n-1])
-	}
-
-	b.WriteString(sql[last:])
-
 	return b.String(), orderedArgs, nil
+}
+
+// skipLiteral returns the index just past the quoted string, quoted
+// identifier, comment or dollar-quoted body starting at sql[i], or i if none
+// starts there. An unterminated literal extends to the end of sql.
+func skipLiteral(sql string, i int) int {
+	switch c := sql[i]; {
+	case c == '\'' || c == '"':
+		for j := i + 1; j < len(sql); j++ {
+			if sql[j] == c {
+				if j+1 < len(sql) && sql[j+1] == c { // doubled quote is an escape
+					j++
+					continue
+				}
+				return j + 1
+			}
+		}
+		return len(sql)
+	case c == '-' && strings.HasPrefix(sql[i:], "--"):
+		if nl := strings.IndexByte(sql[i:], '\n'); nl >= 0 {
+			return i + nl + 1
+		}
+		return len(sql)
+	case c == '/' && strings.HasPrefix(sql[i:], "/*"):
+		depth := 0 // PostgreSQL block comments nest
+		for j := i; j < len(sql); j++ {
+			switch {
+			case strings.HasPrefix(sql[j:], "/*"):
+				depth++
+				j++
+			case strings.HasPrefix(sql[j:], "*/"):
+				depth--
+				j++
+				if depth == 0 {
+					return j + 1
+				}
+			}
+		}
+		return len(sql)
+	case c == '$':
+		// $tag$ opens a dollar-quote; a tag may not start with a digit, which
+		// keeps $1 a placeholder.
+		j := i + 1
+		for j < len(sql) && (sql[j] == '_' || sql[j] >= 'a' && sql[j] <= 'z' || sql[j] >= 'A' && sql[j] <= 'Z' || sql[j] >= 0x80 || j > i+1 && sql[j] >= '0' && sql[j] <= '9') {
+			j++
+		}
+		if j >= len(sql) || sql[j] != '$' {
+			return i
+		}
+		delim := sql[i : j+1]
+		if k := strings.Index(sql[j+1:], delim); k >= 0 {
+			return j + 1 + k + len(delim)
+		}
+		return len(sql)
+	}
+	return i
 }
 
 func CopyDeref[T any, U any](src T, dst *U) (*U, error) {

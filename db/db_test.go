@@ -106,6 +106,27 @@ func TestConvertPgPlaceholders(t *testing.T) {
 			expectedErr: "invalid placeholder $3",
 		},
 		{
+			name:         "should leave literals, identifiers and comments untouched",
+			sql:          "SELECT '$1', \"a$2\", 'it''s $9' -- $7\n/* $8 /* $9 */ $3 */ FROM t WHERE x = $1",
+			args:         []any{"v"},
+			expectedSQL:  "SELECT '$1', \"a$2\", 'it''s $9' -- $7\n/* $8 /* $9 */ $3 */ FROM t WHERE x = ?",
+			expectedArgs: []any{"v"},
+		},
+		{
+			name:         "should leave dollar-quoted bodies untouched",
+			sql:          "DO $$ SELECT $1 $$; DO $fn$ SELECT $2 $fn$; SELECT $1",
+			args:         []any{"v"},
+			expectedSQL:  "DO $$ SELECT $1 $$; DO $fn$ SELECT $2 $fn$; SELECT ?",
+			expectedArgs: []any{"v"},
+		},
+		{
+			name:         "should return original sql when only literals look like placeholders",
+			sql:          "SELECT '$5'",
+			args:         []any{},
+			expectedSQL:  "SELECT '$5'",
+			expectedArgs: []any{},
+		},
+		{
 			name:        "should return error for placeholder index 0",
 			sql:         "SELECT * FROM users WHERE id = $0",
 			args:        []any{1},
