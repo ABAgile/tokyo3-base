@@ -23,7 +23,11 @@ import (
 )
 
 const (
-	flowTTL             = 10 * time.Minute
+	flowTTL = 10 * time.Minute
+	// maxPendingFlows bounds how many unfinished logins (e.g. one per browser
+	// tab) the flow cookie carries at once; the oldest is dropped beyond it.
+	// Kept small so the sealed cookie stays under the per-cookie size limit.
+	maxPendingFlows     = 3
 	defaultScopes       = "openid email profile groups"
 	defaultCallbackPath = "/auth/callback"
 )
@@ -77,6 +81,12 @@ type AuthenticatorConfig struct {
 	// injected [SessionIssuer] implements [CompletionOverride] instead —
 	// that path owns 100% of its own completion logic.
 	EnrichSession func(ctx context.Context, claims *Claims, sess *session.Session) error
+
+	// RequireVerifiedEmail makes [Authenticator.CallbackHandler] refuse a login
+	// (401) whose ID token does not assert email_verified=true. Enable it when
+	// the email claim is used to authorize or identify users; left false, the
+	// claim is passed through unchecked (see [Claims.Email]).
+	RequireVerifiedEmail bool
 }
 
 // SessionIssuer is the minimal contract every [Authenticator] caller
@@ -213,6 +223,69 @@ type oidcFlow struct {
 	// sealed flow cookie — see [Authenticator.Begin] and [CompletedFlow].
 	// Unused by [DefaultCompleter]'s default completion path.
 	Extra string `json:"extra,omitempty"`
+	// Exp is the flow's expiry (unix seconds). The cookie's own Max-Age is only
+	// enforced by the browser, so the sealed payload carries its own deadline.
+	Exp int64 `json:"exp"`
+}
+
+// oidcFlowSet is the flow cookie's payload: the logins started in this browser
+// and not yet completed, oldest first. Holding several lets two tabs log in
+// concurrently without the second clobbering the first's state.
+type oidcFlowSet struct {
+	Flows []oidcFlow `json:"flows"`
+}
+
+func (a *Authenticator) now() time.Time {
+	if a.flow.Now != nil {
+		return a.flow.Now()
+	}
+	return time.Now()
+}
+
+// pendingFlows returns the unexpired flows carried by r's flow cookie; empty
+// when the cookie is absent, invalid, or holds nothing live.
+func (a *Authenticator) pendingFlows(r *http.Request) []oidcFlow {
+	var set oidcFlowSet
+	if err := a.flow.Read(r, &set); err != nil {
+		return nil
+	}
+	now := a.now().Unix()
+	live := set.Flows[:0]
+	for _, f := range set.Flows {
+		if f.Exp > now {
+			live = append(live, f)
+		}
+	}
+	return live
+}
+
+// matchFlow returns the index of the flow whose state equals state, or -1.
+func matchFlow(flows []oidcFlow, state string) int {
+	found := -1
+	for i, f := range flows {
+		if f.State != "" && subtle.ConstantTimeCompare([]byte(state), []byte(f.State)) == 1 {
+			found = i
+		}
+	}
+	return found
+}
+
+// consumeFlow removes flows[idx] from the flow cookie (clearing it when
+// nothing else is pending). A negative idx leaves the cookie untouched, so a
+// forged callback can't wipe the user's legitimate pending logins.
+func (a *Authenticator) consumeFlow(w http.ResponseWriter, r *http.Request, flows []oidcFlow, idx int) {
+	if idx < 0 {
+		return
+	}
+	rest := append(append([]oidcFlow(nil), flows[:idx]...), flows[idx+1:]...)
+	if len(rest) == 0 {
+		a.flow.Clear(w, r)
+		return
+	}
+	if err := a.flow.Set(w, r, oidcFlowSet{Flows: rest}, flowTTL); err != nil {
+		a.sess.Log().Warn("oidc: re-seal pending flows failed", "err", err)
+		a.flow.Clear(w, r)
+	}
 }
 
 // LoginHandler starts the Authorization-Code flow via [Authenticator.Begin]
@@ -249,9 +322,21 @@ func (a *Authenticator) Begin(w http.ResponseWriter, r *http.Request, extra stri
 		Verifier: verifier,
 		ReturnTo: a.sess.SafeReturnTo(r.URL.Query().Get("return_to")),
 		Extra:    extra,
+		Exp:      a.now().Add(flowTTL).Unix(),
 	}
-	if err := a.flow.Set(w, r, flow, flowTTL); err != nil {
-		return "", err
+	flows := append(a.pendingFlows(r), flow)
+	if len(flows) > maxPendingFlows {
+		flows = flows[len(flows)-maxPendingFlows:]
+	}
+	if err := a.flow.Set(w, r, oidcFlowSet{Flows: flows}, flowTTL); err != nil {
+		// Possibly too large with the other pending logins; fall back to this
+		// login alone rather than failing it.
+		if len(flows) == 1 {
+			return "", err
+		}
+		if err := a.flow.Set(w, r, oidcFlowSet{Flows: []oidcFlow{flow}}, flowTTL); err != nil {
+			return "", err
+		}
 	}
 
 	ep, err := a.endpoint(r.Context())
@@ -322,22 +407,26 @@ func (a *Authenticator) endpoint(ctx context.Context) (oauth2.Endpoint, error) {
 // otherwise.
 func (a *Authenticator) CallbackHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		var flow oidcFlow
-		if err := a.flow.Read(r, &flow); err != nil {
+		flows := a.pendingFlows(r)
+		if len(flows) == 0 {
+			a.flow.Clear(w, r)
 			http.Error(w, "login session expired — start again", http.StatusBadRequest)
 			return
 		}
-		a.flow.Clear(w, r)
 
 		q := r.URL.Query()
+		idx := matchFlow(flows, q.Get("state"))
 		if e := q.Get("error"); e != "" {
+			a.consumeFlow(w, r, flows, idx)
 			http.Error(w, "IdP returned an error: "+e, http.StatusUnauthorized)
 			return
 		}
-		if flow.State == "" || subtle.ConstantTimeCompare([]byte(q.Get("state")), []byte(flow.State)) != 1 {
+		if idx < 0 {
 			http.Error(w, "state mismatch — possible CSRF; start again", http.StatusBadRequest)
 			return
 		}
+		flow := flows[idx]
+		a.consumeFlow(w, r, flows, idx)
 		code := q.Get("code")
 		if code == "" {
 			http.Error(w, "no authorization code", http.StatusBadRequest)
@@ -380,6 +469,11 @@ func (a *Authenticator) CallbackHandler() http.HandlerFunc {
 		if claims.Subject == "" {
 			a.sess.Log().Warn("oidc: id_token has no subject; login refused")
 			http.Error(w, "invalid ID token", http.StatusUnauthorized)
+			return
+		}
+		if a.cfg.RequireVerifiedEmail && !claims.EmailVerified {
+			a.sess.Log().Warn("oidc: email not verified; login refused", "sub", claims.Subject)
+			http.Error(w, "email not verified", http.StatusUnauthorized)
 			return
 		}
 

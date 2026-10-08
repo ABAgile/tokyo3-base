@@ -147,16 +147,26 @@ func TestLoginHandler_ReturnToAndCookieScope(t *testing.T) {
 	if fc == nil {
 		t.Fatal("login set no flow cookie")
 	}
-	var flow oidcFlow
-	if err := a.flow.Open(fc.Value, &flow); err != nil {
-		t.Fatalf("open flow cookie: %v", err)
-	}
+	flow := openFlow(t, a, fc)
 	if flow.ReturnTo != "/portal/" {
 		t.Errorf("fallback return_to = %q, want /portal/ (no return_to given)", flow.ReturnTo)
 	}
 	if fc.Path != "/portal" {
 		t.Errorf("flow cookie path = %q, want /portal (shares the session cookie's scope)", fc.Path)
 	}
+}
+
+// openFlow unseals the flow cookie and returns its newest pending flow.
+func openFlow(t *testing.T, a *Authenticator, fc *http.Cookie) oidcFlow {
+	t.Helper()
+	var set oidcFlowSet
+	if err := a.flow.Open(fc.Value, &set); err != nil {
+		t.Fatalf("open flow cookie: %v", err)
+	}
+	if len(set.Flows) == 0 {
+		t.Fatal("flow cookie holds no flows")
+	}
+	return set.Flows[len(set.Flows)-1]
 }
 
 // startFlow runs LoginHandler and returns the sealed flow cookie + the decoded
@@ -177,10 +187,7 @@ func startFlow(t *testing.T, a *Authenticator) (*http.Cookie, oidcFlow) {
 	if fc == nil {
 		t.Fatal("login set no flow cookie")
 	}
-	var flow oidcFlow
-	if err := a.flow.Open(fc.Value, &flow); err != nil {
-		t.Fatalf("open flow cookie: %v", err)
-	}
+	flow := openFlow(t, a, fc)
 	return fc, flow
 }
 
@@ -458,10 +465,7 @@ func TestCompletionOverride_TakesPrecedenceAndCarriesExtra(t *testing.T) {
 	if fc == nil {
 		t.Fatal("Begin set no flow cookie")
 	}
-	var flow oidcFlow
-	if err := a.flow.Open(fc.Value, &flow); err != nil {
-		t.Fatalf("open flow cookie: %v", err)
-	}
+	flow := openFlow(t, a, fc)
 
 	stub.claims = &Claims{Subject: "u-1", Email: "cli@x", Nonce: flow.Nonce}
 	a.cfg.Verifier = stub
@@ -514,10 +518,7 @@ func TestCompletionOverride_ErrorRenders500(t *testing.T) {
 			fc = c
 		}
 	}
-	var flow oidcFlow
-	if err := a.flow.Open(fc.Value, &flow); err != nil {
-		t.Fatalf("open flow cookie: %v", err)
-	}
+	flow := openFlow(t, a, fc)
 	stub.claims = &Claims{Subject: "u-1", Nonce: flow.Nonce}
 	a.cfg.Verifier = stub
 
@@ -660,5 +661,172 @@ func TestCallback_AsyncDiscoveryFailure_502(t *testing.T) {
 
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("callback code = %d, want 502 when endpoint discovery fails", rec.Code)
+	}
+}
+
+// beginLogin runs LoginHandler carrying prior and returns the flow cookie the
+// response (re)set.
+func beginLogin(t *testing.T, a *Authenticator, prior *http.Cookie) *http.Cookie {
+	t.Helper()
+	r := httptest.NewRequest(http.MethodGet, "/auth/login", nil)
+	if prior != nil {
+		r.AddCookie(prior)
+	}
+	rec := httptest.NewRecorder()
+	a.LoginHandler()(rec, r)
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == a.flow.Name {
+			return c
+		}
+	}
+	t.Fatal("login set no flow cookie")
+	return nil
+}
+
+func flowsIn(t *testing.T, a *Authenticator, fc *http.Cookie) []oidcFlow {
+	t.Helper()
+	var set oidcFlowSet
+	if err := a.flow.Open(fc.Value, &set); err != nil {
+		t.Fatalf("open flow cookie: %v", err)
+	}
+	return set.Flows
+}
+
+func tokenServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "at", "id_token": "it"})
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// The flow cookie's lifetime is enforced from the sealed payload, not just by
+// the browser's Max-Age.
+func TestCallback_FlowExpiryEnforcedFromPayload(t *testing.T) {
+	a := testAuth(t, stubTok{}, nil)
+	fc, flow := startFlow(t, a)
+	base := a.flow.Now()
+	a.flow.Now = func() time.Time { return base.Add(flowTTL + time.Second) }
+
+	r := httptest.NewRequest(http.MethodGet, "/auth/callback?state="+url.QueryEscape(flow.State)+"&code=abc", nil)
+	r.AddCookie(fc)
+	rec := httptest.NewRecorder()
+	a.CallbackHandler()(rec, r)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "expired") {
+		t.Fatalf("code=%d body=%q, want 400 expired", rec.Code, rec.Body.String())
+	}
+}
+
+// Two logins started in different tabs both complete: the second Begin must not
+// clobber the first's state, and finishing one leaves the other pending.
+func TestCallback_ConcurrentLoginsBothComplete(t *testing.T) {
+	srv := tokenServer(t)
+	a := testAuth(t, stubTok{}, func(c *AuthenticatorConfig) { c.Issuer = srv.URL })
+
+	c1 := beginLogin(t, a, nil)
+	c2 := beginLogin(t, a, c1)
+	flows := flowsIn(t, a, c2)
+	if len(flows) != 2 {
+		t.Fatalf("flows after two logins = %d, want 2", len(flows))
+	}
+
+	callback := func(cookie *http.Cookie, f oidcFlow) *httptest.ResponseRecorder {
+		a.cfg.Verifier = stubTok{claims: &Claims{Subject: "u", Nonce: f.Nonce}}
+		r := httptest.NewRequest(http.MethodGet, "/auth/callback?state="+url.QueryEscape(f.State)+"&code=abc", nil)
+		r.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+		a.CallbackHandler()(rec, r)
+		return rec
+	}
+
+	rec := callback(c2, flows[0])
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("first login callback = %d %q", rec.Code, rec.Body.String())
+	}
+	var rest *http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == a.flow.Name {
+			rest = c
+		}
+	}
+	if rest == nil || rest.MaxAge < 0 {
+		t.Fatalf("flow cookie after first callback = %+v, want the second login still pending", rest)
+	}
+	if left := flowsIn(t, a, rest); len(left) != 1 || left[0].State != flows[1].State {
+		t.Fatalf("pending after first callback = %+v, want only the second flow", left)
+	}
+
+	if rec := callback(rest, flows[1]); rec.Code != http.StatusSeeOther {
+		t.Fatalf("second login callback = %d %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestBegin_PendingFlowsAreCapped(t *testing.T) {
+	a := testAuth(t, stubTok{}, nil)
+	var fc *http.Cookie
+	var states []string
+	for range maxPendingFlows + 2 {
+		fc = beginLogin(t, a, fc)
+		states = append(states, openFlow(t, a, fc).State)
+	}
+	flows := flowsIn(t, a, fc)
+	if len(flows) != maxPendingFlows {
+		t.Fatalf("pending flows = %d, want %d", len(flows), maxPendingFlows)
+	}
+	if flows[0].State != states[2] || flows[len(flows)-1].State != states[len(states)-1] {
+		t.Error("cap must drop the oldest flows and keep the newest")
+	}
+}
+
+// A callback whose state matches nothing must not wipe the user's legitimate
+// pending logins.
+func TestCallback_UnknownStateLeavesFlowCookieAlone(t *testing.T) {
+	a := testAuth(t, stubTok{}, nil)
+	fc, _ := startFlow(t, a)
+	r := httptest.NewRequest(http.MethodGet, "/auth/callback?state=WRONG&code=abc", nil)
+	r.AddCookie(fc)
+	rec := httptest.NewRecorder()
+	a.CallbackHandler()(rec, r)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d, want 400", rec.Code)
+	}
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == a.flow.Name {
+			t.Fatalf("forged callback modified the flow cookie: %+v", c)
+		}
+	}
+}
+
+func TestCallback_RequireVerifiedEmail(t *testing.T) {
+	srv := tokenServer(t)
+	for _, tc := range []struct {
+		name     string
+		require  bool
+		verified bool
+		want     int
+	}{
+		{"required, unverified", true, false, http.StatusUnauthorized},
+		{"required, verified", true, true, http.StatusSeeOther},
+		{"not required, unverified", false, false, http.StatusSeeOther},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := testAuth(t, stubTok{}, func(c *AuthenticatorConfig) {
+				c.Issuer = srv.URL
+				c.RequireVerifiedEmail = tc.require
+			})
+			fc, flow := startFlow(t, a)
+			a.cfg.Verifier = stubTok{claims: &Claims{Subject: "u", Email: "a@x", EmailVerified: tc.verified, Nonce: flow.Nonce}}
+			r := httptest.NewRequest(http.MethodGet, "/auth/callback?state="+url.QueryEscape(flow.State)+"&code=abc", nil)
+			r.AddCookie(fc)
+			rec := httptest.NewRecorder()
+			a.CallbackHandler()(rec, r)
+			if rec.Code != tc.want {
+				t.Fatalf("code = %d body=%q, want %d", rec.Code, rec.Body.String(), tc.want)
+			}
+			if tc.want == http.StatusUnauthorized && otherCookie(rec.Result().Cookies(), a.flow.Name) != nil {
+				t.Error("session issued despite unverified email")
+			}
+		})
 	}
 }
