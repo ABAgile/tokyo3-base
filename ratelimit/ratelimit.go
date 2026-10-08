@@ -19,6 +19,11 @@
 // X-Forwarded-For is consulted only when the peer is itself a configured
 // trusted proxy, in which case the rightmost hop that is NOT trusted (the real
 // client as seen by infrastructure we control) becomes the key.
+//
+// A peer whose RemoteAddr is not an IP (a unix-domain socket, for example) can
+// never be a trusted proxy, so X-Forwarded-For is ignored and every such client
+// shares one bucket. Behind a sidecar proxy on a unix socket, rate-limit at the
+// proxy or listen on loopback TCP and list the proxy in TrustedProxies.
 package ratelimit
 
 import (
@@ -49,6 +54,10 @@ const (
 	maxBuckets = 100_000
 	// overflowKey keys the shared bucket; it cannot collide with an IP.
 	overflowKey = "overflow"
+	// warnInterval is the minimum gap between "rate limit exceeded" log lines
+	// for one bucket, so a client sitting above its limit can't turn every
+	// rejected request into a log line (and a NATS publish).
+	warnInterval = time.Minute
 )
 
 // Config wires a [Limiter].
@@ -66,7 +75,9 @@ type Config struct {
 	// key, so the header can't be used to evade the limit.
 	TrustedProxies []*net.IPNet
 
-	// Log receives a Warn line per throttled request. nil ⇒ slog.Default.
+	// Log receives a Warn line for throttled requests, at most one per source
+	// per minute (with a count of those suppressed in between). nil ⇒
+	// slog.Default.
 	Log *slog.Logger
 
 	// OnThrottle renders the response for a throttled request. The Retry-After
@@ -95,6 +106,9 @@ type Limiter struct {
 type bucket struct {
 	lim  *rate.Limiter
 	seen time.Time
+
+	lastWarn   time.Time // last throttle log line for this bucket
+	suppressed int       // throttled requests since lastWarn that were not logged
 }
 
 // New builds a limiter allowing RPS requests/second per source with the given
@@ -140,9 +154,13 @@ func (l *Limiter) Middleware(next http.Handler, exempt ...string) http.Handler {
 			return
 		}
 		key := l.clientIP.FromRequest(r)
-		if !l.allow(clientip.Network(key), time.Now()) {
+		bucketKey := clientip.Network(key)
+		now := time.Now()
+		if !l.allow(bucketKey, now) {
 			w.Header().Set("Retry-After", l.retryAfter())
-			l.log.Warn("rate limit exceeded", "source", key, "path", r.URL.Path)
+			if log, suppressed := l.warnDue(bucketKey, now); log {
+				l.log.Warn("rate limit exceeded", "source", key, "path", r.URL.Path, "suppressed", suppressed)
+			}
 			if l.onThrottle != nil {
 				l.onThrottle(w, r)
 			} else {
@@ -173,6 +191,28 @@ func (l *Limiter) allow(key string, now time.Time) bool {
 	b.seen = now
 	l.mu.Unlock()
 	return b.lim.AllowN(now, 1)
+}
+
+// warnDue reports whether a throttle log line is due for key, and how many
+// throttled requests were skipped since the previous one. At most one line is
+// due per warnInterval per bucket.
+func (l *Limiter) warnDue(key string, now time.Time) (due bool, suppressed int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b, ok := l.buckets[key]
+	if !ok {
+		b = l.buckets[overflowKey]
+	}
+	if b == nil {
+		return true, 0
+	}
+	if !b.lastWarn.IsZero() && now.Sub(b.lastWarn) < warnInterval {
+		b.suppressed++
+		return false, 0
+	}
+	suppressed = b.suppressed
+	b.lastWarn, b.suppressed = now, 0
+	return true, suppressed
 }
 
 // sweepLocked drops idle buckets. The caller holds l.mu. Rate-limited to one

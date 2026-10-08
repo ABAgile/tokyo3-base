@@ -10,6 +10,12 @@
 // its source. With no trusted proxies configured, X-Forwarded-For is ignored
 // entirely and the peer IP is always returned.
 //
+// A peer that is not an IP (e.g. a unix-domain socket, whose RemoteAddr is "@"
+// or empty) can never match a trusted proxy CIDR: X-Forwarded-For is ignored
+// and the non-IP peer string is the key, so all such clients look like one
+// source. Front such a listener with loopback TCP if per-client attribution
+// is needed.
+//
 // This is the shared extraction that both rate-limit keying and audit
 // attribution should use, so a single source IP is derived one way across the
 // fleet. It applies to HTTP only; an SSH/raw-TCP peer is just net.Addr and has

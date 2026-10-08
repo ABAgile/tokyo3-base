@@ -1,12 +1,14 @@
 package ratelimit
 
 import (
+	"bytes"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -195,5 +197,60 @@ func TestAllow_BucketCapUsesSharedOverflow(t *testing.T) {
 	}
 	if len(l.buckets) != maxBuckets+1 {
 		t.Errorf("buckets = %d, want %d (cap + overflow)", len(l.buckets), maxBuckets+1)
+	}
+}
+
+// Throttle log lines are rate-limited per bucket so a client above its limit
+// can't turn every rejected request into a log line.
+func TestWarnDue_OncePerIntervalWithSuppressedCount(t *testing.T) {
+	l := New(Config{RPS: 1, Burst: 1, Log: discard()})
+	now := time.Unix(1000, 0)
+	l.allow("k", now)
+	if due, n := l.warnDue("k", now); !due || n != 0 {
+		t.Fatalf("first warn = (%v, %d), want (true, 0)", due, n)
+	}
+	for range 3 {
+		if due, _ := l.warnDue("k", now.Add(time.Second)); due {
+			t.Fatal("warn within the interval should be suppressed")
+		}
+	}
+	if due, n := l.warnDue("k", now.Add(warnInterval)); !due || n != 3 {
+		t.Fatalf("warn after interval = (%v, %d), want (true, 3)", due, n)
+	}
+}
+
+func TestMiddleware_ThrottleLogIsSampled(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	l := New(Config{RPS: 1, Burst: 1, Log: log})
+	h := l.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	for range 10 {
+		r := httptest.NewRequest(http.MethodGet, "/api", nil)
+		r.RemoteAddr = "203.0.113.9:1"
+		h.ServeHTTP(httptest.NewRecorder(), r)
+	}
+	if n := strings.Count(buf.String(), "rate limit exceeded"); n != 1 {
+		t.Fatalf("logged %d throttle lines for 9 throttled requests, want 1:\n%s", n, buf.String())
+	}
+}
+
+// A non-IP peer (unix socket) is never a trusted proxy: X-Forwarded-For is
+// ignored and all such clients share one bucket.
+func TestMiddleware_NonIPPeerSharesBucketAndIgnoresXFF(t *testing.T) {
+	l := New(Config{RPS: 1, Burst: 1, Log: discard(), TrustedProxies: []*net.IPNet{mustCIDR(t, "0.0.0.0/0")}})
+	h := l.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) }))
+	send := func(xff string) int {
+		r := httptest.NewRequest(http.MethodGet, "/api", nil)
+		r.RemoteAddr = "@"
+		r.Header.Set("X-Forwarded-For", xff)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, r)
+		return rec.Code
+	}
+	if got := send("198.51.100.1"); got != http.StatusTeapot {
+		t.Fatalf("first request: got %d", got)
+	}
+	if got := send("198.51.100.2"); got != http.StatusTooManyRequests {
+		t.Errorf("different XFF behind a non-IP peer should still share the bucket; got %d", got)
 	}
 }
