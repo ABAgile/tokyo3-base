@@ -638,7 +638,9 @@ func Logout(extras ...string) error
 
 Removes `tokens.json` (so the next call requires a fresh login) plus
 any extras the caller names. Extras may be absolute paths or paths
-relative to `CacheDir`; missing files are silently ignored. The
+relative to `CacheDir` (a relative path must stay inside it — `..` and `.`
+are refused and reported in the returned error); missing files are silently
+ignored. The
 shared `config.json` is intentionally preserved so the next `login`
 can reuse the cached issuer + client_id. Logout waits (up to 30s) for
 an in-flight token refresh via the same cache lock, so a concurrent
@@ -1247,7 +1249,7 @@ malformed value is an error naming the key:
 | `Float(key string) (float64, error)` | Parse a float (e.g. a rate-limit RPS). |
 | `Int(key string) (int, error)` | Parse an int (e.g. a burst). |
 | `Duration(key string) (time.Duration, error)` | Parse a Go duration (`"750ms"`, `"6h"`). |
-| `CIDRList(key string) ([]*net.IPNet, error)` | Parse a comma-separated CIDR list; a bare IP ⇒ `/32` (IPv4) or `/128` (IPv6). Handy for trusted-proxy allow-lists. |
+| `CIDRList(key string) ([]*net.IPNet, error)` | Parse a comma-separated CIDR list; a bare IP ⇒ `/32` (IPv4) or `/128` (IPv6); IPv4-mapped IPv6 entries (`::ffff:10.0.0.1`) are normalized to plain IPv4. Handy for trusted-proxy allow-lists. |
 
 ```go
 addr      := envutil.Or("MYDAEMON_ADDR", ":8080")
@@ -1740,7 +1742,7 @@ type TrackerConfig[T any] struct {
     Less   func(a, b T) bool   // optional: newest-first comparator ⇒ sorted; nil ⇒ arrival order
     Max    int                 // ring cap; 0 ⇒ DefaultTrackerSize (500)
     Label  string              // optional, for the "subscribed" log line
-    ResubscribeWait time.Duration // >0 ⇒ resubscribe (from last Seq) after the source drops; 0 ⇒ Run returns nil on close
+    ResubscribeWait time.Duration // >0 ⇒ resubscribe (from last Seq; a sequence reset drops the stale ring) after the source drops; 0 ⇒ Run returns nil on close
     Log    *slog.Logger
 }
 
@@ -1906,6 +1908,9 @@ type AuthenticatorConfig struct {
     // the verified claims, used only on the DefaultCompleter path; a
     // returned error aborts the login (fail closed):
     EnrichSession func(ctx context.Context, claims *Claims, sess *session.Session) error
+    // RequireVerifiedEmail refuses (401) a login whose ID token lacks
+    // email_verified=true; default false (the claim is passed through unchecked).
+    RequireVerifiedEmail bool
 }
 
 // SessionIssuer is the minimal contract every Authenticator caller supplies;
@@ -1984,7 +1989,8 @@ handler := sess.Gate(mux) // wrap the protected routes
 
 Cookies are HttpOnly, Secure (when served over TLS — `X-Forwarded-Proto`
 aware), SameSite=Lax, scoped to the Manager's cookie path; the flow cookie is
-short-lived (10m) and the session honors the Manager's `SessionTTL`.
+short-lived (10m, enforced from its sealed payload, and carries up to 3 pending
+logins so concurrent tabs don't clobber each other) and the session honors the Manager's `SessionTTL`.
 `return_to` is confined to a local absolute path under the configured
 `BasePath` (or any local absolute path when root-mounted) by the Manager's
 `SafeReturnTo`, so it cannot escape the app mount or bounce to an attacker
@@ -2106,6 +2112,12 @@ peer, never a raw `X-Forwarded-For`, so it can't be spoofed via the header;
 CIDR, in which case the rightmost *untrusted* hop (the real client behind our
 own edge) becomes the key. Derive audit attribution from the same `clientip`
 extractor so the limiter and the audit log agree on the source.
+
+A non-IP peer (a unix-domain socket) can never be a trusted proxy, so
+`X-Forwarded-For` is ignored and all such clients share one bucket — listen on
+loopback TCP and list the proxy in `TrustedProxies` if you need per-client
+limits. Throttle warnings are logged at most once per source per minute (with a
+`suppressed` count), so a client over its limit can't flood the logs.
 
 It is **not** a volumetric-DoS control: a distributed flood from many IPs
 bypasses per-IP limits, replicas don't coordinate, and L3/L4 floods never reach
@@ -2242,7 +2254,7 @@ func (m *Manager) NewSession() (Session, error)
 func (m *Manager) IssueSession(w http.ResponseWriter, r *http.Request, sess Session) error
 func (m *Manager) UpdateSession(w http.ResponseWriter, r *http.Request, mutate func(*Session) error) error
 func (m *Manager) Gate(next http.Handler) http.Handler
-func (m *Manager) LogoutHandler() http.HandlerFunc
+func (m *Manager) LogoutHandler() http.HandlerFunc // client-side only: a captured session cookie stays valid until Expiry unless Config.IsRevoked is wired
 func (m *Manager) CSRFToken(r *http.Request, scope string) (string, error)
 func (m *Manager) ValidateCSRF(r *http.Request, token, scope string) bool
 func (m *Manager) SiblingCookie(suffix string) sealedcookie.Cookie
