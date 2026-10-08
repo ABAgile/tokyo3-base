@@ -194,10 +194,15 @@ func (h *BackchannelLogoutHandler) ServeHTTP(w http.ResponseWriter, r *http.Requ
 // Single-process only: a multi-replica deployment would want a
 // DB-backed table or a shared cache instead of this in-memory map.
 type logoutJTICache struct {
-	mu     sync.Mutex
-	seen   map[string]logoutJTIEntry
-	window time.Duration
+	mu        sync.Mutex
+	seen      map[string]logoutJTIEntry
+	window    time.Duration
+	lastSweep time.Time
 }
+
+// jtiSweepInterval spaces the full-map eviction passes, so accept stays O(1)
+// on the hot path.
+const jtiSweepInterval = time.Minute
 
 type logoutJTIEntry struct {
 	at      time.Time
@@ -209,19 +214,22 @@ func newLogoutJTICache(window time.Duration) *logoutJTICache {
 }
 
 // accept records jti and reports whether this is the first time it's
-// been seen within window — false means replay. Sweeps expired
-// entries on every call; cheap since the map stays small (one entry
-// per logout in the last window).
+// been seen within window — false means replay. Expired entries are
+// evicted at most once per jtiSweepInterval; an expired entry not yet
+// swept is never counted as a replay.
 func (c *logoutJTICache) accept(jti string, now time.Time) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	cutoff := now.Add(-c.window)
-	for k, entry := range c.seen {
-		if !entry.pending && entry.at.Before(cutoff) {
-			delete(c.seen, k)
+	if c.lastSweep.IsZero() || now.Sub(c.lastSweep) >= jtiSweepInterval {
+		c.lastSweep = now
+		for k, entry := range c.seen {
+			if !entry.pending && entry.at.Before(cutoff) {
+				delete(c.seen, k)
+			}
 		}
 	}
-	if _, dup := c.seen[jti]; dup {
+	if entry, dup := c.seen[jti]; dup && (entry.pending || !entry.at.Before(cutoff)) {
 		return false
 	}
 	c.seen[jti] = logoutJTIEntry{at: now, pending: true}

@@ -82,3 +82,17 @@ func TestLogoutJTICache_PendingDoesNotExpire(t *testing.T) {
 		t.Fatal("completed reservation did not expire")
 	}
 }
+
+// An expired entry that has not been swept yet must not count as a replay.
+func TestLogoutJTICache_ExpiredUnsweptIsNotReplay(t *testing.T) {
+	c := newLogoutJTICache(10 * time.Second)
+	now := time.Now()
+	c.accept("a", now) // first call sweeps; later calls within jtiSweepInterval do not
+	c.finish("a", true, now)
+	if !c.accept("b", now.Add(time.Second)) {
+		t.Fatal("accept b")
+	}
+	if !c.accept("a", now.Add(30*time.Second)) {
+		t.Fatal("expired, unswept jti was rejected as a replay")
+	}
+}
