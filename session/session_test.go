@@ -920,3 +920,21 @@ func TestGate_IsRevoked(t *testing.T) {
 		t.Fatalf("check error must fail closed: code=%d", rec.Code)
 	}
 }
+
+// Logout is client-side only: without IsRevoked, a copy of the cookie captured
+// before logout still passes the Gate. This pins the documented behaviour.
+func TestLogout_DoesNotRevokeCapturedCookieWithoutIsRevoked(t *testing.T) {
+	m := testManager(t, nil)
+	now := m.cfg.Now()
+	val := sessionCookieValue(t, m, Session{Subject: "u", Expiry: now.Add(time.Hour)})
+
+	m.LogoutHandler()(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/auth/logout", nil))
+
+	r := httptest.NewRequest(http.MethodGet, "/x", nil)
+	r.AddCookie(&http.Cookie{Name: m.cookie.Name, Value: val})
+	rec := httptest.NewRecorder()
+	m.Gate(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })).ServeHTTP(rec, r)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("captured cookie after logout: code=%d, want 200 (stateless session)", rec.Code)
+	}
+}

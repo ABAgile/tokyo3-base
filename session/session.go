@@ -346,7 +346,14 @@ func (m *Manager) ValidateCSRF(r *http.Request, token, scope string) bool {
 
 // LogoutHandler clears the session cookie and redirects to the login route.
 // Requests a browser marks Sec-Fetch-Site: cross-site are refused so another
-// site can't log the user out by embedding the route.
+// site can't log the user out by embedding the route. same-site requests (a
+// sibling subdomain) are deliberately allowed, so deployments that share a
+// registrable domain with untrusted subdomains should not rely on this check.
+//
+// Logout is client-side only: the session is a stateless sealed cookie, so a
+// copy of it captured before logout stays valid until Expiry unless
+// [Config.IsRevoked] is wired to a server-side deny-list (keyed on
+// [Session.SID] or Subject) that the caller also feeds on logout.
 func (m *Manager) LogoutHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
