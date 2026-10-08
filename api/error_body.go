@@ -2,6 +2,7 @@ package api
 
 import (
 	"compress/gzip"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -31,6 +32,15 @@ func (t errorBodyTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	// limit applies to decoded bytes rather than permitting a gzip bomb.
 	if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
 		compressed, err = gzip.NewReader(body)
+		if errors.Is(err, io.EOF) {
+			// An error status with an empty gzip-labelled body: hand the
+			// response through (empty) so the caller still sees the status.
+			body.Close()
+			resp.Body = http.NoBody
+			resp.ContentLength = 0
+			resp.Header.Del("Content-Encoding")
+			return resp, nil
+		}
 		if err != nil {
 			body.Close()
 			return nil, err

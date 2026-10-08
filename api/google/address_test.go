@@ -127,6 +127,18 @@ func TestGeocodeService_GetResults(t *testing.T) {
 			expected:   []AddressResult{},
 		},
 		{
+			name:       "ZERO_RESULTS is an empty result, not an error",
+			statusCode: http.StatusOK,
+			serverBody: `{"status":"ZERO_RESULTS","results":[]}`,
+			expected:   []AddressResult{},
+		},
+		{
+			name:       "status failure reported with HTTP 200 is an error",
+			statusCode: http.StatusOK,
+			serverBody: `{"status":"REQUEST_DENIED","error_message":"key invalid","results":[]}`,
+			wantErr:    true,
+		},
+		{
 			name:       "API error is propagated",
 			statusCode: http.StatusUnauthorized,
 			serverBody: `{}`,
@@ -204,4 +216,18 @@ func TestPlacesService_GetResults(t *testing.T) {
 			assert.Equal(t, tc.expected, results)
 		})
 	}
+}
+
+func TestPlacesService_RequestsNarrowFieldMask(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get(headerGoogFieldMask)
+		fmt.Fprint(w, `{"places":[]}`)
+	}))
+	defer srv.Close()
+
+	_, err := NewPlacesService("k", withTestServer(srv)).GetResults(context.Background(), "x")
+	require.NoError(t, err)
+	assert.Equal(t, placesFieldMask, got)
+	assert.NotContains(t, got, "*")
 }

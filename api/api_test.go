@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -172,13 +173,31 @@ func TestClientOption_WithTimeout(t *testing.T) {
 }
 
 func TestClientOption_WithRetryCount(t *testing.T) {
+	// Resty retries transport errors, so drop the connection for the first two
+	// attempts and answer the third.
+	var attempts atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) <= 2 {
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err == nil {
+				conn.Close()
+			}
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
 
 	rc := NewRestClient(srv.URL, CO.WithRetryCount(2))
+	rc.SetRetryWaitTime(time.Millisecond).SetRetryMaxWaitTime(5 * time.Millisecond)
 	assert.NoError(t, rc.R(context.Background(), http.MethodGet, "/", &struct{}{}))
+	assert.EqualValues(t, 3, attempts.Load(), "two retries after the dropped connections")
+
+	attempts.Store(-100) // every attempt drops the connection now
+	rc = NewRestClient(srv.URL, CO.WithRetryCount(1))
+	rc.SetRetryWaitTime(time.Millisecond).SetRetryMaxWaitTime(5 * time.Millisecond)
+	assert.Error(t, rc.R(context.Background(), http.MethodGet, "/", &struct{}{}))
+	assert.EqualValues(t, -98, attempts.Load(), "retry count bounds the attempts")
 }
 
 func TestClientOption_WithDebug(t *testing.T) {

@@ -2,6 +2,7 @@ package google
 
 import (
 	"context"
+	"fmt"
 	"slices"
 
 	"github.com/abagile/tokyo3-base/api"
@@ -30,7 +31,11 @@ func (ac AddressComponent) Name() string {
 }
 
 type geocodeResponse struct {
-	Results []struct {
+	// Status and ErrorMessage: the Geocoding API reports failures such as
+	// REQUEST_DENIED or OVER_QUERY_LIMIT with HTTP 200 and a status field.
+	Status       string `json:"status"`
+	ErrorMessage string `json:"error_message"`
+	Results      []struct {
 		FormattedAddress  string             `json:"formatted_address"`
 		AddressComponents []AddressComponent `json:"address_components"`
 	} `json:"results"`
@@ -52,6 +57,11 @@ func (s *GeocodeService) GetResults(ctx context.Context, address string) ([]Addr
 		"address": address,
 	})); err != nil {
 		return nil, err
+	}
+	switch res.Status {
+	case "", "OK", "ZERO_RESULTS":
+	default:
+		return nil, fmt.Errorf("google geocode: %s: %s", res.Status, res.ErrorMessage)
 	}
 	results := make([]AddressResult, 0, len(res.Results))
 	for _, r := range res.Results {
@@ -82,7 +92,7 @@ func NewPlacesService(apiKey string, opts ...api.RestyClientOption) Addresser {
 func (s *PlacesService) GetResults(ctx context.Context, address string) ([]AddressResult, error) {
 	var res placesResponse
 	if err := s.client.SearchPlaces(ctx, &res,
-		api.RO.WithHeaders(map[string]string{headerGoogApiKey: s.apiKey, headerGoogFieldMask: "*"}),
+		api.RO.WithHeaders(map[string]string{headerGoogApiKey: s.apiKey, headerGoogFieldMask: placesFieldMask}),
 		api.RO.WithBody(map[string]string{"textQuery": address}),
 	); err != nil {
 		return nil, err

@@ -12,6 +12,9 @@ const (
 	placesURL           = "https://places.googleapis.com/v1/places:searchText"
 	headerGoogApiKey    = "X-Goog-Api-Key"
 	headerGoogFieldMask = "X-Goog-FieldMask"
+	// placesFieldMask requests only the fields GetResults reads; "*" selects
+	// every field and bills at the highest Places SKU tier.
+	placesFieldMask = "places.formattedAddress,places.addressComponents"
 )
 
 type Client struct {

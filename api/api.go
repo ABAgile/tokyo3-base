@@ -3,8 +3,10 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"time"
@@ -127,6 +129,11 @@ func (rc *RestyClient) R(ctx context.Context, method, path string, result any, o
 	}
 	resp, err := req.Execute(method, path)
 	if err != nil {
+		// net/http embeds the full request URL in its error; scrub credential
+		// query parameters (API keys, tokens) before it reaches logs or callers.
+		if ue, ok := errors.AsType[*url.Error](err); ok {
+			ue.URL = sanitizeURL(ue.URL)
+		}
 		return fmt.Errorf("api call failed: %w", err)
 	}
 	if resp.IsError() {
