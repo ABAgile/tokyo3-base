@@ -10,6 +10,7 @@ package sealedcookie
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -38,6 +39,26 @@ type Cookie struct {
 	// header is believed from any peer. Direct TLS (r.TLS) always marks the
 	// cookie Secure.
 	Proxies *clientip.Extractor
+}
+
+// keySize is the AES-256 key length Cookie requires.
+const keySize = 32
+
+// Validate reports whether c is usable: a 32-byte key and a name net/http
+// will actually send. net/http silently drops a cookie with an invalid name
+// in Set, so catching it here turns a mysterious runtime failure into a
+// construction error.
+func (c Cookie) Validate() error {
+	if len(c.Key) != keySize {
+		return fmt.Errorf("sealedcookie: key must be %d bytes, got %d", keySize, len(c.Key))
+	}
+	if c.Name == "" {
+		return errors.New("sealedcookie: name is required")
+	}
+	if err := (&http.Cookie{Name: c.Name, Value: "x", Path: c.Path}).Valid(); err != nil {
+		return fmt.Errorf("sealedcookie: %w", err)
+	}
+	return nil
 }
 
 func (c Cookie) now() time.Time {

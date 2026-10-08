@@ -830,3 +830,50 @@ func TestCallback_RequireVerifiedEmail(t *testing.T) {
 		})
 	}
 }
+
+// A forged callback carrying ?error= but no matching state must not reflect
+// the error text or touch the pending flow.
+func TestCallback_ErrorParamRequiresState(t *testing.T) {
+	a := testAuth(t, stubTok{}, nil)
+	fc, flow := startFlow(t, a)
+
+	r := httptest.NewRequest(http.MethodGet, "/auth/callback?error=evil%20text&state=WRONG", nil)
+	r.AddCookie(fc)
+	rec := httptest.NewRecorder()
+	a.CallbackHandler()(rec, r)
+	if rec.Code != http.StatusBadRequest || strings.Contains(rec.Body.String(), "evil") {
+		t.Fatalf("forged error: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == a.flow.Name {
+			t.Fatalf("forged callback modified the flow cookie: %+v", c)
+		}
+	}
+
+	r = httptest.NewRequest(http.MethodGet, "/auth/callback?error=access_denied&state="+url.QueryEscape(flow.State), nil)
+	r.AddCookie(fc)
+	rec = httptest.NewRecorder()
+	a.CallbackHandler()(rec, r)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("genuine IdP error: code=%d, want 401", rec.Code)
+	}
+}
+
+func TestNewAuthenticator_RejectsUnusableFlowCookie(t *testing.T) {
+	sess := testSessionManager(t, nil)
+	good := sess.SiblingCookie("flow")
+	for name, mut := range map[string]func(*sealedcookie.Cookie){
+		"short key":    func(c *sealedcookie.Cookie) { c.Key = c.Key[:16] },
+		"empty name":   func(c *sealedcookie.Cookie) { c.Name = "" },
+		"invalid name": func(c *sealedcookie.Cookie) { c.Name = "bad name;" },
+	} {
+		c := good
+		mut(&c)
+		_, err := NewAuthenticator(AuthenticatorConfig{
+			Issuer: "i", ClientID: "c", RedirectURL: "r", Verifier: stubTok{}, FlowCookie: c,
+		}, sess)
+		if err == nil {
+			t.Errorf("%s: want construction error", name)
+		}
+	}
+}

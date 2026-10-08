@@ -186,10 +186,14 @@ func NewAuthenticator(cfg AuthenticatorConfig, sess SessionIssuer) (*Authenticat
 		return nil, errors.New("oidc: redirect url is required")
 	case cfg.Verifier == nil:
 		return nil, errors.New("oidc: verifier is required")
-	case len(cfg.FlowCookie.Key) == 0:
-		return nil, errors.New("oidc: flow cookie is required")
 	case isNilSessionIssuer(sess):
 		return nil, errors.New("oidc: session issuer is required")
+	}
+	if len(cfg.FlowCookie.Key) == 0 {
+		return nil, errors.New("oidc: flow cookie is required")
+	}
+	if err := cfg.FlowCookie.Validate(); err != nil {
+		return nil, fmt.Errorf("oidc: flow cookie: %w", err)
 	}
 	if cfg.Scopes == "" {
 		cfg.Scopes = defaultScopes
@@ -416,13 +420,16 @@ func (a *Authenticator) CallbackHandler() http.HandlerFunc {
 
 		q := r.URL.Query()
 		idx := matchFlow(flows, q.Get("state"))
-		if e := q.Get("error"); e != "" {
-			a.consumeFlow(w, r, flows, idx)
-			http.Error(w, "IdP returned an error: "+e, http.StatusUnauthorized)
-			return
-		}
+		// State first: an unauthenticated request (forged link) must not be
+		// able to put IdP-error text on this origin or end a pending login.
 		if idx < 0 {
 			http.Error(w, "state mismatch — possible CSRF; start again", http.StatusBadRequest)
+			return
+		}
+		if e := q.Get("error"); e != "" {
+			a.consumeFlow(w, r, flows, idx)
+			a.sess.Log().Warn("oidc: IdP returned an error", "error", e, "description", q.Get("error_description"))
+			http.Error(w, "IdP returned an error: "+e, http.StatusUnauthorized)
 			return
 		}
 		flow := flows[idx]

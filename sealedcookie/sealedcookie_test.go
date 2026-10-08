@@ -275,3 +275,20 @@ func TestSet_RejectsOversizedValue(t *testing.T) {
 		t.Error("no cookie should be written on error")
 	}
 }
+
+func TestCookie_Validate(t *testing.T) {
+	key := bytes.Repeat([]byte{1}, 32)
+	if err := (Cookie{Key: key, Name: "ok_flow", Path: "/"}).Validate(); err != nil {
+		t.Fatalf("valid cookie: %v", err)
+	}
+	for name, c := range map[string]Cookie{
+		"short key":    {Key: key[:16], Name: "n", Path: "/"},
+		"no key":       {Name: "n", Path: "/"},
+		"empty name":   {Key: key, Path: "/"},
+		"invalid name": {Key: key, Name: "bad name;", Path: "/"},
+	} {
+		if err := c.Validate(); err == nil {
+			t.Errorf("%s: want error", name)
+		}
+	}
+}
