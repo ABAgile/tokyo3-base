@@ -236,13 +236,20 @@ func TestCertLoader_Reload_BypassesMtimeGate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	origKeyStat, err := os.Stat(keyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	// Rotate in place, then pin mtime back to the original value so
-	// the lazy path sees "unchanged".
+	// Rotate in place, then pin both mtimes back to the original values
+	// so the lazy path sees "unchanged".
 	newCert, newKey, _ := writeCertKeyFiles(t)
 	overwrite(t, certFile, newCert)
 	overwrite(t, keyFile, newKey)
 	if err := os.Chtimes(certFile, origStat.ModTime(), origStat.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(keyFile, origKeyStat.ModTime(), origKeyStat.ModTime()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -263,6 +270,68 @@ func TestCertLoader_Reload_BypassesMtimeGate(t *testing.T) {
 	}
 	if forced == first {
 		t.Error("Reload did not swap the cert")
+	}
+}
+
+// TestCertLoader_LazyReload_OlderMtime: a replacement whose mtime is OLDER
+// than the loaded one (cp -p, restored backup) is still a change and must
+// be picked up by the lazy path.
+func TestCertLoader_LazyReload_OlderMtime(t *testing.T) {
+	certFile, keyFile, _ := writeCertKeyFiles(t)
+	loader := reloader.NewCertLoader(certFile, keyFile)
+	first, err := loader.GetCertificate(&tls.ClientHelloInfo{})
+	if err != nil {
+		t.Fatalf("initial load: %v", err)
+	}
+
+	newCert, newKey, _ := writeCertKeyFiles(t)
+	overwrite(t, certFile, newCert)
+	overwrite(t, keyFile, newKey)
+	past := time.Now().Add(-time.Hour)
+	for _, f := range []string{certFile, keyFile} {
+		if err := os.Chtimes(f, past, past); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	second, err := loader.GetCertificate(&tls.ClientHelloInfo{})
+	if err != nil {
+		t.Fatalf("second load: %v", err)
+	}
+	if second == first {
+		t.Error("replacement with an older mtime was not picked up")
+	}
+}
+
+// TestCertLoader_LazyReload_KeyOnlyChange: a rotation that changes only the
+// key file's mtime is noticed (here the swap fails because the new key does
+// not match the cert, proving a reload was attempted and the old cert kept).
+func TestCertLoader_LazyReload_KeyOnlyChange(t *testing.T) {
+	certFile, keyFile, _ := writeCertKeyFiles(t)
+	loader := reloader.NewCertLoader(certFile, keyFile)
+	var errs int
+	loader.OnError = func(error) { errs++ }
+	first, err := loader.GetCertificate(&tls.ClientHelloInfo{})
+	if err != nil {
+		t.Fatalf("initial load: %v", err)
+	}
+
+	_, otherKey, _ := writeCertKeyFiles(t)
+	overwrite(t, keyFile, otherKey)
+	future := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(keyFile, future, future); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := loader.GetCertificate(&tls.ClientHelloInfo{})
+	if err != nil {
+		t.Fatalf("second load: %v", err)
+	}
+	if got != first {
+		t.Error("mismatched key must keep the previous cert")
+	}
+	if errs == 0 {
+		t.Error("key-only change did not trigger a reload attempt")
 	}
 }
 

@@ -38,9 +38,10 @@ type CertLoader struct {
 	// Forced [CertLoader.Reload] failures return the error instead.
 	OnError func(err error)
 
-	mu      sync.RWMutex
-	cert    *tls.Certificate
-	modTime time.Time
+	mu         sync.RWMutex
+	cert       *tls.Certificate
+	modTime    time.Time // cert file mtime at the last successful load
+	keyModTime time.Time // key file mtime at the last successful load
 }
 
 // NewCertLoader creates a CertLoader. The cert/key are loaded lazily on first
@@ -69,10 +70,10 @@ func (c *CertLoader) GetClientCertificate(_ *tls.CertificateRequestInfo) (*tls.C
 // file's mtime has advanced. Shared by GetCertificate and
 // GetClientCertificate.
 func (c *CertLoader) current() (*tls.Certificate, error) {
-	fi, statErr := os.Stat(c.certFile)
+	certM, keyM, statOK := c.mtimes()
 
 	c.mu.RLock()
-	upToDate := c.cert != nil && statErr == nil && !fi.ModTime().After(c.modTime)
+	upToDate := c.cert != nil && statOK && certM.Equal(c.modTime) && keyM.Equal(c.keyModTime)
 	if upToDate {
 		cert := c.cert
 		c.mu.RUnlock()
@@ -91,6 +92,19 @@ func (c *CertLoader) current() (*tls.Certificate, error) {
 	return cert, err
 }
 
+// mtimes stats the cert and key files. ok is false when either stat fails.
+// Staleness is "mtime differs" rather than "mtime advanced": a replacement
+// that carries an older or preserved mtime (cp -p, a restored backup) must
+// still be picked up, as must a rotation that only touched the key.
+func (c *CertLoader) mtimes() (certM, keyM time.Time, ok bool) {
+	cfi, cerr := os.Stat(c.certFile)
+	kfi, kerr := os.Stat(c.keyFile)
+	if cerr != nil || kerr != nil {
+		return time.Time{}, time.Time{}, false
+	}
+	return cfi.ModTime(), kfi.ModTime(), true
+}
+
 // Reload re-reads the pair from disk regardless of mtime. Use from
 // rotators' post-write callbacks where mtime may not have advanced
 // past the cached value (same-second writes on coarse filesystems).
@@ -105,15 +119,11 @@ func (c *CertLoader) Reload() error {
 // loaded — callers decide whether to surface or swallow. Hooks fire
 // outside the lock.
 func (c *CertLoader) reload(forced bool) (*tls.Certificate, error) {
-	fi, statErr := os.Stat(c.certFile)
-	var mtime time.Time
-	if statErr == nil {
-		mtime = fi.ModTime()
-	}
+	certM, keyM, statOK := c.mtimes()
 
 	c.mu.Lock()
 	// Double-check under write lock.
-	if !forced && c.cert != nil && statErr == nil && !mtime.After(c.modTime) {
+	if !forced && c.cert != nil && statOK && certM.Equal(c.modTime) && keyM.Equal(c.keyModTime) {
 		cert := c.cert
 		c.mu.Unlock()
 		return cert, nil
@@ -129,12 +139,12 @@ func (c *CertLoader) reload(forced bool) (*tls.Certificate, error) {
 		return prev, err
 	}
 	c.cert = &newCert
-	if statErr == nil {
-		c.modTime = mtime
+	if statOK {
+		c.modTime, c.keyModTime = certM, keyM
 	}
 	c.mu.Unlock()
 	if c.OnSwap != nil {
-		c.OnSwap(&newCert, mtime)
+		c.OnSwap(&newCert, certM)
 	}
 	return &newCert, nil
 }
@@ -191,7 +201,7 @@ func (l *CALoader) Pool() (*x509.CertPool, error) {
 	}
 
 	l.mu.RLock()
-	upToDate := l.pool != nil && statErr == nil && !mtime.After(l.modTime)
+	upToDate := l.pool != nil && statErr == nil && mtime.Equal(l.modTime)
 	if upToDate {
 		pool := l.pool
 		l.mu.RUnlock()
@@ -201,7 +211,7 @@ func (l *CALoader) Pool() (*x509.CertPool, error) {
 
 	l.mu.Lock()
 	// Double-check under write lock.
-	if l.pool != nil && statErr == nil && !mtime.After(l.modTime) {
+	if l.pool != nil && statErr == nil && mtime.Equal(l.modTime) {
 		pool := l.pool
 		l.mu.Unlock()
 		return pool, nil
