@@ -230,7 +230,7 @@ func (h *AttrsHandler) Handle(ctx context.Context, r slog.Record) error {
 			}
 			sb.WriteString(a.Key)
 			sb.WriteString(": [")
-			fmt.Fprint(&sb, a.Value.Any())
+			fmt.Fprint(&sb, a.Value.Resolve().Any()) // Resolve so slog.LogValuer redaction applies
 			sb.WriteString("]")
 		}
 		nr := slog.NewRecord(r.Time, r.Level, sb.String(), r.PC)

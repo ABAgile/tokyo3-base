@@ -153,3 +153,20 @@ func TestStackFrame(t *testing.T) {
 		assert.Greater(t, strings.Count(all, "\n"), strings.Count(fewer, "\n"))
 	})
 }
+
+type secretVal struct{ token string }
+
+func (secretVal) LogValue() slog.Value { return slog.StringValue("REDACTED") }
+
+func TestAttrsHandler_ResolvesLogValuer(t *testing.T) {
+	var buf bytes.Buffer
+	logger := NewAttrsLogger(slog.NewTextHandler(&buf, nil))
+	logger.Info("login", "cred", secretVal{token: "hunter2"})
+	out := buf.String()
+	if strings.Contains(out, "hunter2") {
+		t.Errorf("secret leaked into log line: %s", out)
+	}
+	if !strings.Contains(out, "cred: [REDACTED]") {
+		t.Errorf("message annotation missing resolved value: %s", out)
+	}
+}
