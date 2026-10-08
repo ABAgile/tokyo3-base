@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // deviceSleeper is the channel-based sleep used between device-flow
@@ -64,15 +65,19 @@ func RunDeviceFlow(ctx context.Context, issuer, clientID string, stderr io.Write
 	}
 
 	if stderr != nil {
+		// These strings come from the IdP and go to a terminal: drop control
+		// characters so a hostile response can't inject escape sequences.
+		uri := terminalSafe(authz.VerificationURI)
+		complete := terminalSafe(authz.VerificationURIComplete)
 		fmt.Fprintln(stderr, "Visit this URL to approve sign-in:")
-		if authz.VerificationURIComplete != "" {
-			fmt.Fprintln(stderr, "  ", authz.VerificationURIComplete)
+		if complete != "" {
+			fmt.Fprintln(stderr, "  ", complete)
 		} else {
-			fmt.Fprintln(stderr, "  ", authz.VerificationURI)
+			fmt.Fprintln(stderr, "  ", uri)
 		}
 		fmt.Fprintln(stderr, "Or open this URL and enter the code below:")
-		fmt.Fprintln(stderr, "  ", authz.VerificationURI)
-		fmt.Fprintln(stderr, "  code:", authz.UserCode)
+		fmt.Fprintln(stderr, "  ", uri)
+		fmt.Fprintln(stderr, "  code:", terminalSafe(authz.UserCode))
 		fmt.Fprintln(stderr, "Waiting for approval…")
 	}
 
@@ -122,4 +127,15 @@ func RunDeviceFlow(ctx context.Context, issuer, clientID string, stderr io.Write
 				errResp.Error, strings.TrimSpace(errResp.ErrorDescription))
 		}
 	}
+}
+
+// terminalSafe removes control characters (including ESC, so ANSI/OSC
+// sequences lose their introducer) from s before it is printed to a terminal.
+func terminalSafe(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, s)
 }

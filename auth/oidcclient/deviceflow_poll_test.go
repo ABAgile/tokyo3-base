@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -105,5 +106,31 @@ func TestRunDeviceFlow_SlowDownAddsFiveSecondsEachTime(t *testing.T) {
 	want := []time.Duration{time.Second, 6 * time.Second, 11 * time.Second}
 	if got := sleeps(); !slices.Equal(got, want) {
 		t.Fatalf("poll intervals = %v, want %v", got, want)
+	}
+}
+
+func TestRunDeviceFlow_StripsControlCharsFromPrompt(t *testing.T) {
+	recordDeviceSleeps(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/device_authorization", func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, `{"device_code":"d","user_code":"AB\u001b[2JCD","verification_uri":"https://example.test/\u001b]0;pwned\u0007device","expires_in":60,"interval":1}`)
+	})
+	mux.HandleFunc("/token", func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, `{"access_token":"at","expires_in":60}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	var out strings.Builder
+	if _, err := RunDeviceFlow(context.Background(), srv.URL, "cli", &out); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range out.String() {
+		if r != '\n' && r < 0x20 || r == 0x7f {
+			t.Fatalf("control character %q reached the terminal: %q", r, out.String())
+		}
+	}
+	if !strings.Contains(out.String(), "code: AB[2JCD") {
+		t.Errorf("user code missing from prompt: %q", out.String())
 	}
 }
