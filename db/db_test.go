@@ -1,7 +1,9 @@
 package db
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
@@ -221,4 +223,35 @@ func TestCopyDeref_ErrorCases(t *testing.T) {
 		assert.Error(t, err)
 		assert.Equal(t, "expected struct types", err.Error())
 	})
+}
+
+func TestConvertPgPlaceholders_LiteralEdgeCases(t *testing.T) {
+	tests := []struct {
+		name, sql, want string
+		args            []any
+		wantArgs        []any
+	}{
+		{"E string backslash-escaped quote", `SELECT E'it\'s $1', $1`, `SELECT E'it\'s $1', ?`, []any{1}, []any{1}},
+		{"plain string keeps backslash literal", `SELECT 'a\', $1`, `SELECT 'a\', ?`, []any{1}, []any{1}},
+		{"identifier containing $", `SELECT col$1 FROM t WHERE id = $1`, `SELECT col$1 FROM t WHERE id = ?`, []any{1}, []any{1}},
+		{"identifier ending in e is not an E string", `SELECT code'x', $1`, `SELECT code'x', ?`, []any{1}, []any{1}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, args, err := ConvertPgPlaceholders(tc.sql, tc.args...)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+			assert.Equal(t, tc.wantArgs, args)
+		})
+	}
+}
+
+func TestNewPgxPoolContext_FailsFastWhenUnreachable(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	pool, err := NewPgxPoolContext(ctx, "postgres://user:secret@127.0.0.1:1/db?sslmode=disable&connect_timeout=2")
+	assert.Nil(t, pool)
+	if assert.Error(t, err) {
+		assert.NotContains(t, err.Error(), "secret")
+	}
 }

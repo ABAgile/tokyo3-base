@@ -21,6 +21,8 @@ var (
 	byteSliceType      = reflect.TypeFor[[]byte]()
 )
 
+// NewPgxPool parses connStr and builds a pool without contacting the database.
+// Use [NewPgxPoolContext] to also fail fast when the database is unreachable.
 func NewPgxPool(connStr string, opts ...DatabaseConfigOption) (*pgxpool.Pool, error) {
 	pgConf, err := pgxpool.ParseConfig(connStr)
 	if err != nil {
@@ -30,6 +32,21 @@ func NewPgxPool(connStr string, opts ...DatabaseConfigOption) (*pgxpool.Pool, er
 		opt(pgConf)
 	}
 	return pgxpool.NewWithConfig(context.Background(), pgConf)
+}
+
+// NewPgxPoolContext is [NewPgxPool] followed by a Ping bounded by ctx, so a
+// bad address, credential, or TLS setup surfaces at startup. The pool is closed
+// when the ping fails.
+func NewPgxPoolContext(ctx context.Context, connStr string, opts ...DatabaseConfigOption) (*pgxpool.Pool, error) {
+	pool, err := NewPgxPool(connStr, opts...)
+	if err != nil {
+		return nil, err
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ping database %s: %w", SantizeDbConn(connStr), err)
+	}
+	return pool, nil
 }
 
 func WithDecimalRegister() DatabaseConfigOption {
@@ -113,7 +130,7 @@ func ConvertPgPlaceholders(sql string, args ...any) (string, []any, error) {
 			i = end
 			continue
 		}
-		if sql[i] == '$' {
+		if sql[i] == '$' && !(i > 0 && isIdentByte(sql[i-1])) { // `col$1` is an identifier, not a placeholder
 			j := i + 1
 			for j < len(sql) && sql[j] >= '0' && sql[j] <= '9' {
 				j++
@@ -147,7 +164,13 @@ func ConvertPgPlaceholders(sql string, args ...any) (string, []any, error) {
 func skipLiteral(sql string, i int) int {
 	switch c := sql[i]; {
 	case c == '\'' || c == '"':
+		// E'...' strings treat backslash as an escape character.
+		esc := c == '\'' && i > 0 && (sql[i-1] == 'e' || sql[i-1] == 'E') && (i < 2 || !isIdentByte(sql[i-2]))
 		for j := i + 1; j < len(sql); j++ {
+			if esc && sql[j] == '\\' {
+				j++
+				continue
+			}
 			if sql[j] == c {
 				if j+1 < len(sql) && sql[j+1] == c { // doubled quote is an escape
 					j++
@@ -179,6 +202,9 @@ func skipLiteral(sql string, i int) int {
 		}
 		return len(sql)
 	case c == '$':
+		if i > 0 && isIdentByte(sql[i-1]) {
+			return i // `$` inside an identifier, not a dollar-quote
+		}
 		// $tag$ opens a dollar-quote; a tag may not start with a digit, which
 		// keeps $1 a placeholder.
 		j := i + 1
@@ -195,6 +221,12 @@ func skipLiteral(sql string, i int) int {
 		return len(sql)
 	}
 	return i
+}
+
+// isIdentByte reports whether b can be part of an unquoted SQL identifier.
+func isIdentByte(b byte) bool {
+	return b == '_' || b == '$' || b >= 0x80 ||
+		b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9'
 }
 
 func CopyDeref[T any, U any](src T, dst *U) (*U, error) {
