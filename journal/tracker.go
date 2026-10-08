@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"sort"
 	"sync"
+	"time"
 )
 
 // DefaultTrackerSize is the ring cap when [TrackerConfig.Max] is unset. Old
@@ -26,6 +27,7 @@ type Tracker[T any] struct {
 	max    int
 	label  string
 	log    *slog.Logger
+	retry  time.Duration
 
 	mu   sync.RWMutex
 	ring []T // newest first
@@ -56,6 +58,14 @@ type TrackerConfig[T any] struct {
 
 	// Log is the structured logger. nil ⇒ slog.Default.
 	Log *slog.Logger
+
+	// ResubscribeWait, when > 0, makes [Tracker.Run] survive a source that
+	// drops: if the source channel closes (or Subscribe fails) while ctx is
+	// live, Run waits this long and subscribes again, resuming after the last
+	// sequence it ingested so nothing is duplicated or skipped. 0 keeps the
+	// legacy behaviour — a closed channel ends Run with a nil error — which
+	// leaves the ring silently stale if the source died unexpectedly.
+	ResubscribeWait time.Duration
 }
 
 // NewTracker validates cfg and returns a Tracker. Source and Decode are the
@@ -80,19 +90,50 @@ func NewTracker[T any](cfg TrackerConfig[T]) (*Tracker[T], error) {
 		max:    cfg.Max,
 		label:  cfg.Label,
 		log:    cfg.Log,
+		retry:  cfg.ResubscribeWait,
 	}, nil
 }
 
 // Run subscribes to the source — replaying the last Max records, then tailing
 // — and ingests until ctx is cancelled or the source channel closes. Returns
-// ctx.Err() on cancel and nil on a clean channel close. Own the goroutine via
+// ctx.Err() on cancel and nil on a clean channel close. With
+// [TrackerConfig.ResubscribeWait] set, a dropped source is resubscribed (from
+// the last ingested sequence) instead of ending Run. Own the goroutine via
 // [guard.Go] or a run.Group component.
 func (t *Tracker[T]) Run(ctx context.Context) error {
-	ch, err := t.src.Subscribe(ctx, t.max, 0)
-	if err != nil {
-		return err
+	var lastSeq uint64
+	for {
+		replay, from := t.max, uint64(0)
+		if lastSeq > 0 {
+			replay, from = 0, lastSeq+1 // resume: don't replay what the ring already holds
+		}
+		ch, err := t.src.Subscribe(ctx, replay, from)
+		if err == nil {
+			t.log.Info("journal tracker subscribed", "label", t.label, "replay", replay, "from_seq", from)
+			if err = t.ingest(ctx, ch, &lastSeq); err == nil && t.retry <= 0 {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			t.log.Warn("journal tracker source closed; resubscribing", "label", t.label, "wait", t.retry)
+		} else {
+			if t.retry <= 0 || ctx.Err() != nil {
+				return err
+			}
+			t.log.Warn("journal tracker subscribe failed; retrying", "label", t.label, "wait", t.retry, "err", err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(t.retry):
+		}
 	}
-	t.log.Info("journal tracker subscribed", "label", t.label, "replay", t.max)
+}
+
+// ingest drains ch into the ring, recording the newest sequence seen. It
+// returns ctx.Err() on cancel and nil when the channel closes.
+func (t *Tracker[T]) ingest(ctx context.Context, ch <-chan Msg, lastSeq *uint64) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -100,6 +141,9 @@ func (t *Tracker[T]) Run(ctx context.Context) error {
 		case msg, ok := <-ch:
 			if !ok {
 				return nil
+			}
+			if msg.Seq > *lastSeq {
+				*lastSeq = msg.Seq
 			}
 			if v, keep := t.decode(msg); keep {
 				t.insert(v)

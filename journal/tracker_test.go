@@ -3,6 +3,7 @@ package journal_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"testing"
@@ -151,5 +152,74 @@ func TestNewTracker_Validation(t *testing.T) {
 	}
 	if _, err := journal.NewTracker(journal.TrackerConfig[event]{Source: &feedSource{}}); err == nil {
 		t.Error("want error when Decode is nil")
+	}
+}
+
+// dropSource closes each subscription after its batch; it records the
+// (replay, startFromSeq) of every Subscribe so resume behaviour is observable.
+type dropSource struct {
+	batches [][]journal.Msg
+	calls   [][2]uint64
+	done    chan struct{}
+}
+
+func (d *dropSource) Subscribe(ctx context.Context, replay int, from uint64) (<-chan journal.Msg, error) {
+	d.calls = append(d.calls, [2]uint64{uint64(replay), from})
+	i := len(d.calls) - 1
+	if i >= len(d.batches) {
+		close(d.done)
+		ch := make(chan journal.Msg)
+		go func() { <-ctx.Done(); close(ch) }()
+		return ch, nil
+	}
+	ch := make(chan journal.Msg, len(d.batches[i]))
+	for _, m := range d.batches[i] {
+		ch <- m
+	}
+	close(ch)
+	return ch, nil
+}
+func (d *dropSource) Close() error { return nil }
+
+func TestTracker_ResubscribesFromLastSeq(t *testing.T) {
+	now := time.Now()
+	src := &dropSource{
+		batches: [][]journal.Msg{
+			{jmsg(t, 4, "a", now), jmsg(t, 5, "b", now)},
+			{jmsg(t, 6, "c", now)},
+		},
+		done: make(chan struct{}),
+	}
+	tr, err := journal.NewTracker(journal.TrackerConfig[event]{
+		Source: src, Decode: decodeEvent, Max: 10, Log: discard(), ResubscribeWait: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- tr.Run(ctx) }()
+
+	select {
+	case <-src.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("tracker never resubscribed a third time")
+	}
+	cancel()
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want context.Canceled", err)
+	}
+
+	want := [][2]uint64{{10, 0}, {0, 6}, {0, 7}}
+	if len(src.calls) != len(want) {
+		t.Fatalf("Subscribe calls = %v, want %v", src.calls, want)
+	}
+	for i := range want {
+		if src.calls[i] != want[i] {
+			t.Errorf("call %d = %v, want %v", i, src.calls[i], want[i])
+		}
+	}
+	if got := tr.Snapshot(); len(got) != 3 {
+		t.Errorf("ring has %d events, want 3 (no duplicates): %+v", len(got), got)
 	}
 }
