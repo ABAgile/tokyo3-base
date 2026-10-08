@@ -376,6 +376,12 @@ func (a *Authenticator) CallbackHandler() http.HandlerFunc {
 			return
 		}
 
+		if claims.Subject == "" {
+			a.sess.Log().Warn("oidc: id_token has no subject; login refused")
+			http.Error(w, "invalid ID token", http.StatusUnauthorized)
+			return
+		}
+
 		if oc, ok := a.sess.(CompletionOverride); ok {
 			if err := oc.CompleteLogin(w, r, claims, CompletedFlow{ReturnTo: flow.ReturnTo, Extra: flow.Extra}); err != nil {
 				a.sess.Log().Error("oidc: complete login failed", "email", claims.Email, "err", err)

@@ -339,6 +339,28 @@ func TestCallback_NonceMismatch(t *testing.T) {
 	}
 }
 
+func TestCallback_EmptySubjectRefused(t *testing.T) {
+	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "at", "id_token": "it"})
+	}))
+	defer tokenSrv.Close()
+	stub := stubTok{}
+	a := testAuth(t, stub, func(c *AuthenticatorConfig) { c.Issuer = tokenSrv.URL })
+	fc, flow := startFlow(t, a)
+	stub.claims = &Claims{Email: "alice@x", Nonce: flow.Nonce} // no sub
+	a.cfg.Verifier = stub
+	r := httptest.NewRequest(http.MethodGet, "/auth/callback?state="+url.QueryEscape(flow.State)+"&code=abc", nil)
+	r.AddCookie(fc)
+	rec := httptest.NewRecorder()
+	a.CallbackHandler()(rec, r)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("code = %d, want 401 for a token without sub", rec.Code)
+	}
+	if otherCookie(rec.Result().Cookies(), a.flow.Name) != nil {
+		t.Error("a session cookie was issued for a subject-less token")
+	}
+}
+
 // ── CompletionOverride ────────────────────────────────────────────────────────
 
 // fakeOverrideIssuer is a minimal SessionIssuer + CompletionOverride
