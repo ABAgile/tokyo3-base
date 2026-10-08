@@ -334,3 +334,25 @@ func TestNoopSource_ClosesOnCancel(t *testing.T) {
 		t.Fatal("channel did not close after ctx cancel")
 	}
 }
+
+func TestHandler_DoneEndsStream(t *testing.T) {
+	src := newFakeSource()
+	done := make(chan struct{})
+	srv := httptest.NewServer(sse.Handler{Source: src, Done: done})
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	close(done)
+	finished := make(chan struct{})
+	go func() { _, _ = io.Copy(io.Discard, resp.Body); close(finished) }()
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream did not end after Done closed")
+	}
+}

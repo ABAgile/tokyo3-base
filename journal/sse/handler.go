@@ -46,6 +46,11 @@ type Handler struct {
 	Source    journal.Source
 	Replay    int
 	Heartbeat time.Duration
+	// Done, when non-nil, ends every stream once closed. http.Server.Shutdown
+	// does not cancel request contexts, so without it an open stream holds a
+	// graceful shutdown until its timeout; pass a channel closed when the
+	// server begins shutting down (e.g. ctx.Done() of the run.Group).
+	Done <-chan struct{}
 }
 
 // ServeHTTP implements http.Handler. Returns 500 if the response writer
@@ -104,6 +109,8 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case <-r.Context().Done():
+			return
+		case <-h.Done:
 			return
 		case <-tickC:
 			// SSE comment line — clients ignore it; proxies see traffic.

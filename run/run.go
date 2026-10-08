@@ -62,6 +62,11 @@ func Group(ctx context.Context, components ...Component) error {
 // (the expected result of Shutdown) is folded to nil. Set useTLS for
 // ListenAndServeTLS (the server's TLSConfig is the cert source, so the cert/key
 // args are empty); otherwise plain ListenAndServe.
+//
+// Shutdown does not cancel in-flight request contexts, so a long-lived handler
+// (SSE, long-poll) must stop on its own signal — e.g. sse.Handler.Done set to
+// the group's ctx.Done() — or Shutdown waits out shutdownTimeout and returns
+// context.DeadlineExceeded.
 func HTTPServer(srv *http.Server, shutdownTimeout time.Duration, useTLS bool) Component {
 	return func(ctx context.Context) error {
 		serveErr := make(chan error, 1)
