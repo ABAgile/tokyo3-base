@@ -2,6 +2,7 @@ package envutil
 
 import (
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"strconv"
@@ -10,8 +11,8 @@ import (
 )
 
 // Float reads the env var named by key as a float64. An unset or empty var
-// yields (0, nil) so callers can apply their own default; a malformed value is
-// an error naming the key.
+// yields (0, nil) so callers can apply their own default; a malformed or non-finite
+// (NaN, Inf) value is an error naming the key.
 func Float(key string) (float64, error) {
 	v := strings.TrimSpace(os.Getenv(key))
 	if v == "" {
@@ -20,6 +21,9 @@ func Float(key string) (float64, error) {
 	f, err := strconv.ParseFloat(v, 64)
 	if err != nil {
 		return 0, fmt.Errorf("%s: %w", key, err)
+	}
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, fmt.Errorf("%s: %q is not a finite number", key, v)
 	}
 	return f, nil
 }

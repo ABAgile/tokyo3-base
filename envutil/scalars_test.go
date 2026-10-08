@@ -73,3 +73,12 @@ func TestCIDRList(t *testing.T) {
 		t.Error("malformed CIDRList should error")
 	}
 }
+
+func TestFloat_RejectsNonFinite(t *testing.T) {
+	for _, v := range []string{"NaN", "Inf", "-Inf", "+Inf"} {
+		t.Setenv("RL_NONFINITE", v)
+		if _, err := envutil.Float("RL_NONFINITE"); err == nil {
+			t.Errorf("Float(%q) should error", v)
+		}
+	}
+}
