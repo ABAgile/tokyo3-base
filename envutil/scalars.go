@@ -75,8 +75,10 @@ func CIDRList(key string) ([]*net.IPNet, error) {
 		}
 		if !strings.Contains(part, "/") {
 			if ip := net.ParseIP(part); ip != nil {
-				if ip.To4() != nil {
-					part += "/32"
+				// An IPv4-mapped IPv6 literal is the IPv4 host; appending /32
+				// to its textual form would instead yield ::/32.
+				if v4 := ip.To4(); v4 != nil {
+					part = v4.String() + "/32"
 				} else {
 					part += "/128"
 				}
@@ -86,7 +88,22 @@ func CIDRList(key string) ([]*net.IPNet, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", key, err)
 		}
-		out = append(out, n)
+		out = append(out, unmapCIDR(n))
 	}
 	return out, nil
+}
+
+// unmapCIDR rewrites an IPv4-mapped IPv6 prefix (::ffff:a.b.c.d/N, N >= 96) as
+// the equivalent IPv4 prefix. clientip canonicalizes IPv4-mapped peers to plain
+// IPv4, so a mapped network would otherwise never match any peer.
+func unmapCIDR(n *net.IPNet) *net.IPNet {
+	ones, bits := n.Mask.Size()
+	if bits != 128 || ones < 96 {
+		return n
+	}
+	v4 := n.IP.To4()
+	if v4 == nil {
+		return n
+	}
+	return &net.IPNet{IP: v4, Mask: net.CIDRMask(ones-96, 32)}
 }

@@ -1,6 +1,7 @@
 package envutil_test
 
 import (
+	"net"
 	"testing"
 	"time"
 
@@ -80,5 +81,19 @@ func TestFloat_RejectsNonFinite(t *testing.T) {
 		if _, err := envutil.Float("RL_NONFINITE"); err == nil {
 			t.Errorf("Float(%q) should error", v)
 		}
+	}
+}
+
+func TestCIDRList_IPv4MappedIPv6(t *testing.T) {
+	t.Setenv("TP", "::ffff:10.0.0.1, ::ffff:192.168.0.0/112")
+	nets, err := envutil.CIDRList("TP")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nets) != 2 || nets[0].String() != "10.0.0.1/32" || nets[1].String() != "192.168.0.0/16" {
+		t.Fatalf("nets = %v, want [10.0.0.1/32 192.168.0.0/16]", nets)
+	}
+	if !nets[0].Contains(net.ParseIP("10.0.0.1")) || nets[0].Contains(net.ParseIP("10.0.0.2")) {
+		t.Error("mapped host entry must match exactly the IPv4 host")
 	}
 }
