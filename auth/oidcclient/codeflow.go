@@ -50,8 +50,10 @@ func RunCodeFlow(ctx context.Context, issuer, clientID string, port int, stderr 
 			return "", fmt.Errorf("auth server returned error: %s (%s)", e, q.Get("error_description"))
 		}
 		if q.Get("state") != state {
+			// Not our redirect (stray local request or forged link): keep
+			// waiting for the real one rather than aborting the login.
 			http.Error(w, "state mismatch", http.StatusBadRequest)
-			return "", errors.New("state mismatch (possible CSRF)")
+			return "", ErrCallbackIgnored
 		}
 		code := q.Get("code")
 		if code == "" {

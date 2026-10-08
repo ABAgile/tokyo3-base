@@ -51,8 +51,45 @@ func LoopbackListener(port int, path string) (net.Listener, string, error) {
 // timing assumption callers have to get right on their own.
 type LoopbackCallback struct {
 	srv      *http.Server
-	once     sync.Once
+	mu       sync.Mutex
+	done     bool
 	resultCh chan loopbackResult
+}
+
+// ErrCallbackIgnored may be returned by a StartLoopbackCallback handler for a
+// request that is not the expected redirect (for example a wrong state, sent
+// by another local process or web page). The request does not count: Wait
+// keeps waiting for the genuine callback instead of aborting the login.
+var ErrCallbackIgnored = errors.New("loopback callback ignored")
+
+// serve runs handle for one request unless the outcome is already decided
+// (reported as false). The lock is held across handle so concurrent requests
+// can't both win; defer keeps a panicking handler from wedging it.
+func (lc *LoopbackCallback) serve(w http.ResponseWriter, r *http.Request, handle func(http.ResponseWriter, *http.Request) (string, error)) bool {
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	if lc.done {
+		return false
+	}
+	value, err := handle(w, r)
+	if errors.Is(err, ErrCallbackIgnored) {
+		return true
+	}
+	lc.done = true
+	lc.resultCh <- loopbackResult{value, err}
+	return true
+}
+
+// finish records the first outcome and reports whether this call was it.
+func (lc *LoopbackCallback) finish(r loopbackResult) bool {
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	if lc.done {
+		return false
+	}
+	lc.done = true
+	lc.resultCh <- r
+	return true
 }
 
 type loopbackResult struct {
@@ -65,7 +102,9 @@ type loopbackResult struct {
 // time this call returns, so the caller can safely open the browser
 // next. handle inspects each request, writes the browser-facing
 // response, and returns either a caller-defined success value or an
-// error; only the first request's outcome is delivered by Wait.
+// error; only the first request's outcome is delivered by Wait, except that a
+// handler returning [ErrCallbackIgnored] leaves the callback open for the
+// next request.
 //
 // This is the shared "wait for exactly one browser redirect" mechanic
 // behind RunCodeFlow (which waits for an OAuth ?code=/?state=
@@ -77,20 +116,14 @@ func StartLoopbackCallback(listener net.Listener, path string, handle func(w htt
 	lc := &LoopbackCallback{resultCh: make(chan loopbackResult, 1)}
 	mux := http.NewServeMux()
 	mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
-		handled := false
-		lc.once.Do(func() {
-			handled = true
-			value, err := handle(w, r)
-			lc.resultCh <- loopbackResult{value, err}
-		})
-		if !handled {
+		if !lc.serve(w, r, handle) {
 			http.Error(w, "callback already received", http.StatusConflict)
 		}
 	})
 	lc.srv = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		if err := lc.srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			lc.once.Do(func() { lc.resultCh <- loopbackResult{err: err} })
+			lc.finish(loopbackResult{err: err})
 		}
 	}()
 	return lc

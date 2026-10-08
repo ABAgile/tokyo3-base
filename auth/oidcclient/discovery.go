@@ -79,15 +79,17 @@ func discoverEndpoints(ctx context.Context, issuer string) endpoints {
 		return fallback
 	}
 
+	// Endpoints that would carry credentials in cleartext are ignored, so a
+	// discovery document can't downgrade the exchange to plain http.
 	ep := fallback
-	if doc.AuthorizationEndpoint != "" {
-		ep.AuthorizationEndpoint = doc.AuthorizationEndpoint
-	}
-	if doc.TokenEndpoint != "" {
-		ep.TokenEndpoint = doc.TokenEndpoint
-	}
-	if doc.DeviceAuthorizationEndpoint != "" {
-		ep.DeviceAuthorizationEndpoint = doc.DeviceAuthorizationEndpoint
+	for dst, src := range map[*string]string{
+		&ep.AuthorizationEndpoint:       doc.AuthorizationEndpoint,
+		&ep.TokenEndpoint:               doc.TokenEndpoint,
+		&ep.DeviceAuthorizationEndpoint: doc.DeviceAuthorizationEndpoint,
+	} {
+		if src != "" && requireSecureEndpoint(src) == nil {
+			*dst = src
+		}
 	}
 	return ep
 }

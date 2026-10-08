@@ -30,6 +30,7 @@ type codeFlowFixture struct {
 	overrideCode  string // if non-empty, used as the ?code= value
 	overrideState string // if non-empty, used as the ?state= value (mismatch test)
 	skipCallback  bool   // if true, OpenBrowser doesn't fire the callback at all
+	strayFirst    bool   // if true, a bad-state request hits the callback before the real one
 }
 
 // reset locks the OpenBrowser var for the duration of a single test.
@@ -96,6 +97,11 @@ func (f *codeFlowFixture) install() {
 			// codeCh before we fire — otherwise the goroutine race
 			// could surface a flake under load. 50ms is plenty.
 			time.Sleep(50 * time.Millisecond)
+			if f.strayFirst {
+				if resp, err := http.Get(redirect + "?code=stolen&state=forged"); err == nil {
+					resp.Body.Close()
+				}
+			}
 			cb := redirect + "?code=" + url.QueryEscape(code) + "&state=" + url.QueryEscape(state)
 			resp, err := http.Get(cb)
 			if err == nil {
@@ -133,23 +139,38 @@ func TestRunCodeFlow_HappyPath(t *testing.T) {
 	}
 }
 
-// TestRunCodeFlow_StateMismatchAborts: the callback handler must
-// reject a mismatched state (CSRF defence) and surface that as the
-// error from RunCodeFlow rather than continuing to exchange the
-// code.
-func TestRunCodeFlow_StateMismatchAborts(t *testing.T) {
+// TestRunCodeFlow_StateMismatchIgnored: a callback with the wrong state
+// (stray local request, forged link) must not complete the flow and must not
+// consume the one callback slot — RunCodeFlow keeps waiting and the genuine
+// redirect still succeeds.
+func TestRunCodeFlow_StateMismatchIgnored(t *testing.T) {
 	f := newCodeFlowFixture(t)
-	f.overrideState = "wrong-state-totally-different"
+	f.strayFirst = true
 	f.install()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err := RunCodeFlow(ctx, f.srv.URL, "cli-client", 0, io.Discard)
-	if err == nil {
-		t.Fatal("RunCodeFlow: expected state-mismatch error, got nil")
+	tok, err := RunCodeFlow(ctx, f.srv.URL, "cli-client", 0, io.Discard)
+	if err != nil {
+		t.Fatalf("RunCodeFlow after stray request: %v", err)
 	}
-	if !strings.Contains(err.Error(), "state mismatch") {
-		t.Errorf("error %q does not mention state mismatch", err.Error())
+	if tok.AccessToken != "at-code" {
+		t.Errorf("tokens = %+v", tok)
+	}
+}
+
+// TestRunCodeFlow_OnlyStateMismatchNeverCompletes: with nothing but a
+// mismatched-state callback the flow must not exchange a code.
+func TestRunCodeFlow_OnlyStateMismatchNeverCompletes(t *testing.T) {
+	f := newCodeFlowFixture(t)
+	f.overrideState = "wrong-state-totally-different"
+	f.install()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	tok, err := RunCodeFlow(ctx, f.srv.URL, "cli-client", 0, io.Discard)
+	if err == nil {
+		t.Fatalf("RunCodeFlow: expected failure, got tokens %+v", tok)
 	}
 }
 

@@ -40,6 +40,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -85,10 +86,19 @@ func CacheDir() (string, error) {
 		return "", err
 	}
 	dir := filepath.Join(base, rootDirName)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := ensurePrivateDir(dir); err != nil {
 		return "", err
 	}
 	return dir, nil
+}
+
+// ensurePrivateDir creates dir (0o700) and tightens it if it already existed
+// with looser permissions.
+func ensurePrivateDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	return os.Chmod(dir, 0o700)
 }
 
 // AppCacheDir returns $XDG_CONFIG_HOME/auth-sso/<appName>/, creating
@@ -110,7 +120,7 @@ func AppCacheDir(appName string) (string, error) {
 		return "", err
 	}
 	dir := filepath.Join(base, appName)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := ensurePrivateDir(dir); err != nil {
 		return "", err
 	}
 	return dir, nil
@@ -240,13 +250,30 @@ func loadCachedTokens() (*cachedTokens, error) {
 // If the issuer doesn't re-issue an id_token on refresh, the
 // previously-cached IDToken is retained — refresh responses are
 // allowed to omit it per OIDC spec.
+//
+// Refreshes are serialised across processes by an advisory file lock
+// (Unix), so concurrent helpers cannot burn the rotated refresh token.
 func EnsureFreshTokens(ctx context.Context, cfg Config, accessSkew time.Duration) (*Tokens, error) {
-	cached, err := loadCachedTokens()
+	cached, err := loadMatchingTokens(cfg)
 	if err != nil {
 		return nil, err
 	}
-	if cached.Config != nil && *cached.Config != cfg {
-		return nil, errors.New("SSO cache issuer/client mismatch; run login again")
+	if time.Until(cached.Expiration) >= accessSkew {
+		return &cached.Tokens, nil
+	}
+
+	// The refresh token rotates on use and the cache is shared by every
+	// helper, so concurrent refreshes would burn it (and may trip the IdP's
+	// reuse detection). Serialise them, then re-read: another process may
+	// have refreshed while this one waited for the lock.
+	unlock, err := lockTokens()
+	if err != nil {
+		return nil, fmt.Errorf("lock token cache: %w", err)
+	}
+	defer unlock()
+	cached, err = loadMatchingTokens(cfg)
+	if err != nil {
+		return nil, err
 	}
 	tokens := &cached.Tokens
 	if time.Until(tokens.Expiration) >= accessSkew {
@@ -268,6 +295,19 @@ func EnsureFreshTokens(ctx context.Context, cfg Config, accessSkew time.Duration
 		return nil, fmt.Errorf("save tokens: %w", err)
 	}
 	return fresh, nil
+}
+
+// loadMatchingTokens loads the cached tokens and rejects a cache bound to a
+// different issuer/client than cfg.
+func loadMatchingTokens(cfg Config) (*cachedTokens, error) {
+	cached, err := loadCachedTokens()
+	if err != nil {
+		return nil, err
+	}
+	if cached.Config != nil && *cached.Config != cfg {
+		return nil, errors.New("SSO cache issuer/client mismatch; run login again")
+	}
+	return cached, nil
 }
 
 // Refresh swaps a refresh_token for a fresh access + (rotated)
@@ -318,8 +358,39 @@ func PostTokenAt(ctx context.Context, tokenURL string, form url.Values) (*Tokens
 	return parseTokens(body)
 }
 
+// noRedirectClient is used for credential-bearing POSTs: a redirect would
+// replay the form (codes, refresh tokens, device codes) to another URL.
+var noRedirectClient = &http.Client{
+	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+}
+
+// requireSecureEndpoint rejects endpoints that would carry credentials over
+// cleartext: only https, or http to a loopback host (local dev/test IdPs).
+func requireSecureEndpoint(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("oidcclient: invalid endpoint: %w", err)
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		host := u.Hostname()
+		if host == "localhost" {
+			return nil
+		}
+		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+			return nil
+		}
+	}
+	return fmt.Errorf("oidcclient: refusing non-https endpoint %s://%s", u.Scheme, u.Host)
+}
+
 // postForm bounds each exchange through the body read, not just the headers.
 func postForm(ctx context.Context, endpoint string, form url.Values) (int, []byte, error) {
+	if err := requireSecureEndpoint(endpoint); err != nil {
+		return 0, nil, err
+	}
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
@@ -329,7 +400,7 @@ func postForm(ctx context.Context, endpoint string, form url.Values) (int, []byt
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := noRedirectClient.Do(req)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -469,6 +540,10 @@ func WriteFileAtomic(path string, data []byte, mode os.FileMode) error {
 		return err
 	}
 	if err := f.Chmod(mode); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
 		f.Close()
 		return err
 	}

@@ -567,6 +567,9 @@ func Refresh(ctx context.Context, issuer, clientID, refreshToken string) (*Token
 invocation: returns cached tokens if the access token has more than
 `accessSkew` remaining, otherwise transparently refreshes via the
 refresh token, persists the rotated pair, and returns the new tokens.
+Refreshes are serialised across processes by an advisory file lock (Unix),
+so concurrent helpers can't burn the rotated token. Token endpoints must be
+`https` (or loopback `http`) and redirects are not followed.
 Refresh-token rotation is the assumed default (the new refresh token
 in the response replaces the old); if the issuer omits the new
 refresh in the response (rotation disabled at the AS), the previous
