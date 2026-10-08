@@ -330,6 +330,16 @@ func (r *Reloader) TLSConfig(poolName string, opts ...TLSConfigOption) *tls.Conf
 	for _, opt := range opts {
 		opt(cfg)
 	}
+	// The handshake reports no server name when the target is an IP literal
+	// (no SNI is sent), so fall back to the configured ServerName — typically
+	// set via [WithServerName] — rather than skipping hostname verification.
+	verify := cfg.VerifyConnection
+	cfg.VerifyConnection = func(cs tls.ConnectionState) error {
+		if cs.ServerName == "" {
+			cs.ServerName = cfg.ServerName
+		}
+		return verify(cs)
+	}
 	return cfg
 }
 

@@ -361,3 +361,32 @@ func TestVerifyPeerChain_FailsClosed(t *testing.T) {
 		t.Error("expected error for empty peer chain")
 	}
 }
+
+// TestVerifyPeerChain_RequiresServerName: an empty ServerName would make
+// x509 skip hostname verification, so it must be rejected rather than let
+// any CA-signed cert pass for any host.
+func TestVerifyPeerChain_RequiresServerName(t *testing.T) {
+	cert, err := SelfSignedCert()
+	if err != nil {
+		t.Fatalf("SelfSignedCert: %v", err)
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		t.Fatalf("parse leaf: %v", err)
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(leaf)
+
+	cs := tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}}
+	if err := VerifyPeerChain(pool, cs); err == nil {
+		t.Error("expected error for empty ServerName")
+	}
+	cs.ServerName = "localhost"
+	if err := VerifyPeerChain(pool, cs); err != nil {
+		t.Errorf("valid ServerName rejected: %v", err)
+	}
+	cs.ServerName = "other.example"
+	if err := VerifyPeerChain(pool, cs); err == nil {
+		t.Error("expected hostname mismatch error")
+	}
+}

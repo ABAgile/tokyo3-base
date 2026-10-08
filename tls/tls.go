@@ -184,6 +184,11 @@ func VerifyPeerChain(roots *x509.CertPool, cs tls.ConnectionState) error {
 	if len(cs.PeerCertificates) == 0 {
 		return errors.New("peer presented no certificates")
 	}
+	// An empty DNSName makes x509 skip hostname verification entirely, which
+	// would let any cert the CA signed pass for any host. Fail closed.
+	if cs.ServerName == "" {
+		return errors.New("no server name to verify the peer against (set tls.Config.ServerName)")
+	}
 	opts := x509.VerifyOptions{
 		Roots:         roots,
 		DNSName:       cs.ServerName,
