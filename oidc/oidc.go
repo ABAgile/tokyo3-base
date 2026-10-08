@@ -127,14 +127,14 @@ func (v *HTTPVerifier) Verify(ctx context.Context, rawIDToken string) (*Claims, 
 		Nonce         string          `json:"nonce"`
 		AuthTime      int64           `json:"auth_time"`
 		SID           string          `json:"sid"`
-		Events        map[string]any  `json:"events"`
+		Events        json.RawMessage `json:"events"`
 	}
 	if err := tok.Claims(&raw); err != nil {
 		return nil, fmt.Errorf("decode token claims: %w", err)
 	}
 	// A logout_token is signed by the same keys for the same audience and may
 	// carry exp; it must never be accepted as proof of identity.
-	if _, isLogout := raw.Events[backchannelLogoutEvent]; isLogout {
+	if hasLogoutEvent(raw.Events) {
 		return nil, errors.New("logout_token presented as ID token")
 	}
 	var authTime time.Time
@@ -152,6 +152,19 @@ func (v *HTTPVerifier) Verify(ctx context.Context, rawIDToken string) (*Claims, 
 		AuthTime:      authTime,
 		SessionID:     raw.SID,
 	}, nil
+}
+
+// hasLogoutEvent reports whether an `events` claim is an object naming the
+// back-channel logout event. Any other shape (absent, null, an array or string
+// some IdPs emit for unrelated purposes) is not a logout token and is ignored
+// rather than failing an otherwise valid ID token.
+func hasLogoutEvent(raw json.RawMessage) bool {
+	var events map[string]json.RawMessage
+	if json.Unmarshal(raw, &events) != nil {
+		return false
+	}
+	_, ok := events[backchannelLogoutEvent]
+	return ok
 }
 
 // parseLooseBool reads a JSON boolean, or the string "true"/"false", as a bool.

@@ -453,3 +453,36 @@ func TestVerifyLogoutToken(t *testing.T) {
 		t.Errorf("expected missing sub/sid error, got %v", err)
 	}
 }
+
+// An `events` claim that isn't the logout object (some IdPs emit other shapes)
+// must not fail an otherwise valid ID token, while the logout event must still
+// be refused.
+func TestHTTPVerifier_Verify_EventsClaimShapes(t *testing.T) {
+	fi := newFakeIssuer(t)
+	ver, err := oidc.NewHTTPVerifier(context.Background(), fi.issuer, testAud)
+	if err != nil {
+		t.Fatalf("NewHTTPVerifier: %v", err)
+	}
+	now := time.Now().Unix()
+	for _, tc := range []struct {
+		name    string
+		events  any
+		wantErr bool
+	}{
+		{"array", []string{"x"}, false},
+		{"string", "x", false},
+		{"unrelated object", map[string]any{"other": map[string]any{}}, false},
+		{"logout event", map[string]any{"http://schemas.openid.net/event/backchannel-logout": map[string]any{}}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tok := fi.signToken(t, map[string]any{
+				"iss": fi.issuer, "aud": testAud, "sub": "u",
+				"iat": now, "exp": now + 300, "events": tc.events,
+			})
+			_, err := ver.Verify(context.Background(), tok)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
+}
