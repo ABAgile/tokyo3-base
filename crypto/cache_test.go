@@ -268,3 +268,64 @@ func TestKeyProviderCache_ExpiredEntriesAreSwept(t *testing.T) {
 		}
 	}
 }
+
+// ctxAwareKP's Unwrap fails with the context's error if the context it was
+// given is cancelled while it works.
+type ctxAwareKP struct{ started chan struct{} }
+
+func (ctxAwareKP) Wrap(_ context.Context, dek []byte) ([]byte, error) { return dek, nil }
+func (p ctxAwareKP) Unwrap(ctx context.Context, _ []byte) ([]byte, error) {
+	close(p.started)
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(100 * time.Millisecond):
+		return make([]byte, 32), nil
+	}
+}
+
+// TestKeyProviderCache_LeaderCancelDoesNotFailWaiters: the caller that happens
+// to start the shared unwrap cancelling must neither fail the unwrap for the
+// other waiters nor keep waiting itself.
+func TestKeyProviderCache_LeaderCancelDoesNotFailWaiters(t *testing.T) {
+	master := ctxAwareKP{started: make(chan struct{})}
+	cache := NewKeyProviderCache(master, time.Minute)
+	wrapped := []byte("wrapped")
+
+	leaderCtx, cancel := context.WithCancel(context.Background())
+	leaderErr := make(chan error, 1)
+	go func() {
+		_, err := cache.ForKey(leaderCtx, "id", wrapped)
+		leaderErr <- err
+	}()
+	<-master.started
+
+	waiterErr := make(chan error, 1)
+	go func() {
+		_, err := cache.ForKey(context.Background(), "id", wrapped)
+		waiterErr <- err
+	}()
+	time.Sleep(10 * time.Millisecond) // let the waiter join the flight
+	cancel()
+
+	if err := <-leaderErr; !errors.Is(err, context.Canceled) {
+		t.Errorf("leader err = %v, want context.Canceled", err)
+	}
+	if err := <-waiterErr; err != nil {
+		t.Errorf("waiter failed because the leader was cancelled: %v", err)
+	}
+}
+
+type panicKP struct{}
+
+func (panicKP) Wrap(context.Context, []byte) ([]byte, error)   { return nil, nil }
+func (panicKP) Unwrap(context.Context, []byte) ([]byte, error) { panic("kms client bug") }
+
+// The shared unwrap runs on its own goroutine; a panicking root provider must
+// surface as an error to the caller rather than crash the process.
+func TestKeyProviderCache_RootPanicBecomesError(t *testing.T) {
+	cache := NewKeyProviderCache(panicKP{}, time.Minute)
+	if _, err := cache.ForKey(context.Background(), "id", []byte("w")); err == nil {
+		t.Fatal("expected an error from a panicking root provider")
+	}
+}

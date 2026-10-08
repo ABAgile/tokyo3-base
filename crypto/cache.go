@@ -29,6 +29,10 @@ type KeyProviderCache struct {
 	unwrapFlights singleflight.Group
 }
 
+// unwrapTimeout bounds one shared rootKP.Unwrap call, which runs detached from
+// the callers waiting on it.
+const unwrapTimeout = 30 * time.Second
+
 // keyDigest identifies wrapped key material without retaining it.
 type keyDigest = [sha256.Size]byte
 
@@ -82,16 +86,20 @@ func (c *KeyProviderCache) ForKey(ctx context.Context, keyID string, wrappedKey 
 	}
 
 	// Slow path: collapse concurrent misses for the same key and wrapped
-	// material into a single rootKP.Unwrap call. The leader runs with its own
-	// ctx; waiters share its result (or its error — failure paths dedupe too).
-	v, err, _ := c.unwrapFlights.Do(flightKey(keyID, digest), func() (any, error) {
+	// material into a single rootKP.Unwrap call. The shared call is detached
+	// from any one caller's cancellation (and bounded by unwrapTimeout), so a
+	// caller that gives up cannot fail the unwrap every other waiter depends
+	// on; each caller still stops waiting when its own ctx is done.
+	ch := c.unwrapFlights.DoChan(flightKey(keyID, digest), func() (any, error) {
 		// Re-check after acquiring the singleflight slot — a previous leader
 		// may have populated the cache while we were queued.
 		if kp := c.lookup(keyID, digest); kp != nil {
 			return kp, nil
 		}
 
-		plainKey, err := c.rootKP.Unwrap(ctx, wrappedKey)
+		uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), unwrapTimeout)
+		defer cancel()
+		plainKey, err := c.unwrap(uctx, wrappedKey)
 		if err != nil {
 			return nil, fmt.Errorf("unwrap key: %w", err)
 		}
@@ -99,10 +107,28 @@ func (c *KeyProviderCache) ForKey(ctx context.Context, keyID string, wrappedKey 
 		c.store(keyID, digest, kp)
 		return kp, nil
 	})
-	if err != nil {
-		return nil, err
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case r := <-ch:
+		if r.Err != nil {
+			return nil, r.Err
+		}
+		return r.Val.(KeyProvider), nil
 	}
-	return v.(KeyProvider), nil
+}
+
+// unwrap calls the root provider, turning a panic into an error. DoChan runs
+// the shared call on its own goroutine, where a panic would take the whole
+// process down instead of reaching the caller's recovery (for example
+// net/http's per-request recover).
+func (c *KeyProviderCache) unwrap(ctx context.Context, wrappedKey []byte) (key []byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("root key provider panicked: %v", r)
+		}
+	}()
+	return c.rootKP.Unwrap(ctx, wrappedKey)
 }
 
 // flightKey scopes a singleflight call to one keyID and wrapped material, so a
