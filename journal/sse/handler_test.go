@@ -356,3 +356,17 @@ func TestHandler_DoneEndsStream(t *testing.T) {
 		t.Fatal("stream did not end after Done closed")
 	}
 }
+
+// A Last-Event-ID of MaxUint64 must not wrap to startFromSeq=0 (n+1 overflow);
+// it is treated as malformed, i.e. no resume.
+func TestHandler_LastEventIDOverflowIgnored(t *testing.T) {
+	src := newFakeSource()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	req := httptest.NewRequest("GET", "/", nil).WithContext(ctx)
+	req.Header.Set("Last-Event-ID", "18446744073709551615")
+	sse.Handler{Source: src, Replay: 5}.ServeHTTP(httptest.NewRecorder(), req)
+	if src.gotStartSeq != 0 {
+		t.Fatalf("gotStartSeq = %d, want 0", src.gotStartSeq)
+	}
+}

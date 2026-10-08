@@ -22,6 +22,7 @@ package sse
 import (
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -114,7 +115,7 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// resume" — fall through to the backfill window.
 	var startFromSeq uint64
 	if v := r.Header.Get("Last-Event-ID"); v != "" {
-		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil && n < math.MaxUint64 { // n+1 must not wrap to 0
 			startFromSeq = n + 1
 		}
 	}

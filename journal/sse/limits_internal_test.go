@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestLimits_AcquireReleaseBookkeeping(t *testing.T) {
@@ -87,5 +88,17 @@ func TestLimits_ConcurrentNeverExceedsCap(t *testing.T) {
 	}
 	if l.total != 0 || len(l.perClient) != 0 {
 		t.Fatalf("limiter leaked: total=%d clients=%d", l.total, len(l.perClient))
+	}
+}
+
+func TestLimits_RejectRetryAfterAtLeastOneSecond(t *testing.T) {
+	l, err := NewLimits(LimitsConfig{MaxStreams: 1, RetryAfter: 100 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	l.reject(rec)
+	if got := rec.Header().Get("Retry-After"); got != "1" {
+		t.Fatalf("Retry-After = %q, want 1", got)
 	}
 }

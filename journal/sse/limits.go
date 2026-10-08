@@ -105,6 +105,7 @@ func (l *Limits) acquire(r *http.Request) (release func(), scope limitScope, ok 
 
 // reject writes the 429 for a refused stream.
 func (l *Limits) reject(w http.ResponseWriter) {
-	w.Header().Set("Retry-After", strconv.Itoa(int(l.cfg.RetryAfter.Round(time.Second)/time.Second)))
+	secs := max(int(l.cfg.RetryAfter.Round(time.Second)/time.Second), 1) // 0 would mean "retry immediately"
+	w.Header().Set("Retry-After", strconv.Itoa(secs))
 	http.Error(w, "too many event streams", http.StatusTooManyRequests)
 }
