@@ -1,4 +1,4 @@
-// AES-256-GCM helpers and an envelope-encryption pattern.
+// Package crypto provides AES-256-GCM helpers and an envelope-encryption pattern.
 //
 // Layout:
 //   - Seal/Open       — direct AEAD primitives (key + plaintext → ciphertext);

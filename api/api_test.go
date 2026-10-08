@@ -25,9 +25,9 @@ func (t *testTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return t.base.RoundTrip(req)
 }
 
-// ── ApiError ──────────────────────────────────────────────────────────────────
+// ── APIError ──────────────────────────────────────────────────────────────────
 
-func TestApiError(t *testing.T) {
+func TestAPIError(t *testing.T) {
 	testCases := []struct {
 		name     string
 		code     int
@@ -44,16 +44,16 @@ func TestApiError(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.expected, (&ApiError{StatusCode: tc.code, Body: tc.body}).Error())
+			assert.Equal(t, tc.expected, (&APIError{StatusCode: tc.code, Body: tc.body}).Error())
 		})
 	}
 }
 
-// TestRestyClient_R_PopulatesApiErrorBody verifies the body the
-// server returned is verbatim accessible on the ApiError. This is
+// TestRestyClient_R_PopulatesAPIErrorBody verifies the body the
+// server returned is verbatim accessible on the APIError. This is
 // the load-bearing contract for callers (cert-agentd, ssh-proxyd)
 // that surface server-side error JSON in their own error chains.
-func TestRestyClient_R_PopulatesApiErrorBody(t *testing.T) {
+func TestRestyClient_R_PopulatesAPIErrorBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusForbidden)
@@ -66,7 +66,7 @@ func TestRestyClient_R_PopulatesApiErrorBody(t *testing.T) {
 	err := rc.R(context.Background(), http.MethodGet, "/", &result)
 	require.Error(t, err)
 
-	var apiErr *ApiError
+	var apiErr *APIError
 	require.ErrorAs(t, err, &apiErr)
 	assert.Equal(t, http.StatusForbidden, apiErr.StatusCode)
 	assert.Equal(t, `{"error":"policy denied for groups [eng]"}`, string(apiErr.Body))
@@ -87,7 +87,7 @@ func TestRestyClient_R(t *testing.T) {
 		statusCode     int
 		responseBody   any
 		wantErr        bool
-		wantApiErrCode int
+		wantAPIErrCode int
 	}{
 		{
 			name:         "success decodes result",
@@ -95,18 +95,18 @@ func TestRestyClient_R(t *testing.T) {
 			responseBody: body{Message: "ok"},
 		},
 		{
-			name:           "4xx returns ApiError",
+			name:           "4xx returns APIError",
 			statusCode:     http.StatusBadRequest,
 			responseBody:   body{Message: "bad"},
 			wantErr:        true,
-			wantApiErrCode: http.StatusBadRequest,
+			wantAPIErrCode: http.StatusBadRequest,
 		},
 		{
-			name:           "5xx returns ApiError",
+			name:           "5xx returns APIError",
 			statusCode:     http.StatusInternalServerError,
 			responseBody:   body{Message: "error"},
 			wantErr:        true,
-			wantApiErrCode: http.StatusInternalServerError,
+			wantAPIErrCode: http.StatusInternalServerError,
 		},
 	}
 
@@ -125,9 +125,9 @@ func TestRestyClient_R(t *testing.T) {
 
 			if tc.wantErr {
 				require.Error(t, err)
-				var apiErr *ApiError
+				var apiErr *APIError
 				require.ErrorAs(t, err, &apiErr)
-				assert.Equal(t, tc.wantApiErrCode, apiErr.StatusCode)
+				assert.Equal(t, tc.wantAPIErrCode, apiErr.StatusCode)
 			} else {
 				require.NoError(t, err)
 				assert.Equal(t, "ok", result.Message)
@@ -149,14 +149,14 @@ func TestRestyClient_R_NetworkError(t *testing.T) {
 
 // ── ClientOption ──────────────────────────────────────────────────────────────
 
-func TestClientOption_WithBaseUrl(t *testing.T) {
+func TestClientOption_WithBaseURL(t *testing.T) {
 	var called bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
 	}))
 	defer srv.Close()
 
-	rc := NewRestClient("http://wrong.invalid", CO.WithBaseUrl(srv.URL))
+	rc := NewRestClient("http://wrong.invalid", CO.WithBaseURL(srv.URL))
 	_ = rc.R(context.Background(), http.MethodGet, "/", &struct{}{})
 	assert.True(t, called, "request should reach the overridden base URL")
 }

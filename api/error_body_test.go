@@ -45,7 +45,7 @@ func TestRestyClient_EmptyGzipErrorPreservesStatus(t *testing.T) {
 	}))
 	defer srv.Close()
 	err := NewRestClient(srv.URL).R(context.Background(), "GET", "/", nil, RO.WithHeader("Accept-Encoding", "gzip"))
-	var ae *ApiError
+	var ae *APIError
 	if !errors.As(err, &ae) || len(ae.Body) != 0 || ae.StatusCode != 500 {
 		t.Fatalf("empty compressed error = %v", err)
 	}
@@ -56,7 +56,7 @@ func TestRestyClient_ErrorReadIsBounded(t *testing.T) {
 	tr := &bodyTransport{body: b, status: 500}
 	rc := NewRestClient("http://example.test", CO.WithTransport(tr))
 	err := rc.R(context.Background(), "GET", "/", nil)
-	var ae *ApiError
+	var ae *APIError
 	if !errors.As(err, &ae) || len(ae.Body) != apiErrorBodyLimit {
 		t.Fatalf("error=%v body=%v", err, ae)
 	}
@@ -90,7 +90,7 @@ func TestRestyClient_ExplicitGzipErrorsAreBoundedAfterDecode(t *testing.T) {
 	b := &countedBody{Reader: bytes.NewReader(compressed.Bytes())}
 	rc := NewRestClient("http://example.test", CO.WithTransport(&bodyTransport{body: b, status: 500, encoding: "gzip"}))
 	err := rc.R(context.Background(), "GET", "/", nil, RO.WithHeader("Accept-Encoding", "gzip"))
-	var ae *ApiError
+	var ae *APIError
 	if !errors.As(err, &ae) || len(ae.Body) != apiErrorBodyLimit || !b.closed {
 		t.Fatalf("error=%v closed=%v", err, b.closed)
 	}

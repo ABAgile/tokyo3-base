@@ -1,3 +1,5 @@
+// Package google wraps the Google Geocoding and Places (text search) APIs behind
+// a small Addresser interface that returns formatted addresses and cities.
 package google
 
 import (
@@ -92,7 +94,7 @@ func NewPlacesService(apiKey string, opts ...api.RestyClientOption) Addresser {
 func (s *PlacesService) GetResults(ctx context.Context, address string) ([]AddressResult, error) {
 	var res placesResponse
 	if err := s.client.SearchPlaces(ctx, &res,
-		api.RO.WithHeaders(map[string]string{headerGoogApiKey: s.apiKey, headerGoogFieldMask: placesFieldMask}),
+		api.RO.WithHeaders(map[string]string{headerGoogAPIKey: s.apiKey, headerGoogFieldMask: placesFieldMask}),
 		api.RO.WithBody(map[string]string{"textQuery": address}),
 	); err != nil {
 		return nil, err

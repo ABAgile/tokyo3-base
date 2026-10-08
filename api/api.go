@@ -1,3 +1,7 @@
+// Package api is a thin, typed layer over the Resty HTTP client: functional
+// client and request options, a typed APIError for non-2xx responses, bounded
+// error bodies, a concurrency-safe bearer-token cache with refresh, and a
+// redacting request/response logger.
 package api
 
 import (
@@ -42,7 +46,7 @@ func NewRestClient(baseURL string, opts ...RestyClientOption) *RestyClient {
 	return &RestyClient{Client: client}
 }
 
-func (co *ClientOption) WithBaseUrl(url string) RestyClientOption {
+func (co *ClientOption) WithBaseURL(url string) RestyClientOption {
 	return func(c *resty.Client) {
 		c.SetBaseURL(url)
 	}
@@ -98,14 +102,14 @@ func (co *ClientOption) WithTransport(rt http.RoundTripper) RestyClientOption {
 	}
 }
 
-// ApiError is the typed error returned by [RestyClient.R] for non-2xx
+// APIError is the typed error returned by [RestyClient.R] for non-2xx
 // responses. StatusCode is the HTTP status. Body is the raw response
 // body — captured verbatim so callers can surface server-side error
 // messages in their own error chains without doing a second
 // roundtrip. Body is truncated at 64 KiB to bound memory; servers
 // that need to communicate larger error payloads should use a
 // structured error contract instead.
-type ApiError struct {
+type APIError struct {
 	StatusCode int
 	Body       []byte
 }
@@ -115,7 +119,7 @@ type ApiError struct {
 // remain available via e.Body for callers that want them.
 const apiErrorBodyTruncate = 512
 
-func (e *ApiError) Error() string {
+func (e *APIError) Error() string {
 	body := strings.TrimSpace(string(e.Body))
 	if body == "" {
 		return fmt.Sprintf("api error: status %d", e.StatusCode)
@@ -147,7 +151,7 @@ func (rc *RestyClient) R(ctx context.Context, method, path string, result any, o
 		if len(body) > apiErrorBodyLimit {
 			body = slices.Clone(body[:apiErrorBodyLimit])
 		}
-		return &ApiError{StatusCode: resp.StatusCode(), Body: body}
+		return &APIError{StatusCode: resp.StatusCode(), Body: body}
 	}
 	// Decode the response body into result manually rather than via
 	// Resty's SetResult — that auto-decode hinges on the server

@@ -37,9 +37,9 @@ func TestR_EmptyGzipErrorBodyStillReportsStatus(t *testing.T) {
 
 	err := api.NewRestClient(srv.URL).R(context.Background(), http.MethodGet, "/x", nil,
 		api.RO.WithHeader("Accept-Encoding", "gzip"))
-	var apiErr *api.ApiError
+	var apiErr *api.APIError
 	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("want ApiError 500, got %T %v", err, err)
+		t.Fatalf("want APIError 500, got %T %v", err, err)
 	}
 }
 
@@ -55,7 +55,7 @@ func TestR_GzipErrorBodyStillDecoded(t *testing.T) {
 
 	err := api.NewRestClient(srv.URL).R(context.Background(), http.MethodGet, "/x", nil,
 		api.RO.WithHeader("Accept-Encoding", "gzip"))
-	var apiErr *api.ApiError
+	var apiErr *api.APIError
 	if !errors.As(err, &apiErr) || string(apiErr.Body) != "bad input" {
 		t.Fatalf("want decoded body, got %T %v", err, err)
 	}

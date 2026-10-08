@@ -1,3 +1,7 @@
+// Package db holds PostgreSQL helpers shared by the daemons: pgx pool
+// construction (with an optional startup ping), a logging-safe connection-string
+// summary, conversion of PostgreSQL-style $n placeholders to "?" for other
+// drivers, and a reflection-based struct copy for mapping query rows.
 package db
 
 import (
@@ -44,7 +48,7 @@ func NewPgxPoolContext(ctx context.Context, connStr string, opts ...DatabaseConf
 	}
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("ping database %s: %w", SantizeDbConn(connStr), err)
+		return nil, fmt.Errorf("ping database %s: %w", SanitizeDBConn(connStr), err)
 	}
 	return pool, nil
 }
@@ -64,10 +68,9 @@ func WithDecimalRegister() DatabaseConfigOption {
 	}
 }
 
-// SantizeDbConn returns a logging-safe connection summary. Only connection
+// SanitizeDBConn returns a logging-safe connection summary. Only connection
 // routing fields are retained, never credentials or arbitrary parameters.
-// The historical spelling is retained for source compatibility.
-func SantizeDbConn(connStr string) string {
+func SanitizeDBConn(connStr string) string {
 	if strings.Contains(connStr, "://") {
 		u, err := url.Parse(connStr)
 		if err != nil || (u.Scheme != "postgres" && u.Scheme != "postgresql") {

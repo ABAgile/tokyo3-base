@@ -10,7 +10,7 @@ import (
 const (
 	geocodeURL          = "https://maps.googleapis.com/maps/api/geocode/json"
 	placesURL           = "https://places.googleapis.com/v1/places:searchText"
-	headerGoogApiKey    = "X-Goog-Api-Key"
+	headerGoogAPIKey    = "X-Goog-Api-Key"
 	headerGoogFieldMask = "X-Goog-FieldMask"
 	// placesFieldMask requests only the fields GetResults reads; "*" selects
 	// every field and bills at the highest Places SKU tier.

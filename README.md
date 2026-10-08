@@ -61,7 +61,7 @@ rc := api.NewRestClient("https://api.example.com",
 
 | Option | Description |
 |---|---|
-| `CO.WithBaseUrl(url)` | Overrides the base URL after construction |
+| `CO.WithBaseURL(url)` | Overrides the base URL after construction |
 | `CO.WithTimeout(d)` | Request timeout |
 | `CO.WithRetryCount(n)` | Number of retries on transient errors |
 | `CO.WithHeader(k, v)` | Sets a default request header |
@@ -78,7 +78,7 @@ rc := api.NewRestClient("https://api.example.com",
 func (rc *RestyClient) R(ctx context.Context, method, path string, result any, opts ...RestyRequestOption) error
 ```
 
-Executes a request and unmarshals the response body into `result` on success. Returns `*ApiError` on HTTP error status; the response body is decoded with `encoding/json` directly (no Content-Type heuristics) so test mocks that omit `Content-Type: application/json` work unchanged.
+Executes a request and unmarshals the response body into `result` on success. Returns `*APIError` on HTTP error status; the response body is decoded with `encoding/json` directly (no Content-Type heuristics) so test mocks that omit `Content-Type: application/json` work unchanged.
 
 `NewRestClient` wraps the transport configured by its options to cap error-body
 reads at 64 KiB before Resty buffers/logs them, including after gzip decoding.
@@ -89,7 +89,7 @@ limiter wraps the transport. Resty's transport setters (`SetTLSClientConfig`,
 `SetProxy`, `SetCertificates`, `SetRootCertificate*`) require a bare
 `*http.Transport`, so calling them on the client after construction is ignored
 (Resty logs an error). Replacing the embedded client's transport later bypasses
-the read limit, although `ApiError.Body` is still truncated to 64 KiB.
+the read limit, although `APIError.Body` is still truncated to 64 KiB.
 
 ```go
 var out MyResponse
@@ -97,17 +97,17 @@ err := rc.R(ctx, http.MethodGet, "/v1/orders/{id}", &out,
     api.RO.WithPathParam("id", orderID),
     api.RO.WithQueryParam("expand", "items"),
 )
-var apiErr *api.ApiError
+var apiErr *api.APIError
 if errors.As(err, &apiErr) {
     // apiErr.StatusCode holds the HTTP status;
     // apiErr.Body holds the raw response body verbatim (capped at 64 KiB).
 }
 ```
 
-#### `ApiError` shape
+#### `APIError` shape
 
 ```go
-type ApiError struct {
+type APIError struct {
     StatusCode int
     Body       []byte
 }
@@ -1105,7 +1105,7 @@ pool, err := NewPgxPool(connStr, WithDecimalRegister())
 ### Connection string sanitization
 
 ```go
-func SantizeDbConn(connStr string) string
+func SanitizeDBConn(connStr string) string
 ```
 
 Returns a logging-safe summary of keyword or Postgres URL DSNs, retaining only
@@ -1115,7 +1115,7 @@ parameters, and fragments are omitted. Malformed input returns a fixed redacted
 marker. The historical function spelling is retained.
 
 ```go
-SantizeDbConn("host=localhost user=admin password=secret dbname=app")
+SanitizeDBConn("host=localhost user=admin password=secret dbname=app")
 // → "host=localhost dbname=app"
 ```
 

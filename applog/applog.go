@@ -1,3 +1,6 @@
+// Package applog builds the daemons' structured JSON slog logger, with optional
+// shipping of operational logs to NATS (async, discard-on-full), a runtime
+// level switch, and a handler that mirrors attributes into the message text.
 package applog
 
 import (

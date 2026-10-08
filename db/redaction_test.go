@@ -10,7 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func TestSantizeDbConn_RedactsCredentialForms(t *testing.T) {
+func TestSanitizeDBConn_RedactsCredentialForms(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"postgres://alice:hunter2@db:5432/app?password=hunter2&user=alice&sslmode=require#hunter2", "postgres://db:5432/app?sslmode=require"},
 		{"postgresql://alice:p%40ss@db/app?sslpassword=secret&connect_timeout=5", "postgresql://db/app?connect_timeout=5"},
@@ -23,7 +23,7 @@ func TestSantizeDbConn_RedactsCredentialForms(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.in, func(t *testing.T) {
-			if got := SantizeDbConn(tc.in); got != tc.want {
+			if got := SanitizeDBConn(tc.in); got != tc.want {
 				t.Fatalf("got %q, want %q", got, tc.want)
 			}
 		})
@@ -40,13 +40,13 @@ func TestWithDecimalRegister_PreservesAfterConnectError(t *testing.T) {
 	}
 }
 
-func FuzzSantizeDbConn_RejectsMalformedCredentialTail(f *testing.F) {
+func FuzzSanitizeDBConn_RejectsMalformedCredentialTail(f *testing.F) {
 	f.Add("hello world")
 	f.Add("escaped\\' quote")
 	f.Fuzz(func(t *testing.T, secret string) {
 		// Malformed quoted credentials must never be echoed as a parser error.
 		secret = strings.ReplaceAll(secret, "'", "")
-		got := SantizeDbConn("host=db password='" + secret)
+		got := SanitizeDBConn("host=db password='" + secret)
 		if got != "[invalid database connection string]" {
 			t.Fatalf("malformed DSN returned %q", got)
 		}

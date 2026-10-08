@@ -31,7 +31,7 @@ func TestWithDecimalRegister(t *testing.T) {
 	assert.NotNil(t, cfg.AfterConnect)
 }
 
-func TestSantizeDbConn(t *testing.T) {
+func TestSanitizeDBConn(t *testing.T) {
 	testCases := []struct {
 		name     string
 		connStr  string
@@ -66,7 +66,7 @@ func TestSantizeDbConn(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.expected, SantizeDbConn(tc.connStr))
+			assert.Equal(t, tc.expected, SanitizeDBConn(tc.connStr))
 		})
 	}
 }
