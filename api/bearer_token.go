@@ -53,9 +53,10 @@ type BearerTokenManager struct {
 	// released, so keep it quick.
 	OnRefreshError func(err error, tokenStillValid bool)
 
-	inflight    *refreshCall // guarded by the embedded lock
-	nextAttempt time.Time    // earliest next Refresher call after a failure
-	lastErr     error        // most recent refresh failure; cleared on success
+	inflight    *refreshCall  // guarded by the embedded lock
+	nextAttempt time.Time     // earliest next Refresher call after a failure
+	lifetime    time.Duration // lifetime of the token the last successful refresh returned; 0 if unknown
+	lastErr     error         // most recent refresh failure; cleared on success
 }
 
 // refreshCall is one in-flight Refresher invocation shared by all waiters.
@@ -68,7 +69,14 @@ type refreshCall struct {
 // lock. Both the fast path and the re-check under the write lock use this one
 // predicate, so a token can never be judged stale by one and fresh by the
 // other (which, at the exact boundary, returned an expired token).
+//
+// A refresh buffer longer than half the token's observed lifetime is clamped to
+// half the lifetime. Otherwise a token that lives no longer than the buffer
+// would never count as fresh and every call would run the Refresher.
 func (tm *BearerTokenManager) fresh(buffer time.Duration) bool {
+	if buffer < 0 && tm.lifetime > 0 {
+		buffer = max(buffer, -tm.lifetime/2)
+	}
 	return time.Now().Before(tm.ExpiresAt.Add(buffer))
 }
 
@@ -168,6 +176,7 @@ func (tm *BearerTokenManager) runRefresh(ctx context.Context, call *refreshCall,
 	now := time.Now()
 	if err == nil {
 		tm.Token, tm.ExpiresAt = token, expiresAt
+		tm.lifetime = expiresAt.Sub(now)
 		tm.nextAttempt, tm.lastErr = time.Time{}, nil
 	} else {
 		tm.lastErr = err

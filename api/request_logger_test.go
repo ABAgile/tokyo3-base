@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -242,5 +243,21 @@ func TestWithRequestLogger(t *testing.T) {
 				assert.NotContains(t, buf.String(), s)
 			}
 		})
+	}
+}
+
+func TestIsSensitiveLogField_Signatures(t *testing.T) {
+	for _, name := range []string{"signature", "sig", "X-Amz-Signature", "oauth_signature", "Signature"} {
+		if !isSensitiveLogField(name) {
+			t.Errorf("%q should be redacted", name)
+		}
+	}
+	for _, name := range []string{"design", "Content-Type", "page"} {
+		if isSensitiveLogField(name) {
+			t.Errorf("%q should not be redacted", name)
+		}
+	}
+	if got := sanitizeURL("https://s3.example/o?X-Amz-Signature=abc&x=1"); strings.Contains(got, "abc") {
+		t.Errorf("sanitizeURL leaked the signature: %s", got)
 	}
 }

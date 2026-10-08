@@ -61,10 +61,11 @@ const redactedLogValue = "***redacted***"
 
 func isSensitiveLogField(name string) bool {
 	key := strings.ToLower(strings.NewReplacer("-", "", "_", "").Replace(name))
-	if key == "signature" || key == "sig" {
+	// "sig" alone is too short to match as a substring ("design", "signal").
+	if key == "sig" {
 		return true
 	}
-	for _, part := range []string{"auth", "cookie", "key", "code", "token", "secret", "password", "passwd", "passphrase", "credential", "assertion", "session", "nonce", "state", "verifier", "csrf", "jwt"} {
+	for _, part := range []string{"signature", "auth", "cookie", "key", "code", "token", "secret", "password", "passwd", "passphrase", "credential", "assertion", "session", "nonce", "state", "verifier", "csrf", "jwt"} {
 		if strings.Contains(key, part) {
 			return true
 		}

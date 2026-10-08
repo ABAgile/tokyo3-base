@@ -156,3 +156,22 @@ func TestBearerToken_RefresherMisbehaviourBecomesError(t *testing.T) {
 		t.Errorf("a panicking refresher must be reported as an error, got %v", err)
 	}
 }
+
+// A token whose lifetime is shorter than the refresh buffer must not make
+// every call run the Refresher.
+func TestBearerToken_ShortLivedTokenIsNotRefreshedPerCall(t *testing.T) {
+	var calls atomic.Int32
+	tm := &BearerTokenManager{Refresher: func(context.Context) (string, time.Time, error) {
+		calls.Add(1)
+		return "short", time.Now().Add(3 * time.Minute), nil // < the 5m default buffer
+	}}
+	for range 5 {
+		tok, err := tm.GetToken(context.Background())
+		if err != nil || tok != "short" {
+			t.Fatalf("GetToken = %q, %v", tok, err)
+		}
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("refresher called %d times for 5 GetToken calls, want 1", n)
+	}
+}
