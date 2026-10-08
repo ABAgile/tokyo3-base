@@ -774,3 +774,79 @@ func TestCertLoader_FailedReloadNotRetriedUntilFilesChange(t *testing.T) {
 		t.Fatalf("OnError called %d times after files changed, want 2", errs)
 	}
 }
+
+// While a file is missing mid-rotation the previous cert stays live, and the
+// condition is reported once rather than re-parsed on every handshake; the
+// replacement is picked up as soon as the files return.
+func TestCertLoader_MissingFileReportedOnceAndRecovers(t *testing.T) {
+	certFile, keyFile, _ := writeCertKeyFiles(t)
+	loader := reloader.NewCertLoader(certFile, keyFile)
+	var errs int
+	loader.OnError = func(error) { errs++ }
+	first, err := loader.GetCertificate(&tls.ClientHelloInfo{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Remove(keyFile); err != nil {
+		t.Fatal(err)
+	}
+	for range 5 {
+		got, err := loader.GetCertificate(&tls.ClientHelloInfo{})
+		if err != nil || got != first {
+			t.Fatalf("GetCertificate = %p, %v; want previous cert", got, err)
+		}
+	}
+	if errs != 1 {
+		t.Fatalf("OnError called %d times while the key file was missing, want 1", errs)
+	}
+
+	newCert, newKey, _ := writeCertKeyFiles(t)
+	overwrite(t, certFile, newCert)
+	overwrite(t, keyFile, newKey)
+	future := time.Now().Add(2 * time.Second) // beat coarse filesystem mtimes
+	for _, f := range []string{certFile, keyFile} {
+		if err := os.Chtimes(f, future, future); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := loader.GetCertificate(&tls.ClientHelloInfo{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == first {
+		t.Error("rotated cert not picked up after the files returned")
+	}
+}
+
+// A dial to an IP literal sends no SNI; ClientConfig must then verify against
+// the configured ServerName instead of skipping hostname verification.
+func TestClientConfig_FallsBackToConfiguredServerName(t *testing.T) {
+	certFile, keyFile, caPEM := writeCertKeyFiles(t)
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, caPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := reloader.ClientConfig(certFile, keyFile, caFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, _ := pem.Decode(caPEM)
+	peer, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs := tls.ConnectionState{PeerCertificates: []*x509.Certificate{peer}} // no SNI
+
+	if err := cfg.VerifyConnection(cs); err == nil {
+		t.Fatal("verification without any server name must fail closed")
+	}
+	cfg.ServerName = "localhost"
+	if err := cfg.VerifyConnection(cs); err != nil {
+		t.Fatalf("verification with the configured ServerName: %v", err)
+	}
+	cfg.ServerName = "other.example"
+	if err := cfg.VerifyConnection(cs); err == nil {
+		t.Fatal("verification against a name the cert doesn't cover must fail")
+	}
+}

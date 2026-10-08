@@ -47,13 +47,21 @@ type CertLoader struct {
 	// while a previous cert was kept, so the same bad pair isn't re-parsed
 	// (and re-logged) on every handshake until a file changes again.
 	failCertM, failKeyM time.Time
+
+	// statFailed records that the files could not be stat'ed (e.g. mid-rotation)
+	// and the previous cert was kept, so that state is reported once rather
+	// than re-parsed and re-logged on every handshake until the files return.
+	statFailed bool
 }
 
 // settledLocked reports whether the files are unchanged since the last load
 // attempt (successful, or failed with a previous cert kept). Caller holds c.mu.
 func (c *CertLoader) settledLocked(certM, keyM time.Time, statOK bool) bool {
-	if c.cert == nil || !statOK {
+	if c.cert == nil {
 		return false
+	}
+	if !statOK {
+		return c.statFailed
 	}
 	return certM.Equal(c.modTime) && keyM.Equal(c.keyModTime) ||
 		certM.Equal(c.failCertM) && keyM.Equal(c.failKeyM)
@@ -145,8 +153,12 @@ func (c *CertLoader) reload(forced bool) (*tls.Certificate, error) {
 	newCert, err := tls.LoadX509KeyPair(c.certFile, c.keyFile)
 	if err != nil {
 		prev := c.cert
-		if prev != nil && statOK {
-			c.failCertM, c.failKeyM = certM, keyM
+		if prev != nil {
+			if statOK {
+				c.failCertM, c.failKeyM = certM, keyM
+			} else {
+				c.statFailed = true
+			}
 		}
 		c.mu.Unlock()
 		err = fmt.Errorf("load cert pair: %w", err)
@@ -156,6 +168,7 @@ func (c *CertLoader) reload(forced bool) (*tls.Certificate, error) {
 		return prev, err
 	}
 	c.cert = &newCert
+	c.statFailed = false
 	if statOK {
 		c.modTime, c.keyModTime = certM, keyM
 	}
@@ -378,8 +391,24 @@ func ClientConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
 		}
 		cfg.InsecureSkipVerify = true //nolint:gosec // VerifyConnection provides equivalent verification against the live pool.
 		cfg.VerifyConnection = ca.VerifyConnection
+		fallbackServerName(cfg)
 	}
 	return cfg, nil
+}
+
+// fallbackServerName wraps cfg.VerifyConnection so a handshake that reports no
+// server name (the target is an IP literal, so no SNI was sent) is verified
+// against cfg.ServerName instead — typically set by the caller — rather than
+// skipping hostname verification. Read at handshake time, so a ServerName set
+// after the call still applies.
+func fallbackServerName(cfg *tls.Config) {
+	verify := cfg.VerifyConnection
+	cfg.VerifyConnection = func(cs tls.ConnectionState) error {
+		if cs.ServerName == "" {
+			cs.ServerName = cfg.ServerName
+		}
+		return verify(cs)
+	}
 }
 
 // ClientTLS builds the outbound client TLS config a daemon presents to a TLS
