@@ -43,6 +43,10 @@ type Session struct {
 	Email   string   `json:"email"`
 	Name    string   `json:"name"`
 	Groups  []string `json:"groups"`
+	// SID is the IdP session id (the OIDC `sid` claim), when the login flow
+	// supplied one. It lets [Config.IsRevoked] map an OIDC Back-Channel
+	// Logout notification onto this stateless cookie session.
+	SID string `json:"sid,omitempty"`
 	// Expiry is when the session dies. Fixed at login when
 	// [Config.IdleTimeout] is unset (0) — the session lasts exactly
 	// SessionTTL regardless of activity. When IdleTimeout is set,
@@ -168,6 +172,13 @@ type Config struct {
 	// decided — pass the same list given to clientip/ratelimit. Empty ⇒
 	// X-Forwarded-Proto is believed from any peer (legacy behaviour).
 	TrustedProxies []*net.IPNet
+
+	// IsRevoked, if set, is consulted by [Manager.Gate] for every request
+	// carrying an otherwise valid session; true rejects it as if no session
+	// existed (the cookie is cleared). Use it to honor server-side logout —
+	// e.g. a deny-list fed by an OIDC back-channel logout keyed on
+	// [Session.SID] or Subject. A returned error fails closed with 503.
+	IsRevoked func(ctx context.Context, sess Session) (bool, error)
 
 	Now func() time.Time // injectable clock; nil ⇒ time.Now
 	Log *slog.Logger     // nil ⇒ slog.Default
@@ -334,8 +345,14 @@ func (m *Manager) ValidateCSRF(r *http.Request, token, scope string) bool {
 }
 
 // LogoutHandler clears the session cookie and redirects to the login route.
+// Requests a browser marks Sec-Fetch-Site: cross-site are refused so another
+// site can't log the user out by embedding the route.
 func (m *Manager) LogoutHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+			http.Error(w, "cross-site logout rejected", http.StatusForbidden)
+			return
+		}
 		m.cookie.Clear(w, r)
 		http.Redirect(w, r, m.cfg.BasePath+m.cfg.LoginPath, http.StatusSeeOther)
 	}
@@ -365,6 +382,23 @@ func (m *Manager) Gate(next http.Handler) http.Handler {
 			}
 			http.Error(w, "authentication required", http.StatusUnauthorized)
 			return
+		}
+		if m.cfg.IsRevoked != nil {
+			revoked, err := m.cfg.IsRevoked(r.Context(), sess)
+			if err != nil {
+				m.cfg.Log.Error("session: revocation check failed", "err", err)
+				http.Error(w, "session check unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			if revoked {
+				m.cookie.Clear(w, r)
+				if r.Method == http.MethodGet {
+					http.Redirect(w, r, m.cfg.BasePath+m.cfg.LoginPath, http.StatusSeeOther)
+					return
+				}
+				http.Error(w, "authentication required", http.StatusUnauthorized)
+				return
+			}
 		}
 		if g := m.cfg.RequiredGroup; g != "" && !slices.Contains(sess.Groups, g) {
 			http.Error(w, "forbidden: requires membership in "+g, http.StatusForbidden)

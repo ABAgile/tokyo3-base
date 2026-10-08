@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -260,5 +261,17 @@ func TestCookie_SecureFlagTrustsForwardedProtoPerProxies(t *testing.T) {
 				t.Errorf("Clear Secure = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestSet_RejectsOversizedValue(t *testing.T) {
+	c := Cookie{Key: testKey, Name: "app_cookie", Path: "/", Now: fixedNow}
+	rec := httptest.NewRecorder()
+	err := c.Set(rec, httptest.NewRequest(http.MethodGet, "/", nil), payload{A: strings.Repeat("x", 4000)}, time.Hour)
+	if err == nil {
+		t.Fatal("expected error for a value over the browser cookie limit")
+	}
+	if len(rec.Result().Cookies()) != 0 {
+		t.Error("no cookie should be written on error")
 	}
 }

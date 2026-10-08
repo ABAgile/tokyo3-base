@@ -3,6 +3,7 @@ package oidc
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -333,7 +334,7 @@ func (a *Authenticator) CallbackHandler() http.HandlerFunc {
 			http.Error(w, "IdP returned an error: "+e, http.StatusUnauthorized)
 			return
 		}
-		if q.Get("state") != flow.State || flow.State == "" {
+		if flow.State == "" || subtle.ConstantTimeCompare([]byte(q.Get("state")), []byte(flow.State)) != 1 {
 			http.Error(w, "state mismatch — possible CSRF; start again", http.StatusBadRequest)
 			return
 		}
@@ -402,6 +403,7 @@ func (a *Authenticator) CallbackHandler() http.HandlerFunc {
 		sess.Email = claims.Email
 		sess.Name = claims.Name
 		sess.Groups = claims.Groups
+		sess.SID = claims.SessionID
 		if a.cfg.EnrichSession != nil {
 			if err := a.cfg.EnrichSession(r.Context(), claims, &sess); err != nil {
 				a.sess.Log().Warn("oidc: session enrichment failed; login aborted", "email", claims.Email, "err", err)

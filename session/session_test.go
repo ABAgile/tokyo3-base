@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -163,6 +164,14 @@ func TestBasePath_SafeReturnToAndCookiePath(t *testing.T) {
 			t.Errorf("SafeReturnTo(%q) = %q, want /portal/ fallback", unsafe, got)
 		}
 	}
+	for _, unsafe := range []string{
+		"http://evil.example/portal/x", "javascript:alert(1)", "/portal/%2e%2e/admin",
+		"/portal/%5c..%5cadmin", "/portal/\t/x", "/portal/\n", "portal/x",
+	} {
+		if got := m.SafeReturnTo(unsafe); got != "/portal/" {
+			t.Errorf("SafeReturnTo(%q) = %q, want /portal/ fallback", unsafe, got)
+		}
+	}
 	if got := m.CookiePath(); got != "/portal" {
 		t.Errorf("CookiePath = %q, want /portal", got)
 	}
@@ -170,6 +179,11 @@ func TestBasePath_SafeReturnToAndCookiePath(t *testing.T) {
 	root := testManager(t, nil)
 	if got := root.CookiePath(); got != "/" {
 		t.Errorf("root mount CookiePath = %q, want /", got)
+	}
+	for _, unsafe := range []string{"//evil.example", "/\\evil.example", "/%5cevil.example", "https://evil.example", "/\t//evil.example"} {
+		if got := root.SafeReturnTo(unsafe); got != "/" {
+			t.Errorf("root SafeReturnTo(%q) = %q, want / fallback", unsafe, got)
+		}
 	}
 }
 
@@ -849,5 +863,60 @@ func TestTrustedProxies_GovernForwardedProtoForSessionAndSiblingCookies(t *testi
 				t.Errorf("%s cookie from %s: Secure = %v, want %v", name, remote, got, want)
 			}
 		}
+	}
+}
+
+func TestLogoutHandler_RejectsCrossSite(t *testing.T) {
+	m := testManager(t, nil)
+	for site, want := range map[string]int{"cross-site": http.StatusForbidden, "same-origin": http.StatusSeeOther, "same-site": http.StatusSeeOther, "none": http.StatusSeeOther, "": http.StatusSeeOther} {
+		r := httptest.NewRequest(http.MethodGet, "/auth/logout", nil)
+		if site != "" {
+			r.Header.Set("Sec-Fetch-Site", site)
+		}
+		rec := httptest.NewRecorder()
+		m.LogoutHandler()(rec, r)
+		if rec.Code != want {
+			t.Errorf("Sec-Fetch-Site=%q: code=%d, want %d", site, rec.Code, want)
+		}
+	}
+}
+
+func TestGate_IsRevoked(t *testing.T) {
+	var revoked bool
+	var checkErr error
+	m := testManager(t, func(c *Config) {
+		c.IsRevoked = func(_ context.Context, s Session) (bool, error) {
+			if s.SID != "sid-1" {
+				t.Errorf("SID = %q, want sid-1", s.SID)
+			}
+			return revoked, checkErr
+		}
+	})
+	h := m.Gate(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) }))
+	do := func(method string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, "/roles", nil)
+		r.AddCookie(&http.Cookie{Name: m.cookie.Name, Value: sessionCookieValue(t, m, Session{SID: "sid-1", Expiry: m.cfg.Now().Add(time.Hour)})})
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, r)
+		return rec
+	}
+
+	if rec := do(http.MethodGet); rec.Code != http.StatusTeapot {
+		t.Fatalf("live session: code=%d", rec.Code)
+	}
+	revoked = true
+	rec := do(http.MethodGet)
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/auth/login" {
+		t.Fatalf("revoked GET: code=%d loc=%q", rec.Code, rec.Header().Get("Location"))
+	}
+	if cs := rec.Result().Cookies(); len(cs) != 1 || cs[0].MaxAge >= 0 {
+		t.Errorf("revoked session should clear the cookie, got %+v", cs)
+	}
+	if rec := do(http.MethodPost); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("revoked POST: code=%d", rec.Code)
+	}
+	revoked, checkErr = false, errors.New("store down")
+	if rec := do(http.MethodGet); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("check error must fail closed: code=%d", rec.Code)
 	}
 }

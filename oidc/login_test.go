@@ -195,7 +195,7 @@ func TestLoginCallback_RoundTrip(t *testing.T) {
 	fc, flow := startFlow(t, a)
 
 	// IdP would echo our nonce in the verified ID token.
-	stub.claims = &Claims{Subject: "u-1", Email: "alice@x", Groups: []string{"admins"}, Nonce: flow.Nonce}
+	stub.claims = &Claims{Subject: "u-1", Email: "alice@x", Groups: []string{"admins"}, Nonce: flow.Nonce, SessionID: "sid-7"}
 	a.cfg.Verifier = stub
 
 	r := httptest.NewRequest(http.MethodGet, "/auth/callback?state="+url.QueryEscape(flow.State)+"&code=abc", nil)
@@ -222,6 +222,9 @@ func TestLoginCallback_RoundTrip(t *testing.T) {
 	}
 	if sess.CSRFSecret == "" {
 		t.Error("callback minted no CSRF secret")
+	}
+	if sess.SID != "sid-7" {
+		t.Errorf("session SID = %q, want the IdP sid so back-channel logout can match it", sess.SID)
 	}
 }
 

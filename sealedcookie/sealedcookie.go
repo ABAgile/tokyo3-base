@@ -10,12 +10,17 @@ package sealedcookie
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/abagile/tokyo3-base/clientip"
 	"github.com/abagile/tokyo3-base/crypto"
 )
+
+// maxValueLen caps the sealed value so name, attributes, and value stay under
+// the ~4096-byte per-cookie limit; browsers silently drop larger cookies.
+const maxValueLen = 3800
 
 // Cookie manages one sealed cookie: a fixed key, name, path, and clock.
 // The zero value is not usable — construct with the fields set; Now nil
@@ -49,6 +54,9 @@ func (c Cookie) Set(w http.ResponseWriter, r *http.Request, v any, ttl time.Dura
 	sealed, err := c.Seal(v)
 	if err != nil {
 		return err
+	}
+	if len(sealed) > maxValueLen {
+		return fmt.Errorf("sealedcookie: %q value is %d bytes, over the %d-byte limit browsers accept", c.Name, len(sealed), maxValueLen)
 	}
 	ck := &http.Cookie{
 		Name:     c.Name,
