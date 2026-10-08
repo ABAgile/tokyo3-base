@@ -66,3 +66,12 @@ func TestLogRuntimeStatsEmits(t *testing.T) {
 		t.Fatalf("expected a runtime stats line with goroutines, got: %q", out)
 	}
 }
+
+func TestSeconds_Clamped(t *testing.T) {
+	for query, want := range map[string]int{"": 30, "seconds=abc": 30, "seconds=-1": 30, "seconds=10": 10, "seconds=999999": maxProfileSeconds} {
+		r := httptest.NewRequest(http.MethodGet, "/debug/pprof/profile?"+query, nil)
+		if got := seconds(r, 30); got != want {
+			t.Errorf("seconds(%q) = %d, want %d", query, got, want)
+		}
+	}
+}

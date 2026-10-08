@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 )
@@ -25,13 +26,21 @@ type BearerTokenManager struct {
 	Refresher BearerTokenRefresher
 }
 
+// fresh reports whether the held token is still usable. The caller holds the
+// lock. Both the fast path and the re-check under the write lock use this one
+// predicate, so a token can never be judged stale by one and fresh by the
+// other (which, at the exact boundary, returned an expired token).
+func (tm *BearerTokenManager) fresh(buffer time.Duration) bool {
+	return time.Now().Before(tm.ExpiresAt.Add(buffer))
+}
+
 func (tm *BearerTokenManager) GetToken(ctx context.Context) (string, error) {
 	bufferDuration, ok := ctx.Value(tokenRefreshBufferKey).(time.Duration)
 	if !ok {
 		bufferDuration = -5 * time.Minute // default to refresh token 5 mins before expiry
 	}
 	tm.RLock()
-	if time.Now().Before(tm.ExpiresAt.Add(bufferDuration)) {
+	if tm.fresh(bufferDuration) {
 		token := tm.Token
 		tm.RUnlock()
 		return token, nil
@@ -40,7 +49,10 @@ func (tm *BearerTokenManager) GetToken(ctx context.Context) (string, error) {
 
 	tm.Lock()
 	defer tm.Unlock()
-	if time.Now().After(tm.ExpiresAt.Add(bufferDuration)) {
+	if !tm.fresh(bufferDuration) {
+		if tm.Refresher == nil {
+			return "", errors.New("api: bearer token expired and no refresher configured")
+		}
 		token, expiresAt, err := tm.Refresher(ctx)
 		if err != nil {
 			return "", err

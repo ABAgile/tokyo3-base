@@ -81,7 +81,13 @@ func HTTPServer(srv *http.Server, shutdownTimeout time.Duration, useTLS bool) Co
 		case <-ctx.Done():
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 			defer cancel()
-			return srv.Shutdown(shutdownCtx)
+			err := srv.Shutdown(shutdownCtx)
+			if err != nil {
+				// Graceful drain timed out: force-close what's left rather
+				// than leave connections open until process exit.
+				_ = srv.Close()
+			}
+			return err
 		}
 	}
 }

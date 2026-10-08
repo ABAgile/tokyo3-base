@@ -27,6 +27,10 @@ import (
 
 const defaultStatsInterval = 30 * time.Second
 
+// maxProfileSeconds caps ?seconds= on the CPU-profile and trace endpoints so
+// one request can't hold the profiler (and its connection) indefinitely.
+const maxProfileSeconds = 120
+
 // Config configures the diagnostics server.
 type Config struct {
 	// Addr is the listen address for the diagnostics HTTP server, e.g.
@@ -146,10 +150,11 @@ func traceProfile(w http.ResponseWriter, r *http.Request) {
 	sleep(r, seconds(r, 5))
 }
 
-// seconds reads ?seconds=N, falling back to def when absent or invalid.
+// seconds reads ?seconds=N, falling back to def when absent or invalid and
+// clamping to maxProfileSeconds.
 func seconds(r *http.Request, def int) int {
 	if s, err := strconv.Atoi(r.URL.Query().Get("seconds")); err == nil && s > 0 {
-		return s
+		return min(s, maxProfileSeconds)
 	}
 	return def
 }

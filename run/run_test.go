@@ -3,6 +3,7 @@ package run_test
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"sync/atomic"
 	"testing"
@@ -84,5 +85,51 @@ func TestHTTPServer_ShutsDownOnCancel(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("HTTPServer did not return after cancel")
+	}
+}
+
+func TestHTTPServer_ForceClosesAfterShutdownTimeout(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+
+	started, closed := make(chan struct{}), make(chan struct{})
+	srv := &http.Server{Addr: addr, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done() // only ends when the connection is force-closed
+		close(closed)
+	})}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- run.HTTPServer(srv, 50*time.Millisecond, false)(ctx) }()
+
+	for range 100 { // wait for the listener
+		if c, err := net.Dial("tcp", addr); err == nil {
+			c.Close()
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	go func() {
+		if r, err := http.Get("http://" + addr); err == nil {
+			r.Body.Close()
+		}
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler never started")
+	}
+	cancel()
+	if err := <-done; err == nil {
+		t.Fatal("want shutdown timeout error")
+	}
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight connection not force-closed after shutdown timeout")
 	}
 }

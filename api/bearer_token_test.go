@@ -131,3 +131,9 @@ func TestBearerTokenManager_GetToken_Concurrent(t *testing.T) {
 	mu.Unlock()
 	assert.Equal(t, 1, count, "refresher must be called exactly once despite concurrent access")
 }
+
+func TestBearerTokenManager_NilRefresherErrorsInsteadOfPanicking(t *testing.T) {
+	tm := &BearerTokenManager{Token: "stale", ExpiresAt: time.Now().Add(-time.Hour)}
+	_, err := tm.GetToken(context.Background())
+	require.Error(t, err)
+}
