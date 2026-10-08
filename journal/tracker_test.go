@@ -223,3 +223,47 @@ func TestTracker_ResubscribesFromLastSeq(t *testing.T) {
 		t.Errorf("ring has %d events, want 3 (no duplicates): %+v", len(got), got)
 	}
 }
+
+// resetSource serves one batch per Subscribe call and records the resume
+// points it was asked for, then ends the stream.
+type resetSource struct {
+	batches [][]journal.Msg
+	froms   []uint64
+}
+
+func (s *resetSource) Subscribe(_ context.Context, _ int, from uint64) (<-chan journal.Msg, error) {
+	s.froms = append(s.froms, from)
+	i := len(s.froms) - 1
+	ch := make(chan journal.Msg, 8)
+	if i < len(s.batches) {
+		for _, m := range s.batches[i] {
+			ch <- m
+		}
+	}
+	close(ch)
+	return ch, nil
+}
+
+// A recreated stream restarts at sequence 1; the resume point must follow it
+// instead of staying pinned to the old high-water mark.
+func TestTracker_ResumePointFollowsStreamReset(t *testing.T) {
+	now := time.Now()
+	src := &resetSource{batches: [][]journal.Msg{
+		{jmsg(t, 100, "a", now), jmsg(t, 101, "b", now)},
+		{jmsg(t, 1, "c", now)},
+	}}
+	tr, err := journal.NewTracker(journal.TrackerConfig[event]{
+		Source: src, Decode: decodeEvent, Log: discard(), ResubscribeWait: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_ = tr.Run(ctx)
+	if len(src.froms) < 3 || src.froms[1] != 102 || src.froms[2] != 2 {
+		t.Fatalf("resume points = %v, want [0 102 2 ...]", src.froms)
+	}
+}
+
+func (s *resetSource) Close() error { return nil }

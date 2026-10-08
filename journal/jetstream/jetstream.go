@@ -262,7 +262,8 @@ func (s *Source) ensureStream(ctx context.Context) (jetstream.Stream, error) {
 // Subscribe creates an ephemeral, ack-none consumer with a delivery policy
 // chosen to satisfy the requested backfill window:
 //
-//   - startFromSeq > 0:        ByStartSequence(startFromSeq)         (resume)
+//   - startFromSeq in 1..LastSeq+1: ByStartSequence(startFromSeq)    (resume; a
+//     value past the stream end is treated as a reset and ignored)
 //   - replay <= 0 OR empty:    New                                   (tail only)
 //   - replay >= stream length: All                                   (whole stream)
 //   - otherwise:               ByStartSequence(LastSeq - replay + 1) (last N)
@@ -349,7 +350,10 @@ func (s *Source) Close() error {
 // pickDeliverPolicy is the start-policy decision tree, factored out for
 // testing without a live JetStream.
 func pickDeliverPolicy(replay int, startFromSeq, lastSeq uint64) (jetstream.DeliverPolicy, uint64) {
-	if startFromSeq > 0 {
+	// A resume point past the stream's end (lastSeq+1 is the next message) means
+	// the stream was reset or recreated since the caller last saw it; waiting
+	// for sequences to catch up would deliver nothing, so fall back to replay.
+	if startFromSeq > 0 && startFromSeq <= lastSeq+1 {
 		return jetstream.DeliverByStartSequencePolicy, startFromSeq
 	}
 	if replay <= 0 || lastSeq == 0 {

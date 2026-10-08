@@ -142,9 +142,9 @@ func (t *Tracker[T]) ingest(ctx context.Context, ch <-chan Msg, lastSeq *uint64)
 			if !ok {
 				return nil
 			}
-			if msg.Seq > *lastSeq {
-				*lastSeq = msg.Seq
-			}
+			// Not max(): a recreated stream restarts at 1, and the resume point
+			// must follow it rather than stay stuck at the old high-water mark.
+			*lastSeq = msg.Seq
 			if v, keep := t.decode(msg); keep {
 				t.insert(v)
 			}

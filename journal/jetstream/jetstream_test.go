@@ -93,7 +93,10 @@ func TestPickDeliverPolicy(t *testing.T) {
 		wantStart    uint64
 	}{
 		{"resume dominates everything", 100, 42, 1000, jetstream.DeliverByStartSequencePolicy, 42},
-		{"resume on empty stream", 100, 5, 0, jetstream.DeliverByStartSequencePolicy, 5},
+		{"resume at next message", 100, 1001, 1000, jetstream.DeliverByStartSequencePolicy, 1001},
+		{"resume past end → stream reset, tail only", 0, 1500, 1000, jetstream.DeliverNewPolicy, 0},
+		{"resume on empty (reset) stream → tail only", 100, 5, 0, jetstream.DeliverNewPolicy, 0},
+		{"resume past end → replay window", 100, 900, 500, jetstream.DeliverByStartSequencePolicy, 401},
 		{"empty stream → tail only", 100, 0, 0, jetstream.DeliverNewPolicy, 0},
 		{"replay disabled → tail only", 0, 0, 500, jetstream.DeliverNewPolicy, 0},
 		{"replay negative → tail only", -1, 0, 500, jetstream.DeliverNewPolicy, 0},
