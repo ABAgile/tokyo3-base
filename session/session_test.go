@@ -96,6 +96,19 @@ func TestGate_UnauthenticatedGETRedirects(t *testing.T) {
 	}
 }
 
+func TestGate_RedirectKeepsQuery(t *testing.T) {
+	m := testManager(t, nil)
+	h := m.Gate(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("next must not run") }))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/roles?id=7&tab=a", nil))
+	if loc := rec.Header().Get("Location"); loc != "/auth/login?return_to=%2Froles%3Fid%3D7%26tab%3Da" {
+		t.Errorf("Location = %q", loc)
+	}
+	if got := m.SafeReturnTo("/roles?id=7&tab=a"); got != "/roles?id=7&tab=a" {
+		t.Errorf("SafeReturnTo dropped the query: %q", got)
+	}
+}
+
 // TestBasePath_GateAndLogoutRedirects: when the handler tree is mounted
 // under http.StripPrefix, route matching stays in the stripped space but
 // every Location header must name the browser-visible URL — otherwise the

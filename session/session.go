@@ -125,6 +125,12 @@ type Config struct {
 	// session middleware uses), but never past the session's
 	// AbsoluteExpiry (login-time + SessionTTL).
 	//
+	// Note: the renewed cookie is re-sealed from the request's own copy of
+	// the session, so a concurrent request that changed Session.Extra via
+	// [Manager.UpdateSession] can have that change overwritten if the
+	// extension's Set-Cookie lands last (the cookie is last-write-wins).
+	// Keep Extra for login-time snapshots, or serialise its updates.
+	//
 	// 0 (default) ⇒ today's behaviour: Expiry is fixed at login and the
 	// session dies at exactly SessionTTL regardless of activity. Prefer
 	// that hard-cap-only default for higher-stakes admin surfaces, where
@@ -350,7 +356,11 @@ func (m *Manager) Gate(next http.Handler) http.Handler {
 		sess, ok := m.readSession(r)
 		if !ok {
 			if r.Method == http.MethodGet {
-				http.Redirect(w, r, m.cfg.BasePath+m.cfg.LoginPath+"?return_to="+url.QueryEscape(m.cfg.BasePath+r.URL.Path), http.StatusSeeOther)
+				returnTo := m.cfg.BasePath + r.URL.Path
+				if r.URL.RawQuery != "" {
+					returnTo += "?" + r.URL.RawQuery
+				}
+				http.Redirect(w, r, m.cfg.BasePath+m.cfg.LoginPath+"?return_to="+url.QueryEscape(returnTo), http.StatusSeeOther)
 				return
 			}
 			http.Error(w, "authentication required", http.StatusUnauthorized)
