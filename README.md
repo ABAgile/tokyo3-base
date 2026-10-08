@@ -143,7 +143,13 @@ from transport errors.
 ### Bearer token management
 
 ```go
-type BearerTokenManager struct { ... }
+type BearerTokenManager struct {
+    Token          string
+    ExpiresAt      time.Time
+    Refresher      BearerTokenRefresher
+    OnRefreshError func(err error, tokenStillValid bool) // optional; called after each failed refresh
+    // ...
+}
 type BearerTokenRefresher func(context.Context) (string, time.Time, error)
 ```
 
@@ -163,6 +169,14 @@ token, err := tm.GetToken(ctx)
 ctx = api.WithTokenRefreshBuffer(ctx, -10*time.Minute)
 token, err = tm.GetToken(ctx)
 ```
+
+Refresh behavior:
+
+- **Soft-stale** (inside the refresh window, not yet expired): one caller refreshes; every other caller keeps getting the current token without waiting. If the refresh fails, the current token is still returned until it actually expires.
+- **Expired**: callers wait for the single in-flight refresh and receive its error on failure.
+- After a failed refresh the `Refresher` is not called again for `clamp(remaining/2, 1s, 30s)`; during that pause an expired token returns an error wrapping the last failure.
+- The refresh runs detached from the triggering caller's cancellation (15 s timeout), and a panicking or empty-token `Refresher` becomes an error.
+- Set `OnRefreshError` to log failures that the soft-stale grace period would otherwise hide. It runs before waiting callers are released, so keep it quick.
 
 ### Request logging
 
@@ -1642,7 +1656,17 @@ type Handler struct {
     Replay    int           // default 100
     Heartbeat time.Duration // default 30s; 0 disables
     Done      <-chan struct{} // closed ⇒ end every stream (http.Server.Shutdown does not cancel request contexts)
+    Limits    *Limits         // optional concurrent-stream caps; over a cap ⇒ 429 + Retry-After
 }
+
+type LimitsConfig struct {
+    MaxStreams   int                        // global cap; 0 = unlimited
+    MaxPerClient int                        // per-ClientKey cap; 0 = unlimited
+    ClientKey    func(*http.Request) string // required with MaxPerClient; prefer the authenticated identity
+    RetryAfter   time.Duration              // default 10s
+}
+
+func NewLimits(cfg LimitsConfig) (*Limits, error)
 
 func (Handler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 ```
@@ -1662,6 +1686,29 @@ resumes via `Source.Subscribe(ctx, _, 1235)` so a transient drop replays
 only the missed events — not the full backfill window. Comment-line
 heartbeats (`: ping`) fire every `Heartbeat` to keep proxy connections
 warm.
+
+**Connection limits.** Every stream costs a transport-level consumer (for
+JetStream, a server-side one). Set `Handler.Limits` to refuse streams before
+`Subscribe` is called: a request over `MaxStreams` (global) or `MaxPerClient`
+(per `ClientKey`) gets `429 Too Many Requests` with `Retry-After`. Share one
+`Limits` across handlers to make the caps cover them all. Browsers'
+`EventSource` does not reconnect after a non-200 response, so size
+`MaxPerClient` above the tabs a user legitimately keeps open (5–10 is a
+reasonable start) and have the page handle the failure.
+
+```go
+lim, _ := sse.NewLimits(sse.LimitsConfig{
+    MaxStreams:   500,
+    MaxPerClient: 8,
+    ClientKey: func(r *http.Request) string {
+        if s, ok := session.SessionFromContext(r.Context()); ok {
+            return s.Subject
+        }
+        return clientIP.NetworkKey(r)
+    },
+})
+http.Handle("/events", sse.Handler{Source: src, Limits: lim})
+```
 
 Handler doesn't speak authentication — wrap with whatever middleware the
 host app already uses (cookie session, bearer token, mTLS):
