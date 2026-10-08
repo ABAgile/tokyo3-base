@@ -60,6 +60,10 @@ func (co *ClientOption) WithRetryCount(count int) RestyClientOption {
 	}
 }
 
+// WithDebug turns on Resty's built-in debug output. It prints the full request
+// URL (including query-string credentials such as API keys), every header
+// including Authorization, and bodies, none of it redacted. Use it only for
+// local troubleshooting; production logging belongs to [ClientOption.WithRequestLogger].
 func (co *ClientOption) WithDebug(d bool) RestyClientOption {
 	return func(c *resty.Client) {
 		c.SetDebug(d)
@@ -162,6 +166,8 @@ func (rc *RestyClient) R(ctx context.Context, method, path string, result any, o
 	return nil
 }
 
+// WithDebug enables Resty's unredacted debug output for one request; see
+// [ClientOption.WithDebug] for what it exposes.
 func (ro *RequestOption) WithDebug(d bool) RestyRequestOption {
 	return func(r *resty.Request) {
 		r.SetDebug(d)
