@@ -829,7 +829,8 @@ Postgres-open layer to host those.
 ### Audit sink/source
 
 ```go
-func AuditSink[T any](rt Runtime, subject string) (*journal.EncodedSink[T], error)
+func AuditSink[T any](rt Runtime, subject string, opts ...AuditOption) (*journal.EncodedSink[T], error)
+func AuditRequired() AuditOption // missing NATS URL ⇒ error instead of no-op sink
 func AuditSource(rt Runtime, stream, subject string) (journal.Source, error)
 ```
 
@@ -837,7 +838,9 @@ Build a daemon's primary audit publisher (typed by the app's Entry `T`)
 and own-stream reader from the resolved NATS material — the common case
 collapses to one generic call. A daemon that attaches to additional
 streams (e.g. certd tailing ssh-proxy's audit) wires those directly.
-No-op (no error) when no broker URL is configured.
+No-op (no error) when no broker URL is configured, unless `AuditRequired()`
+is passed to `AuditSink` — use it in production so a missing or misspelled
+env var can't silently disable audit publishing.
 
 ```go
 sink, _ := cli.AuditSink[audit.Entry](rt, audit.Subject)
@@ -1065,7 +1068,7 @@ Most consumers never call this package directly — `session.Manager.CSRFToken`
 func NewPgxPool(connStr string, opts ...DatabaseConfigOption) (*pgxpool.Pool, error)
 ```
 
-Creates a `pgxpool.Pool` from a connection string. Options are applied to the parsed config before the pool is created.
+Creates a `pgxpool.Pool` from a connection string. Options are applied to the parsed config before the pool is created. It does not contact the database; use `NewPgxPoolContext(ctx, connStr, opts...)` to also `Ping` (bounded by `ctx`) and fail at startup when the database is unreachable.
 
 ```go
 type DatabaseConfigOption func(*pgxpool.Config)
@@ -1638,6 +1641,7 @@ type Handler struct {
     Source    journal.Source
     Replay    int           // default 100
     Heartbeat time.Duration // default 30s; 0 disables
+    Done      <-chan struct{} // closed ⇒ end every stream (http.Server.Shutdown does not cancel request contexts)
 }
 
 func (Handler) ServeHTTP(w http.ResponseWriter, r *http.Request)
@@ -2162,6 +2166,7 @@ import "github.com/abagile/tokyo3-base/session"
 type Session struct {
     Subject, Email, Name string
     Groups               []string
+    SID                  string          // IdP session id (OIDC `sid`), set by the OIDC default completer
     Expiry               time.Time       // slides on activity when IdleTimeout is set
     AbsoluteExpiry       time.Time       // hard ceiling: login + SessionTTL
     CSRFSecret           csrf.Secret     // minted by NewSession
@@ -2180,6 +2185,7 @@ type Config struct {
     IdleTimeout    time.Duration // > 0 ⇒ sliding idle expiry, capped at AbsoluteExpiry
     TrustedOrigins *[]string     // non-nil ⇒ Origin/Sec-Fetch-Site verification on
     TrustedProxies []*net.IPNet  // peers allowed to vouch for TLS via X-Forwarded-Proto (empty ⇒ any)
+    IsRevoked      func(ctx context.Context, s Session) (bool, error) // server-side revocation (e.g. back-channel logout by Session.SID); error ⇒ 503
     Now            func() time.Time
     Log            *slog.Logger
 }
