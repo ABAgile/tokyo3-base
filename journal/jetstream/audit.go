@@ -37,6 +37,10 @@ type AuditSinkConfig struct {
 	Subject   string
 	EnvPrefix string
 	Log       *slog.Logger
+	// Required makes an empty URL an error instead of a silent no-op sink, so
+	// a production daemon can't boot with audit publishing quietly disabled
+	// by a missing or misspelled env var.
+	Required bool
 }
 
 // NewAuditSink builds a JSON-encoded JetStream sink for audit
@@ -59,6 +63,9 @@ func NewAuditSink[T any](cfg AuditSinkConfig) (*journal.EncodedSink[T], error) {
 		return nil, fmt.Errorf("EnvPrefix required")
 	}
 	if cfg.URL == "" {
+		if cfg.Required {
+			return nil, fmt.Errorf("%s_URL is required: audit sink must not be a no-op", cfg.EnvPrefix)
+		}
 		if cfg.Log != nil {
 			cfg.Log.Warn(cfg.EnvPrefix + "_URL not set — audit sink is no-op; not for production")
 		}

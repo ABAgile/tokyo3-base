@@ -297,14 +297,19 @@ func (s *Source) Subscribe(ctx context.Context, replay int, startFromSeq uint64)
 	// Stop the iterator when the caller cancels: Next() blocks otherwise.
 	// Stop() unblocks Next() with ErrMsgIteratorClosed; the loop returns
 	// and closes the output channel cleanly.
+	done := make(chan struct{})
 	go func() {
-		<-ctx.Done()
+		select {
+		case <-ctx.Done():
+		case <-done: // reader exited on its own; don't linger until ctx ends
+		}
 		mc.Stop()
 	}()
 
 	ch := make(chan journal.Msg)
 	go func() {
 		defer close(ch)
+		defer close(done)
 		for {
 			msg, err := mc.Next()
 			if err != nil {

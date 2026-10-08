@@ -57,6 +57,13 @@ func TestNewAuditSink_RequiresEnvPrefix(t *testing.T) {
 	}
 }
 
+func TestNewAuditSink_RequiredRejectsEmptyURL(t *testing.T) {
+	_, err := jetstream.NewAuditSink[testEntry](jetstream.AuditSinkConfig{EnvPrefix: "TEST_NATS", Required: true})
+	if err == nil || !strings.Contains(err.Error(), "TEST_NATS_URL") {
+		t.Errorf("err = %v, want URL-required", err)
+	}
+}
+
 // TestNewAuditSink_UnreachableURL: with NewSink's lazy-connect
 // semantics, an unreachable URL is NOT a startup failure — the
 // returned sink is queued for background reconnect. NewAuditSink
