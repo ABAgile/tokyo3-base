@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -53,18 +54,40 @@ func TestStartNoopWhenAddrEmpty(t *testing.T) {
 }
 
 func TestLogRuntimeStatsEmits(t *testing.T) {
-	var buf bytes.Buffer
-	log := slog.New(slog.NewTextHandler(&buf, nil))
+	buf := &lockedBuffer{}
+	log := slog.New(slog.NewTextHandler(buf, nil))
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { logRuntimeStats(ctx, log, 5*time.Millisecond); close(done) }()
-	time.Sleep(40 * time.Millisecond)
+	// Wait for the first tick rather than a fixed sleep, so a loaded machine
+	// can't miss it.
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(buf.String(), "runtime stats") && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
 	cancel()
 	<-done
 	out := buf.String()
 	if !strings.Contains(out, "runtime stats") || !strings.Contains(out, "goroutines=") {
 		t.Fatalf("expected a runtime stats line with goroutines, got: %q", out)
 	}
+}
+
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func TestSeconds_Clamped(t *testing.T) {

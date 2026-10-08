@@ -1,6 +1,7 @@
 package applog
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -13,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	plog "github.com/phuslu/log"
 )
 
 // TestAppLoggerWithNATS_EmptyURL_StdoutOnly: the no-NATS path is the
@@ -199,42 +202,51 @@ func writeMTLSCertFiles(t *testing.T) (certFile, keyFile, caFile string) {
 	return certFile, keyFile, caFile
 }
 
-// TestAppLoggerWithNATS_InstanceSuffixesSubjectAndLogs verifies the
-// per-host case used by cert-agentd / ssh-tunneld: Instance
-// suffixes the NATS subject AND adds an "instance" attribute to
-// every log line. Tested at the helper layer via an httptest-style
-// no-op so we don't need a real broker; the dial branch goes
-// through RetryOnFailedConnect and queues the (unreachable) conn,
-// which is enough to exercise subject derivation.
-func TestAppLoggerWithNATS_InstanceSuffixesSubjectAndLogs(t *testing.T) {
-	// Real broker not required — the subject-derivation path runs
-	// before any Publish call. RetryOnFailedConnect tolerates the
-	// unreachable URL.
-	log, _, drain := AppLoggerWithNATS(Config{
-		App:      "cert-agentd",
-		Instance: "host-42",
-	}, NATSConfig{URL: "nats://127.0.0.1:1"}, WithStdout())
-	defer drain()
-
-	// Logger must remain usable and must carry the instance attribute
-	// on every subsequent record. We can't easily inspect the slog
-	// handler chain from here, but if the .With(...) wiring is wrong
-	// the line below would either panic or produce a missing-instance
-	// record visible in the surrounding test log capture.
-	log.Info("test line — should carry instance attribute")
+// TestLogSubject_InstanceSuffix: Instance suffixes the NATS subject for
+// per-host daemons (cert-agentd, ssh-tunneld); empty Instance keeps the legacy
+// "app_log.<app>" form so singleton daemons' consumers don't need rewriting.
+func TestLogSubject_InstanceSuffix(t *testing.T) {
+	if got, want := logSubject(Config{App: "cert-agentd", Instance: "host-42"}), "app_log.cert-agentd.host-42"; got != want {
+		t.Errorf("per-host subject = %q, want %q", got, want)
+	}
+	if got, want := logSubject(Config{App: "certd"}), "app_log.certd"; got != want {
+		t.Errorf("singleton subject = %q, want %q", got, want)
+	}
 }
 
-// TestAppLoggerWithNATS_EmptyInstancePreservesLegacySubject: empty
-// Instance keeps the subject at the legacy "app_log.<app>" form so
-// singleton daemons (certd, authd, ssh-proxyd) don't need to
-// rewrite consumers.
-func TestAppLoggerWithNATS_EmptyInstancePreservesLegacySubject(t *testing.T) {
-	// Same shape — exercises the no-Instance branch.
-	log, _, drain := AppLoggerWithNATS(Config{App: "certd"}, NATSConfig{
-		URL: "nats://127.0.0.1:1",
-	}, WithStdout())
-	defer drain()
-	log.Info("test line — should NOT carry instance attribute")
+// TestAppLoggerWithNATS_InstanceAttribute: the logger built for an unreachable
+// broker (RetryOnFailedConnect tolerates it) stays usable, and Instance — when
+// set — rides on every record as an "instance" attribute. The logger returned
+// by AppLogger is the one AppLoggerWithNATS wraps, so its output is captured
+// through a buffer writer.
+func TestAppLoggerWithNATS_InstanceAttribute(t *testing.T) {
+	_, _, drain := AppLoggerWithNATS(Config{App: "cert-agentd", Instance: "host-42"},
+		NATSConfig{URL: "nats://127.0.0.1:1"}, WithStdout())
+	drain()
+
+	for _, tc := range []struct {
+		cfg          Config
+		wantInstance bool
+	}{
+		{Config{App: "cert-agentd", Instance: "host-42"}, true},
+		{Config{App: "certd"}, false},
+	} {
+		var buf bytes.Buffer
+		log, _ := AppLogger(tc.cfg, func(_ Config, ws *[]plog.Writer) {
+			*ws = append(*ws, &plog.IOWriter{Writer: &buf})
+		})
+		log.Info("line")
+		out := buf.String()
+		if !strings.Contains(out, `"app":"`+tc.cfg.App+`"`) {
+			t.Errorf("%+v: missing app attribute: %s", tc.cfg, out)
+		}
+		if has := strings.Contains(out, `"instance"`); has != tc.wantInstance {
+			t.Errorf("%+v: instance attribute present=%v, want %v: %s", tc.cfg, has, tc.wantInstance, out)
+		}
+		if tc.wantInstance && !strings.Contains(out, `"instance":"host-42"`) {
+			t.Errorf("%+v: wrong instance value: %s", tc.cfg, out)
+		}
+	}
 }
 
 // TestDialLogNATS_AppliesCustomTimeout: when cfg.Timeout is set,
