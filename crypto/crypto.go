@@ -1,7 +1,8 @@
 // AES-256-GCM helpers and an envelope-encryption pattern.
 //
 // Layout:
-//   - Seal/Open       — direct AEAD primitives (key + plaintext → ciphertext).
+//   - Seal/Open       — direct AEAD primitives (key + plaintext → ciphertext);
+//     SealAAD/OpenAAD additionally bind a context string.
 //   - RandomBytes     — single source of cryptographically random bytes.
 //   - ParseKEK,
 //     GenerateKEK     — parse / mint a 32-byte symmetric key encoded as 64 hex
@@ -67,24 +68,48 @@ func GenerateKEK() (string, error) {
 // generated freshly per call and prepended to the ciphertext, so the output
 // format is `nonce || ciphertext+tag`.
 func Seal(key, plaintext []byte) ([]byte, error) {
-	block, err := aes.NewCipher(key)
+	return SealAAD(key, plaintext, nil)
+}
+
+// SealAAD is [Seal] with additional authenticated data. aad is not encrypted
+// or stored, but [OpenAAD] only succeeds when given the same value, binding
+// the ciphertext to a context (a cookie name, a row ID, ...).
+func SealAAD(key, plaintext, aad []byte) ([]byte, error) {
+	gcm, err := newGCM(key)
 	if err != nil {
-		return nil, fmt.Errorf("new cipher: %w", err)
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, fmt.Errorf("new gcm: %w", err)
+		return nil, err
 	}
 	nonce, err := RandomBytes(gcm.NonceSize())
 	if err != nil {
 		return nil, fmt.Errorf("generate nonce: %w", err)
 	}
-	return gcm.Seal(nonce, nonce, plaintext, nil), nil
+	return gcm.Seal(nonce, nonce, plaintext, aad), nil
 }
 
 // Open decrypts ciphertext produced by Seal. The input is expected to be
 // `nonce || ciphertext+tag`.
 func Open(key, ciphertext []byte) ([]byte, error) {
+	return OpenAAD(key, ciphertext, nil)
+}
+
+// OpenAAD decrypts ciphertext produced by [SealAAD] with the same aad.
+func OpenAAD(key, ciphertext, aad []byte) ([]byte, error) {
+	gcm, err := newGCM(key)
+	if err != nil {
+		return nil, err
+	}
+	if len(ciphertext) < gcm.NonceSize() {
+		return nil, fmt.Errorf("ciphertext too short")
+	}
+	nonce, ct := ciphertext[:gcm.NonceSize()], ciphertext[gcm.NonceSize():]
+	plaintext, err := gcm.Open(nil, nonce, ct, aad)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt: %w", err)
+	}
+	return plaintext, nil
+}
+
+func newGCM(key []byte) (cipher.AEAD, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, fmt.Errorf("new cipher: %w", err)
@@ -93,15 +118,7 @@ func Open(key, ciphertext []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("new gcm: %w", err)
 	}
-	if len(ciphertext) < gcm.NonceSize() {
-		return nil, fmt.Errorf("ciphertext too short")
-	}
-	nonce, ct := ciphertext[:gcm.NonceSize()], ciphertext[gcm.NonceSize():]
-	plaintext, err := gcm.Open(nil, nonce, ct, nil)
-	if err != nil {
-		return nil, fmt.Errorf("decrypt: %w", err)
-	}
-	return plaintext, nil
+	return gcm, nil
 }
 
 // EncryptEnvelope encrypts plaintext under a fresh random 32-byte DEK, then
@@ -109,11 +126,18 @@ func Open(key, ciphertext []byte) ([]byte, error) {
 // Each call produces a unique DEK, so identical plaintexts encrypt to distinct
 // ciphertexts.
 func EncryptEnvelope(ctx context.Context, kp KeyProvider, plaintext []byte) (encryptedValue, wrappedDEK []byte, err error) {
+	return EncryptEnvelopeAAD(ctx, kp, plaintext, nil)
+}
+
+// EncryptEnvelopeAAD is [EncryptEnvelope] with the value bound to aad (for
+// example a row ID), so an (encryptedValue, wrappedDEK) pair copied to another
+// context fails to decrypt there. Decrypt with [DecryptEnvelopeAAD].
+func EncryptEnvelopeAAD(ctx context.Context, kp KeyProvider, plaintext, aad []byte) (encryptedValue, wrappedDEK []byte, err error) {
 	dek, err := RandomBytes(32)
 	if err != nil {
 		return nil, nil, fmt.Errorf("generate dek: %w", err)
 	}
-	encryptedValue, err = Seal(dek, plaintext)
+	encryptedValue, err = SealAAD(dek, plaintext, aad)
 	if err != nil {
 		return nil, nil, fmt.Errorf("seal value: %w", err)
 	}
@@ -126,11 +150,16 @@ func EncryptEnvelope(ctx context.Context, kp KeyProvider, plaintext []byte) (enc
 
 // DecryptEnvelope unwraps the DEK using kp, then decrypts the value under it.
 func DecryptEnvelope(ctx context.Context, kp KeyProvider, wrappedDEK, encryptedValue []byte) ([]byte, error) {
+	return DecryptEnvelopeAAD(ctx, kp, wrappedDEK, encryptedValue, nil)
+}
+
+// DecryptEnvelopeAAD reverses [EncryptEnvelopeAAD]; aad must match.
+func DecryptEnvelopeAAD(ctx context.Context, kp KeyProvider, wrappedDEK, encryptedValue, aad []byte) ([]byte, error) {
 	dek, err := kp.Unwrap(ctx, wrappedDEK)
 	if err != nil {
 		return nil, fmt.Errorf("unwrap dek: %w", err)
 	}
-	plaintext, err := Open(dek, encryptedValue)
+	plaintext, err := OpenAAD(dek, encryptedValue, aad)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt value: %w", err)
 	}

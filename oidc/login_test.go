@@ -148,7 +148,7 @@ func TestLoginHandler_ReturnToAndCookieScope(t *testing.T) {
 		t.Fatal("login set no flow cookie")
 	}
 	var flow oidcFlow
-	if err := sealedcookie.Open(a.flow.Key, fc.Value, &flow); err != nil {
+	if err := a.flow.Open(fc.Value, &flow); err != nil {
 		t.Fatalf("open flow cookie: %v", err)
 	}
 	if flow.ReturnTo != "/portal/" {
@@ -178,7 +178,7 @@ func startFlow(t *testing.T, a *Authenticator) (*http.Cookie, oidcFlow) {
 		t.Fatal("login set no flow cookie")
 	}
 	var flow oidcFlow
-	if err := sealedcookie.Open(a.flow.Key, fc.Value, &flow); err != nil {
+	if err := a.flow.Open(fc.Value, &flow); err != nil {
 		t.Fatalf("open flow cookie: %v", err)
 	}
 	return fc, flow
@@ -214,7 +214,7 @@ func TestLoginCallback_RoundTrip(t *testing.T) {
 		t.Fatal("callback set no session cookie")
 	}
 	var sess session.Session
-	if err := sealedcookie.Open(a.flow.Key, sc.Value, &sess); err != nil {
+	if err := (sealedcookie.Cookie{Key: a.flow.Key, Name: sc.Name}).Open(sc.Value, &sess); err != nil {
 		t.Fatalf("open session: %v", err)
 	}
 	if sess.Email != "alice@x" || len(sess.Groups) != 1 || sess.Groups[0] != "admins" {
@@ -267,7 +267,7 @@ func TestCallback_EnrichSession(t *testing.T) {
 		t.Fatal("callback set no session cookie")
 	}
 	var sess session.Session
-	if err := sealedcookie.Open(a.flow.Key, sc.Value, &sess); err != nil {
+	if err := (sealedcookie.Cookie{Key: a.flow.Key, Name: sc.Name}).Open(sc.Value, &sess); err != nil {
 		t.Fatalf("open session: %v", err)
 	}
 	var got appData
@@ -434,7 +434,7 @@ func TestCompletionOverride_TakesPrecedenceAndCarriesExtra(t *testing.T) {
 		t.Fatal("Begin set no flow cookie")
 	}
 	var flow oidcFlow
-	if err := sealedcookie.Open(a.flow.Key, fc.Value, &flow); err != nil {
+	if err := a.flow.Open(fc.Value, &flow); err != nil {
 		t.Fatalf("open flow cookie: %v", err)
 	}
 
@@ -490,7 +490,7 @@ func TestCompletionOverride_ErrorRenders500(t *testing.T) {
 		}
 	}
 	var flow oidcFlow
-	if err := sealedcookie.Open(a.flow.Key, fc.Value, &flow); err != nil {
+	if err := a.flow.Open(fc.Value, &flow); err != nil {
 		t.Fatalf("open flow cookie: %v", err)
 	}
 	stub.claims = &Claims{Subject: "u-1", Nonce: flow.Nonce}

@@ -189,3 +189,25 @@ func TestCookie_ZeroTTL_BrowserSessionCookie(t *testing.T) {
 		t.Errorf("Expires = %v, want zero value (omitted)", sc.Expires)
 	}
 }
+
+func TestCookie_SealIsBoundToName(t *testing.T) {
+	key := bytes.Repeat([]byte{7}, 32)
+	a := Cookie{Key: key, Name: "app_session"}
+	b := Cookie{Key: key, Name: "app_flow"}
+	sealed, err := a.Seal(map[string]string{"k": "v"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]string
+	if err := a.Open(sealed, &got); err != nil || got["k"] != "v" {
+		t.Fatalf("same-name open: %v %v", got, err)
+	}
+	if err := b.Open(sealed, &got); err == nil {
+		t.Fatal("value sealed for one cookie name opened under another sharing the key")
+	}
+	// The name-less package-level Seal must not open as a named cookie either.
+	plain, _ := Seal(key, map[string]string{"k": "v"})
+	if err := a.Open(plain, &got); err == nil {
+		t.Fatal("unbound value opened as a named cookie")
+	}
+}

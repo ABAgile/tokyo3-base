@@ -906,7 +906,10 @@ func Open(key, ciphertext []byte) ([]byte, error)
 96-bit random nonce and returns `nonce || ciphertext+tag`. `Open` is the
 inverse. Reach for these when you already have a key and just need to
 seal/unseal short blobs (cookies, session tokens, signed-but-encrypted
-payloads).
+payloads). `SealAAD`/`OpenAAD` (and `EncryptEnvelopeAAD`/`DecryptEnvelopeAAD`)
+additionally bind a context string such as a row ID. `sealedcookie.Cookie`
+binds each value to its cookie name, so cookies sharing a key aren't
+interchangeable.
 
 > **Nonce-reuse limit**: with random 96-bit nonces a single key is
 > collision-safe up to ~2³² messages (NIST SP 800-38D). Rotate keys

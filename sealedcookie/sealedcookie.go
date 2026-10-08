@@ -37,7 +37,7 @@ func (c Cookie) now() time.Time {
 // ttl <= 0 sets no Expires/Max-Age — a browser-session cookie, cleared when
 // the browser closes.
 func (c Cookie) Set(w http.ResponseWriter, r *http.Request, v any, ttl time.Duration) error {
-	sealed, err := Seal(c.Key, v)
+	sealed, err := c.Seal(v)
 	if err != nil {
 		return err
 	}
@@ -79,30 +79,50 @@ func (c Cookie) Read(r *http.Request, dst any) error {
 	if err != nil {
 		return err
 	}
-	return Open(c.Key, ck.Value, dst)
+	return c.Open(ck.Value, dst)
 }
 
+// Seal marshals v to JSON and encrypts it (AES-256-GCM) with the cookie's
+// key, bound to the cookie's name, returning a base64url string suitable for
+// its value. A value sealed for one cookie name never opens under another,
+// even when cookies share a key (see session.Manager.SiblingCookie).
+func (c Cookie) Seal(v any) (string, error) {
+	return seal(c.Key, v, c.aad())
+}
+
+// Open reverses [Cookie.Seal]: decodes, decrypts, and unmarshals into dst.
+func (c Cookie) Open(val string, dst any) error {
+	return open(c.Key, val, dst, c.aad())
+}
+
+func (c Cookie) aad() []byte { return []byte("sealedcookie:" + c.Name) }
+
 // Seal marshals v to JSON and encrypts it with key (AES-256-GCM),
-// returning a base64url string suitable for a cookie value.
-func Seal(key []byte, v any) (string, error) {
+// returning a base64url string. Unlike [Cookie.Seal] it is not bound to a
+// cookie name; prefer the Cookie methods for anything set as a cookie.
+func Seal(key []byte, v any) (string, error) { return seal(key, v, nil) }
+
+// Open reverses [Seal]: decodes, decrypts with key, and unmarshals into dst.
+func Open(key []byte, val string, dst any) error { return open(key, val, dst, nil) }
+
+func seal(key []byte, v any, aad []byte) (string, error) {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return "", err
 	}
-	sealed, err := crypto.Seal(key, b)
+	sealed, err := crypto.SealAAD(key, b, aad)
 	if err != nil {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(sealed), nil
 }
 
-// Open reverses [Seal]: decodes, decrypts with key, and unmarshals into dst.
-func Open(key []byte, val string, dst any) error {
+func open(key []byte, val string, dst any, aad []byte) error {
 	raw, err := base64.RawURLEncoding.DecodeString(val)
 	if err != nil {
 		return err
 	}
-	pt, err := crypto.Open(key, raw)
+	pt, err := crypto.OpenAAD(key, raw, aad)
 	if err != nil {
 		return err
 	}

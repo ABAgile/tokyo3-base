@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/abagile/tokyo3-base/csrf"
-	"github.com/abagile/tokyo3-base/sealedcookie"
 )
 
 var testKey = bytes.Repeat([]byte{0x42}, 32)
@@ -44,7 +43,7 @@ func testManager(t *testing.T, mut func(*Config)) *Manager {
 
 func sessionCookieValue(t *testing.T, m *Manager, sess Session) string {
 	t.Helper()
-	v, err := sealedcookie.Seal(m.cfg.SessionKey, sess)
+	v, err := m.cookie.Seal(sess)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -363,7 +362,7 @@ func TestUpdateSession(t *testing.T) {
 		t.Fatal("no re-sealed session cookie written")
 	}
 	var sess Session
-	if err := sealedcookie.Open(m.cfg.SessionKey, sc.Value, &sess); err != nil {
+	if err := m.cookie.Open(sc.Value, &sess); err != nil {
 		t.Fatalf("open updated session: %v", err)
 	}
 	if string(sess.Extra) != `{"tenant":"acme"}` || sess.Email != "a@x" {
@@ -755,7 +754,7 @@ func TestGate_IdleExtend_CappedAtAbsoluteExpiry(t *testing.T) {
 		t.Fatal("expected an extension attempt (capped, not skipped)")
 	}
 	var got Session
-	if err := sealedcookie.Open(m.cfg.SessionKey, extended.Value, &got); err != nil {
+	if err := m.cookie.Open(extended.Value, &got); err != nil {
 		t.Fatalf("open extended cookie: %v", err)
 	}
 	if !got.Expiry.Equal(sess.AbsoluteExpiry) {
@@ -792,5 +791,29 @@ func TestGate_IdleExtend_Disabled_NeverReseals(t *testing.T) {
 	}
 	if len(rec.Result().Cookies()) != 0 {
 		t.Error("Gate re-sealed the cookie despite IdleTimeout being disabled")
+	}
+}
+
+// A value sealed for one cookie must not open as a sibling cookie that shares
+// the session key (and vice versa), so a flow cookie can't be replayed as a
+// session or the reverse.
+func TestSiblingCookie_NotInterchangeableWithSession(t *testing.T) {
+	m := testManager(t, nil)
+	flow := m.SiblingCookie("flow")
+	sess := Session{Subject: "u", Expiry: m.cfg.Now().Add(time.Hour)}
+
+	sealedSession := sessionCookieValue(t, m, sess)
+	var out Session
+	if err := flow.Open(sealedSession, &out); err == nil {
+		t.Error("session cookie value opened as the flow cookie")
+	}
+	sealedFlow, err := flow.Seal(sess)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRequest(http.MethodGet, "/x", nil)
+	r.AddCookie(&http.Cookie{Name: m.cookie.Name, Value: sealedFlow})
+	if _, ok := m.readSession(r); ok {
+		t.Error("flow cookie value accepted as a session")
 	}
 }

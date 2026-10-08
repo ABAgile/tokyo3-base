@@ -283,3 +283,35 @@ func TestRewrap_WrapError(t *testing.T) {
 		t.Error("expected error when newKP.Wrap fails, got nil")
 	}
 }
+
+func TestSealAAD_BindsContext(t *testing.T) {
+	key, _ := RandomBytes(32)
+	ct, err := SealAAD(key, []byte("secret"), []byte("row-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pt, err := OpenAAD(key, ct, []byte("row-1")); err != nil || string(pt) != "secret" {
+		t.Fatalf("OpenAAD = %q, %v", pt, err)
+	}
+	if _, err := OpenAAD(key, ct, []byte("row-2")); err == nil {
+		t.Error("OpenAAD succeeded with a different aad")
+	}
+	if _, err := Open(key, ct); err == nil {
+		t.Error("Open (no aad) succeeded on an aad-bound ciphertext")
+	}
+}
+
+func TestEnvelopeAAD_RejectsSwappedContext(t *testing.T) {
+	kek, _ := RandomBytes(32)
+	kp := NewLocalKeyProvider(kek)
+	ev, wrapped, err := EncryptEnvelopeAAD(context.Background(), kp, []byte("v"), []byte("row-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pt, err := DecryptEnvelopeAAD(context.Background(), kp, wrapped, ev, []byte("row-1")); err != nil || string(pt) != "v" {
+		t.Fatalf("DecryptEnvelopeAAD = %q, %v", pt, err)
+	}
+	if _, err := DecryptEnvelopeAAD(context.Background(), kp, wrapped, ev, []byte("row-2")); err == nil {
+		t.Error("decrypt succeeded under a different row's aad")
+	}
+}
