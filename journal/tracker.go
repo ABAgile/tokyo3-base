@@ -103,9 +103,13 @@ func NewTracker[T any](cfg TrackerConfig[T]) (*Tracker[T], error) {
 func (t *Tracker[T]) Run(ctx context.Context) error {
 	var lastSeq uint64
 	for {
+		// On resume ask to continue after lastSeq; replay is then only used by
+		// the source when that point no longer exists (a recreated stream), so
+		// the ring is rebuilt from the new stream's tail instead of staying
+		// stale and empty of its history.
 		replay, from := t.max, uint64(0)
 		if lastSeq > 0 {
-			replay, from = 0, lastSeq+1 // resume: don't replay what the ring already holds
+			from = lastSeq + 1
 		}
 		ch, err := t.src.Subscribe(ctx, replay, from)
 		if err == nil {
@@ -144,6 +148,11 @@ func (t *Tracker[T]) ingest(ctx context.Context, ch <-chan Msg, lastSeq *uint64)
 			}
 			// Not max(): a recreated stream restarts at 1, and the resume point
 			// must follow it rather than stay stuck at the old high-water mark.
+			// Sequences only go backwards across such a reset, and the ring's
+			// existing entries belong to the old stream, so drop them.
+			if msg.Seq < *lastSeq {
+				t.reset()
+			}
 			*lastSeq = msg.Seq
 			if v, keep := t.decode(msg); keep {
 				t.insert(v)
@@ -160,6 +169,12 @@ func (t *Tracker[T]) Snapshot() []T {
 	out := make([]T, len(t.ring))
 	copy(out, t.ring)
 	return out
+}
+
+func (t *Tracker[T]) reset() {
+	t.mu.Lock()
+	t.ring = nil
+	t.mu.Unlock()
 }
 
 func (t *Tracker[T]) insert(v T) {

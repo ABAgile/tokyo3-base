@@ -192,6 +192,7 @@ type Source struct {
 	streamName        string
 	subject           string
 	inactiveThreshold time.Duration
+	log               *slog.Logger
 
 	streamMu sync.Mutex
 	stream   jetstream.Stream
@@ -237,6 +238,7 @@ func NewSource(cfg SourceConfig) (*Source, error) {
 		streamName:        cfg.StreamName,
 		subject:           cfg.Subject,
 		inactiveThreshold: inactive,
+		log:               cfg.Log,
 	}, nil
 }
 
@@ -319,7 +321,11 @@ func (s *Source) Subscribe(ctx context.Context, replay int, startFromSeq uint64)
 				}
 				// Any other error (connection drop, server gone): the
 				// caller's ctx will likely fire shortly; either way the
-				// iterator is dead.
+				// iterator is dead. Say so, or the closed channel looks like
+				// a clean end of stream.
+				if s.log != nil && ctx.Err() == nil {
+					s.log.Warn("jetstream subscription ended", "stream", s.streamName, "subject", s.subject, "err", err)
+				}
 				return
 			}
 			meta, mErr := msg.Metadata()

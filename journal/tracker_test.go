@@ -210,7 +210,7 @@ func TestTracker_ResubscribesFromLastSeq(t *testing.T) {
 		t.Fatalf("Run = %v, want context.Canceled", err)
 	}
 
-	want := [][2]uint64{{10, 0}, {0, 6}, {0, 7}}
+	want := [][2]uint64{{10, 0}, {10, 6}, {10, 7}}
 	if len(src.calls) != len(want) {
 		t.Fatalf("Subscribe calls = %v, want %v", src.calls, want)
 	}
@@ -229,10 +229,12 @@ func TestTracker_ResubscribesFromLastSeq(t *testing.T) {
 type resetSource struct {
 	batches [][]journal.Msg
 	froms   []uint64
+	replays []int
 }
 
-func (s *resetSource) Subscribe(_ context.Context, _ int, from uint64) (<-chan journal.Msg, error) {
+func (s *resetSource) Subscribe(_ context.Context, replay int, from uint64) (<-chan journal.Msg, error) {
 	s.froms = append(s.froms, from)
+	s.replays = append(s.replays, replay)
 	i := len(s.froms) - 1
 	ch := make(chan journal.Msg, 8)
 	if i < len(s.batches) {
@@ -267,3 +269,30 @@ func TestTracker_ResumePointFollowsStreamReset(t *testing.T) {
 }
 
 func (s *resetSource) Close() error { return nil }
+
+// After a stream reset the ring must not keep the old stream's events, and the
+// resubscribe must still offer the replay window for the new stream.
+func TestTracker_StreamResetDropsStaleRingAndKeepsReplayWindow(t *testing.T) {
+	now := time.Now()
+	src := &resetSource{batches: [][]journal.Msg{
+		{jmsg(t, 100, "old-a", now), jmsg(t, 101, "old-b", now)},
+		{jmsg(t, 1, "new-a", now), jmsg(t, 2, "new-b", now)},
+	}}
+	tr, err := journal.NewTracker(journal.TrackerConfig[event]{
+		Source: src, Decode: decodeEvent, Log: discard(), Max: 7, ResubscribeWait: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_ = tr.Run(ctx)
+
+	got := tr.Snapshot()
+	if len(got) != 2 || got[0].Action != "new-b" || got[1].Action != "new-a" {
+		t.Fatalf("ring after reset = %+v, want only the new stream's [new-b new-a]", got)
+	}
+	if len(src.replays) < 2 || src.replays[1] != 7 {
+		t.Fatalf("resume replay windows = %v, want the full Max (7) offered on resume", src.replays)
+	}
+}
