@@ -528,7 +528,11 @@ when present, so any standards-compliant IdP works regardless of its
 exact endpoint paths — not just ones matching tokyo3-auth's
 `{issuer}/authorize` + `{issuer}/token` + `{issuer}/device_authorization`
 convention. A missing, unreachable, or malformed discovery document
-falls back to that convention rather than failing the login.
+falls back to that convention rather than failing the login. Discovery is
+skipped for a cleartext non-loopback issuer, its redirects must stay on
+https (or loopback), and a document whose `issuer` doesn't match the
+configured one is ignored. Discovered endpoints must themselves be https
+(or loopback).
 
 #### Loopback primitives for non-OAuth server-mediated logins
 
@@ -622,7 +626,9 @@ Removes `tokens.json` (so the next call requires a fresh login) plus
 any extras the caller names. Extras may be absolute paths or paths
 relative to `CacheDir`; missing files are silently ignored. The
 shared `config.json` is intentionally preserved so the next `login`
-can reuse the cached issuer + client_id.
+can reuse the cached issuer + client_id. Logout waits (up to 30s) for
+an in-flight token refresh via the same cache lock, so a concurrent
+refresh can't re-create `tokens.json` afterwards.
 
 ```go
 // Wipe shared tokens plus this helper's whole subdir:

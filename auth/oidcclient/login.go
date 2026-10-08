@@ -3,6 +3,7 @@ package oidcclient
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 )
 
@@ -45,6 +46,13 @@ func Login(ctx context.Context, cfg Config, opt LoginOptions) (*Tokens, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Serialise the final cache writes with refresh and logout, but not the
+	// interactive flow above.
+	unlock, err := lockTokens(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("lock token cache: %w", err)
+	}
+	defer unlock()
 	if err := saveTokens(tokens, &cfg); err != nil {
 		return nil, err
 	}

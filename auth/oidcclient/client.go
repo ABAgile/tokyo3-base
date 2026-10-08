@@ -266,7 +266,7 @@ func EnsureFreshTokens(ctx context.Context, cfg Config, accessSkew time.Duration
 	// helper, so concurrent refreshes would burn it (and may trip the IdP's
 	// reuse detection). Serialise them, then re-read: another process may
 	// have refreshed while this one waited for the lock.
-	unlock, err := lockTokens()
+	unlock, err := lockTokens(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("lock token cache: %w", err)
 	}
@@ -480,6 +480,14 @@ func Logout(extras ...string) error {
 	if err != nil {
 		return err
 	}
+	// Wait out an in-flight refresh: it would otherwise re-save tokens.json
+	// right after the removal below and undo the logout.
+	ctx, cancel := context.WithTimeout(context.Background(), logoutLockTimeout)
+	defer cancel()
+	unlock, lockErr := lockTokens(ctx)
+	if lockErr == nil {
+		defer unlock()
+	}
 	_ = os.Remove(filepath.Join(dir, "tokens.json"))
 	for _, p := range extras {
 		if !filepath.IsAbs(p) {
@@ -487,8 +495,14 @@ func Logout(extras ...string) error {
 		}
 		_ = os.RemoveAll(p)
 	}
+	if lockErr != nil {
+		return fmt.Errorf("cache removed without the refresh lock; a concurrent refresh may have restored tokens: %w", lockErr)
+	}
 	return nil
 }
+
+// logoutLockTimeout bounds how long Logout waits for an in-flight refresh.
+const logoutLockTimeout = 30 * time.Second
 
 // SafeFilename collapses path-meaningful characters to '_' so an
 // operator-supplied string (role slug, principal name, …) can safely

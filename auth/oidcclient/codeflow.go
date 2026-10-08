@@ -45,15 +45,17 @@ func RunCodeFlow(ctx context.Context, issuer, clientID string, port int, stderr 
 	// on a listener that's already accepting requests.
 	lc := StartLoopbackCallback(listener, "/callback", func(w http.ResponseWriter, r *http.Request) (string, error) {
 		q := r.URL.Query()
+		// State first: an unauthenticated request (stray local process,
+		// forged link) must not be able to end the login with ?error=.
+		if q.Get("state") != state {
+			// Not our redirect: keep waiting for the real one rather than
+			// aborting the login.
+			http.Error(w, "state mismatch", http.StatusBadRequest)
+			return "", ErrCallbackIgnored
+		}
 		if e := q.Get("error"); e != "" {
 			http.Error(w, "Auth error: "+e, http.StatusBadRequest)
 			return "", fmt.Errorf("auth server returned error: %s (%s)", e, q.Get("error_description"))
-		}
-		if q.Get("state") != state {
-			// Not our redirect (stray local request or forged link): keep
-			// waiting for the real one rather than aborting the login.
-			http.Error(w, "state mismatch", http.StatusBadRequest)
-			return "", ErrCallbackIgnored
 		}
 		code := q.Get("code")
 		if code == "" {

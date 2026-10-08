@@ -3,6 +3,7 @@ package oidcclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -14,6 +15,18 @@ import (
 // a slow or hanging discovery endpoint should fail fast into the
 // convention fallback, not stall the whole login/refresh attempt.
 const discoveryTimeout = 10 * time.Second
+
+// discoveryClient follows redirects only to endpoints that are themselves
+// acceptable for OAuth traffic, so an https issuer cannot bounce discovery to
+// cleartext http where a network attacker could rewrite the document.
+var discoveryClient = &http.Client{
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		return requireSecureEndpoint(req.URL.String())
+	},
+}
 
 // endpoints is the subset of the OIDC discovery document (OpenID
 // Connect Discovery 1.0 / RFC 8414) this package needs to build
@@ -49,6 +62,11 @@ func conventionEndpoints(issuer string) endpoints {
 // pre-discovery behavior rather than blocking login.
 func discoverEndpoints(ctx context.Context, issuer string) endpoints {
 	fallback := conventionEndpoints(issuer)
+	// A cleartext remote issuer's discovery document is attacker-writable;
+	// skip it (the convention endpoints are refused by postForm anyway).
+	if requireSecureEndpoint(issuer) != nil {
+		return fallback
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, discoveryTimeout)
 	defer cancel()
@@ -58,7 +76,7 @@ func discoverEndpoints(ctx context.Context, issuer string) endpoints {
 		return fallback
 	}
 	req.Header.Set("Accept", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := discoveryClient.Do(req)
 	if err != nil {
 		return fallback
 	}
@@ -71,11 +89,18 @@ func discoverEndpoints(ctx context.Context, issuer string) endpoints {
 		return fallback
 	}
 	var doc struct {
+		Issuer                      string `json:"issuer"`
 		AuthorizationEndpoint       string `json:"authorization_endpoint"`
 		TokenEndpoint               string `json:"token_endpoint"`
 		DeviceAuthorizationEndpoint string `json:"device_authorization_endpoint"`
 	}
 	if err := json.Unmarshal(body, &doc); err != nil {
+		return fallback
+	}
+
+	// OIDC Discovery §4.3: the document must name the issuer it was fetched
+	// for, otherwise it may have been substituted.
+	if strings.TrimRight(doc.Issuer, "/") != strings.TrimRight(issuer, "/") {
 		return fallback
 	}
 

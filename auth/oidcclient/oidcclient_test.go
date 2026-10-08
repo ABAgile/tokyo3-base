@@ -320,7 +320,7 @@ func TestRefresh_UsesDiscoveredTokenEndpoint(t *testing.T) {
 		switch r.URL.Path {
 		case "/.well-known/openid-configuration":
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"token_endpoint":"` + srv.URL + `/custom-token"}`))
+			_, _ = w.Write([]byte(`{"issuer":"` + srv.URL + `","token_endpoint":"` + srv.URL + `/custom-token"}`))
 		case "/custom-token":
 			_, _ = w.Write([]byte(`{"access_token":"at-discovered","refresh_token":"rt-discovered","id_token":"it-discovered","expires_in":3600}`))
 		default:

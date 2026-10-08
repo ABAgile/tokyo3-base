@@ -31,6 +31,7 @@ type codeFlowFixture struct {
 	overrideState string // if non-empty, used as the ?state= value (mismatch test)
 	skipCallback  bool   // if true, OpenBrowser doesn't fire the callback at all
 	strayFirst    bool   // if true, a bad-state request hits the callback before the real one
+	strayError    bool   // if true, a stateless ?error= request hits the callback before the real one
 }
 
 // reset locks the OpenBrowser var for the duration of a single test.
@@ -102,6 +103,11 @@ func (f *codeFlowFixture) install() {
 					resp.Body.Close()
 				}
 			}
+			if f.strayError {
+				if resp, err := http.Get(redirect + "?error=access_denied"); err == nil {
+					resp.Body.Close()
+				}
+			}
 			cb := redirect + "?code=" + url.QueryEscape(code) + "&state=" + url.QueryEscape(state)
 			resp, err := http.Get(cb)
 			if err == nil {
@@ -136,6 +142,24 @@ func TestRunCodeFlow_HappyPath(t *testing.T) {
 	}
 	if d := time.Until(tok.Expiration); d < 59*time.Minute || d > 61*time.Minute {
 		t.Errorf("Expiration ~ %v, want ~1h", d)
+	}
+}
+
+// TestRunCodeFlow_ForgedErrorIgnored: an ?error= callback that doesn't carry
+// the flow's state must be ignored just like a state mismatch.
+func TestRunCodeFlow_ForgedErrorIgnored(t *testing.T) {
+	f := newCodeFlowFixture(t)
+	f.strayError = true
+	f.install()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	tok, err := RunCodeFlow(ctx, f.srv.URL, "cli-client", 0, io.Discard)
+	if err != nil {
+		t.Fatalf("RunCodeFlow after forged error: %v", err)
+	}
+	if tok.AccessToken != "at-code" {
+		t.Errorf("tokens = %+v", tok)
 	}
 }
 
@@ -262,7 +286,7 @@ func TestRunCodeFlow_UsesDiscoveredTokenEndpoint(t *testing.T) {
 		switch r.URL.Path {
 		case "/.well-known/openid-configuration":
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"authorization_endpoint":"` + srv.URL + `/custom-authorize","token_endpoint":"` + srv.URL + `/custom-token"}`))
+			_, _ = w.Write([]byte(`{"issuer":"` + srv.URL + `","authorization_endpoint":"` + srv.URL + `/custom-authorize","token_endpoint":"` + srv.URL + `/custom-token"}`))
 		case "/custom-token":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"access_token":"at-discovered","refresh_token":"rt-discovered","id_token":"it-discovered","expires_in":3600}`))

@@ -56,7 +56,7 @@ func TestPostForm_DoesNotFollowRedirects(t *testing.T) {
 
 func TestDiscoverEndpoints_IgnoresCleartextRemoteEndpoints(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"token_endpoint":"http://evil.example/token","authorization_endpoint":"https://idp.example/auth"}`))
+		_, _ = w.Write([]byte(`{"issuer":"http://` + r.Host + `","token_endpoint":"http://evil.example/token","authorization_endpoint":"https://idp.example/auth"}`))
 	}))
 	defer srv.Close()
 	ep := discoverEndpoints(context.Background(), srv.URL)
@@ -156,5 +156,91 @@ func TestLoopbackCallback_IgnoredRequestKeepsWaiting(t *testing.T) {
 	got, err := lc.Wait(context.Background(), time.Second)
 	if err != nil || got != "good" {
 		t.Fatalf("Wait = %q, %v; want good", got, err)
+	}
+}
+
+func TestDiscoverEndpoints_IgnoresMismatchedIssuer(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"issuer":"https://other.example","token_endpoint":"https://evil.example/token"}`))
+	}))
+	defer srv.Close()
+	ep := discoverEndpoints(context.Background(), srv.URL)
+	if want := srv.URL + "/token"; ep.TokenEndpoint != want {
+		t.Errorf("TokenEndpoint = %q, want convention fallback %q", ep.TokenEndpoint, want)
+	}
+}
+
+func TestDiscoverEndpoints_SkipsCleartextRemoteIssuer(t *testing.T) {
+	// A non-loopback http issuer must not be fetched at all.
+	ep := discoverEndpoints(context.Background(), "http://idp.invalid")
+	if want := conventionEndpoints("http://idp.invalid"); ep != want {
+		t.Errorf("ep = %+v, want convention fallback %+v", ep, want)
+	}
+}
+
+func TestDiscoverEndpoints_RefusesRedirectToCleartext(t *testing.T) {
+	// The issuer is loopback http (allowed), but redirects to a remote http host.
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://evil.invalid/.well-known/openid-configuration", http.StatusFound)
+	}))
+	defer redirector.Close()
+	ep := discoverEndpoints(context.Background(), redirector.URL)
+	if want := redirector.URL + "/token"; ep.TokenEndpoint != want {
+		t.Errorf("TokenEndpoint = %q, want convention fallback %q", ep.TokenEndpoint, want)
+	}
+}
+
+func TestLockTokens_HonorsContext(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("flock unavailable")
+	}
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	unlock, err := lockTokens(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := lockTokens(ctx); err == nil {
+		t.Fatal("second lock succeeded while first held")
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("lock wait ignored ctx: %v", d)
+	}
+}
+
+func TestLogout_WaitsForInFlightRefresh(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("flock unavailable")
+	}
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	cfg := Config{Issuer: "https://idp.example", ClientID: "c"}
+	if err := saveTokens(&Tokens{AccessToken: "at", RefreshToken: "rt"}, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := lockTokens(context.Background()) // simulates a refresh in flight
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- Logout() }()
+	select {
+	case <-done:
+		t.Fatal("Logout returned while the refresh lock was held")
+	case <-time.After(150 * time.Millisecond):
+	}
+	// The refresh finishes (re-saving tokens) and releases the lock; the
+	// pending Logout must then remove them.
+	if err := saveTokens(&Tokens{AccessToken: "at2", RefreshToken: "rt2"}, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	unlock()
+	if err := <-done; err != nil {
+		t.Fatalf("Logout: %v", err)
+	}
+	if _, err := LoadTokens(); err == nil {
+		t.Error("tokens survived Logout")
 	}
 }

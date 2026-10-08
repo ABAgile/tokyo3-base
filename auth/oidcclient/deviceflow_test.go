@@ -337,7 +337,7 @@ func TestRunDeviceFlow_UsesDiscoveredEndpoints(t *testing.T) {
 		switch r.URL.Path {
 		case "/.well-known/openid-configuration":
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"device_authorization_endpoint":"` + srv.URL + `/custom-device-authz","token_endpoint":"` + srv.URL + `/custom-token"}`))
+			_, _ = w.Write([]byte(`{"issuer":"` + srv.URL + `","device_authorization_endpoint":"` + srv.URL + `/custom-device-authz","token_endpoint":"` + srv.URL + `/custom-token"}`))
 		case "/custom-device-authz":
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{

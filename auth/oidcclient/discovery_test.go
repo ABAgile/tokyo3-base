@@ -15,6 +15,7 @@ func TestDiscoverEndpoints_UsesDocumentWhenPresent(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
+			"issuer": "` + "http://" + r.Host + `",
 			"authorization_endpoint": "https://discovered.example/oauth2/v1/authorize",
 			"token_endpoint": "https://discovered.example/oauth2/v1/token",
 			"device_authorization_endpoint": "https://discovered.example/oauth2/v1/device"
@@ -70,7 +71,7 @@ func TestDiscoverEndpoints_PartialDocumentFillsRemainingFromConvention(t *testin
 		w.Header().Set("Content-Type", "application/json")
 		// Only authorization_endpoint is present; token_endpoint and
 		// device_authorization_endpoint should fall back individually.
-		_, _ = w.Write([]byte(`{"authorization_endpoint": "https://discovered.example/authorize"}`))
+		_, _ = w.Write([]byte(`{"issuer": "http://` + r.Host + `", "authorization_endpoint": "https://discovered.example/authorize"}`))
 	}))
 	defer srv.Close()
 
