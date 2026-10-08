@@ -28,7 +28,10 @@ func TestVerifyLogoutToken_ClaimValidation(t *testing.T) {
 		{"null iat", func(c map[string]any) { c["iat"] = nil }, "unmarshal claims"},
 		{"future iat", func(c map[string]any) { c["iat"] = now + 60 }, "iat"},
 		{"stale iat", func(c map[string]any) { c["iat"] = now - 360 }, "iat"},
-		{"expired", func(c map[string]any) { c["exp"] = now - 1 }, "exp"},
+		{"expired", func(c map[string]any) { c["exp"] = now - 120 }, "exp"},
+		{"slightly future iat within skew", func(c map[string]any) { c["iat"] = now + 10 }, ""},
+		{"just expired within skew", func(c map[string]any) { c["exp"] = now - 5 }, ""},
+		{"slightly future nbf within skew", func(c map[string]any) { c["nbf"] = now + 10 }, ""},
 		{"null expiry", func(c map[string]any) { c["exp"] = nil }, "unmarshal claims"},
 		{"future nbf", func(c map[string]any) { c["nbf"] = now + 60 }, "nbf"},
 		{"null nbf", func(c map[string]any) { c["nbf"] = nil }, "nbf"},
@@ -61,7 +64,7 @@ func TestVerifyLogoutToken_ClaimValidation(t *testing.T) {
 			if _, present := body["exp"]; !present && !claims.ExpiresAt.IsZero() {
 				t.Fatalf("absent exp returned ExpiresAt = %v", claims.ExpiresAt)
 			}
-			if claims.IssuedAt.Unix() != now {
+			if wantIAT, _ := body["iat"].(int64); claims.IssuedAt.Unix() != wantIAT {
 				t.Fatalf("IssuedAt = %v", claims.IssuedAt)
 			}
 		})

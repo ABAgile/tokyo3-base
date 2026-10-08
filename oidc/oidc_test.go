@@ -150,6 +150,32 @@ func TestHTTPVerifier_Verify_HappyPath(t *testing.T) {
 	}
 }
 
+func TestHTTPVerifier_Verify_EmailVerified(t *testing.T) {
+	fi := newFakeIssuer(t)
+	ver, _ := oidc.NewHTTPVerifier(context.Background(), fi.issuer, testAud)
+	now := time.Now().Unix()
+	for name, tc := range map[string]struct {
+		set  bool
+		val  any
+		want bool
+	}{
+		"absent": {want: false}, "true": {true, true, true}, "false": {true, false, false},
+		"string true": {true, "true", true}, "string false": {true, "false", false}, "junk": {true, 7, false},
+	} {
+		c := map[string]any{"iss": fi.issuer, "aud": testAud, "sub": "u", "iat": now, "exp": now + 300}
+		if tc.set {
+			c["email_verified"] = tc.val
+		}
+		claims, err := ver.Verify(context.Background(), fi.signToken(t, c))
+		if err != nil {
+			t.Fatalf("%s: Verify: %v", name, err)
+		}
+		if claims.EmailVerified != tc.want {
+			t.Errorf("%s: EmailVerified = %v, want %v", name, claims.EmailVerified, tc.want)
+		}
+	}
+}
+
 func TestHTTPVerifier_Verify_RejectsExpiredToken(t *testing.T) {
 	fi := newFakeIssuer(t)
 	ver, _ := oidc.NewHTTPVerifier(context.Background(), fi.issuer, testAud)

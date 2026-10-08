@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fakeLogoutVerifier is a controllable LogoutTokenVerifier stub.
@@ -214,5 +215,38 @@ func TestBackchannelLogoutHandler_AlwaysSetsCacheControlNoStore(t *testing.T) {
 	rec := postLogout(h, "signed-jwt")
 	if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
 		t.Errorf("Cache-Control = %q, want no-store", cc)
+	}
+}
+
+func TestBackchannelLogoutHandler_RejectsNonPost(t *testing.T) {
+	h, _ := NewBackchannelLogoutHandler(BackchannelLogoutConfig{Verifier: &fakeLogoutVerifier{}, Revoker: &fakeRevoker{}})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/backchannel-logout?logout_token=x", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET status = %d, want 405", rec.Code)
+	}
+}
+
+func TestBackchannelLogoutHandler_RejectsOversizedBody(t *testing.T) {
+	h, _ := NewBackchannelLogoutHandler(BackchannelLogoutConfig{Verifier: &fakeLogoutVerifier{}, Revoker: &fakeRevoker{}})
+	body := "logout_token=" + strings.Repeat("a", maxLogoutBodyBytes+1)
+	req := httptest.NewRequest(http.MethodPost, "/backchannel-logout", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("oversized body status = %d, want 400", rec.Code)
+	}
+}
+
+func TestNewBackchannelLogoutHandler_ReplayWindowFloor(t *testing.T) {
+	h, err := NewBackchannelLogoutHandler(BackchannelLogoutConfig{
+		Verifier: &fakeLogoutVerifier{}, Revoker: &fakeRevoker{}, ReplayWindow: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := logoutTokenMaxAge + logoutTokenSkew; h.jti.window != want {
+		t.Fatalf("window = %v, want floor %v", h.jti.window, want)
 	}
 }

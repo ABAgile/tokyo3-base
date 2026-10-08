@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,8 +32,13 @@ type Claims struct {
 	// Subject is the OIDC `sub` claim — the stable user identifier from the
 	// IdP (typically a UUID).
 	Subject string
-	// Email is the verified email of the user, when the IdP surfaces it.
+	// Email is the `email` claim as the IdP asserts it. It is NOT checked for
+	// verification here — consumers that authorize on it must also require
+	// EmailVerified.
 	Email string
+	// EmailVerified is the `email_verified` claim (bool, or the strings
+	// "true"/"false" some IdPs emit); false when absent or unparseable.
+	EmailVerified bool
 	// Name is the user's display name, when present.
 	Name string
 	// Groups is the authoritative group-membership list. The IdP derives this
@@ -114,12 +120,13 @@ func (v *HTTPVerifier) Verify(ctx context.Context, rawIDToken string) (*Claims, 
 		return nil, err
 	}
 	var raw struct {
-		Email    string   `json:"email"`
-		Name     string   `json:"name"`
-		Groups   []string `json:"groups"`
-		Nonce    string   `json:"nonce"`
-		AuthTime int64    `json:"auth_time"`
-		SID      string   `json:"sid"`
+		Email         string          `json:"email"`
+		EmailVerified json.RawMessage `json:"email_verified"`
+		Name          string          `json:"name"`
+		Groups        []string        `json:"groups"`
+		Nonce         string          `json:"nonce"`
+		AuthTime      int64           `json:"auth_time"`
+		SID           string          `json:"sid"`
 	}
 	if err := tok.Claims(&raw); err != nil {
 		return nil, fmt.Errorf("decode token claims: %w", err)
@@ -129,15 +136,30 @@ func (v *HTTPVerifier) Verify(ctx context.Context, rawIDToken string) (*Claims, 
 		authTime = time.Unix(raw.AuthTime, 0).UTC()
 	}
 	return &Claims{
-		Subject:   tok.Subject,
-		Email:     raw.Email,
-		Name:      raw.Name,
-		Groups:    raw.Groups,
-		Nonce:     raw.Nonce,
-		Issuer:    tok.Issuer,
-		AuthTime:  authTime,
-		SessionID: raw.SID,
+		Subject:       tok.Subject,
+		Email:         raw.Email,
+		EmailVerified: parseLooseBool(raw.EmailVerified),
+		Name:          raw.Name,
+		Groups:        raw.Groups,
+		Nonce:         raw.Nonce,
+		Issuer:        tok.Issuer,
+		AuthTime:      authTime,
+		SessionID:     raw.SID,
 	}, nil
+}
+
+// parseLooseBool reads a JSON boolean, or the string "true"/"false", as a bool.
+// Anything else (absent, null, other types) is false.
+func parseLooseBool(raw json.RawMessage) bool {
+	var b bool
+	if json.Unmarshal(raw, &b) == nil {
+		return b
+	}
+	var str string
+	if json.Unmarshal(raw, &str) == nil {
+		return strings.EqualFold(str, "true")
+	}
+	return false
 }
 
 // LogoutClaims represents the subset of claims validated from an OIDC
@@ -151,12 +173,18 @@ type LogoutClaims struct {
 	ExpiresAt time.Time
 }
 
-const logoutTokenMaxAge = 5 * time.Minute
+const (
+	logoutTokenMaxAge = 5 * time.Minute
+	// logoutTokenSkew tolerates clock drift between the OP and this RP on
+	// iat/nbf/exp. Rejecting a genuine logout_token on skew would silently
+	// leave the session un-revoked.
+	logoutTokenSkew = 30 * time.Second
+)
 
 // VerifyLogoutToken validates an OIDC Back-Channel Logout 1.0 logout_token
 // per §2.6 using the same provider/JWKS as ID tokens. iat is required and
-// must be no more than five minutes old or in the future. exp and nbf are
-// validated when present; ExpiresAt is zero when exp is absent.
+// must be no more than five minutes old or (beyond a 30s skew allowance) in the
+// future. exp and nbf are validated with the same allowance when present; ExpiresAt is zero when exp is absent.
 func (v *HTTPVerifier) VerifyLogoutToken(ctx context.Context, raw string) (*LogoutClaims, error) {
 	tok, err := v.logoutVerifier.Verify(ctx, raw)
 	if err != nil {
@@ -182,19 +210,19 @@ func (v *HTTPVerifier) VerifyLogoutToken(ctx context.Context, raw string) (*Logo
 	}
 	now := time.Now()
 	issuedAt := time.Unix(*body.IAT, 0).UTC()
-	if issuedAt.After(now) || now.Sub(issuedAt) > logoutTokenMaxAge {
+	if issuedAt.After(now.Add(logoutTokenSkew)) || now.Sub(issuedAt) > logoutTokenMaxAge {
 		return nil, errors.New("logout_token iat is in the future or too old")
 	}
 	var expiresAt time.Time
 	if len(body.Exp) != 0 {
 		expiresAt, err = logoutNumericDate(body.Exp)
-		if err != nil || !expiresAt.After(now) {
+		if err != nil || !expiresAt.After(now.Add(-logoutTokenSkew)) {
 			return nil, errors.New("logout_token exp is invalid or expired")
 		}
 	}
 	if len(body.NBF) != 0 {
 		notBefore, err := logoutNumericDate(body.NBF)
-		if err != nil || notBefore.After(now) {
+		if err != nil || notBefore.After(now.Add(logoutTokenSkew)) {
 			return nil, errors.New("logout_token nbf is invalid or in the future")
 		}
 	}

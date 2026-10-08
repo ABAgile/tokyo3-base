@@ -1947,7 +1947,7 @@ type LogoutRevoker interface {
 type BackchannelLogoutConfig struct {
     Verifier     LogoutTokenVerifier // required; *HTTPVerifier / *LazyVerifier satisfy this verbatim
     Revoker      LogoutRevoker       // required; maps a notification onto your session/token model
-    ReplayWindow time.Duration       // jti replay-rejection window; "" ⇒ 5m
+    ReplayWindow time.Duration       // jti replay window; floored at 5.5m (max token age + 30s skew)
     // OnRevoked, if set, runs after a successful revocation (including the
     // "unknown user" idempotent case) so the caller can audit-log with its
     // own metadata shape. A returned error fails the request with 500.

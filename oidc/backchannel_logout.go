@@ -47,9 +47,9 @@ type BackchannelLogoutConfig struct {
 	// session/token model. Required.
 	Revoker LogoutRevoker
 	// ReplayWindow bounds how long a jti is remembered for replay
-	// rejection. <= 0 defaults to 5 minutes — comfortably covers a
-	// logout_token's typical short exp plus worst-case clock skew,
-	// while bounding memory (single-process only; see the internal
+	// rejection. Values below 5.5 minutes (the longest a logout_token is
+	// accepted, including clock skew), including <= 0, are raised to that
+	// floor so a replay can't outlive the window, while bounding memory (single-process only; see the internal
 	// jti cache this handler keeps).
 	ReplayWindow time.Duration
 	// OnRevoked, if set, runs after a successful revocation
@@ -66,6 +66,9 @@ type BackchannelLogoutConfig struct {
 	// revocation/OnRevoked failures. nil ⇒ slog.Default().
 	Log *slog.Logger
 }
+
+// maxLogoutBodyBytes caps the logout_token form body (a JWT is a few KB).
+const maxLogoutBodyBytes = 64 << 10
 
 // BackchannelLogoutHandler consumes OIDC Back-Channel Logout 1.0
 // notifications and revokes the corresponding sessions/tokens via the
@@ -86,8 +89,10 @@ func NewBackchannelLogoutHandler(cfg BackchannelLogoutConfig) (*BackchannelLogou
 	if cfg.Revoker == nil {
 		return nil, errors.New("oidc: backchannel logout revoker is required")
 	}
-	if cfg.ReplayWindow <= 0 {
-		cfg.ReplayWindow = 5 * time.Minute
+	// A jti must be remembered at least as long as a logout_token stays
+	// acceptable (max age plus skew), or a replay could slip through.
+	if minWindow := logoutTokenMaxAge + logoutTokenSkew; cfg.ReplayWindow < minWindow {
+		cfg.ReplayWindow = minWindow
 	}
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
@@ -111,6 +116,12 @@ func NewBackchannelLogoutHandler(cfg BackchannelLogoutConfig) (*BackchannelLogou
 func (h *BackchannelLogoutHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxLogoutBodyBytes)
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "invalid form body", http.StatusBadRequest)
 		return
