@@ -324,6 +324,11 @@ func (m *Manager) UpdateSession(w http.ResponseWriter, r *http.Request, mutate f
 // over [csrf.Token]/[csrf.Validate] (see base/csrf for the token scheme:
 // HMAC over [Session.CSRFSecret], per-render masking, constant-time
 // verification). Errors when the request carries no valid session.
+//
+// Like [Manager.ValidateCSRF] and [Manager.UpdateSession], it reads the
+// session cookie directly and does not consult [Config.IsRevoked] or
+// RequiredGroup: use these only on routes behind [Manager.Gate], which
+// enforces both.
 func (m *Manager) CSRFToken(r *http.Request, scope string) (string, error) {
 	sess, ok := m.readSession(r)
 	if !ok || sess.CSRFSecret == "" {
