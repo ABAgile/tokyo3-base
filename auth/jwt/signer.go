@@ -68,7 +68,7 @@ type Config struct {
 type IDClaims struct {
 	gojwt.RegisteredClaims
 	Nonce             string   `json:"nonce,omitempty"`
-	AuthTime          int64    `json:"auth_time"`
+	AuthTime          int64    `json:"auth_time,omitempty"`
 	ACR               string   `json:"acr,omitempty"`
 	AMR               []string `json:"amr,omitempty"`
 	SID               string   `json:"sid,omitempty"`
@@ -128,6 +128,15 @@ func New(privateKey *rsa.PrivateKey, kid, issuer string, cfg Config) *Signer {
 	return &Signer{privateKey: privateKey, kid: kid, issuer: issuer, cfg: cfg}
 }
 
+// unixOrZero is t's Unix time, or 0 (omitted from the token) for the zero
+// time, whose Unix value is a large negative number.
+func unixOrZero(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.Unix()
+}
+
 // KID returns the active key identifier.
 func (s *Signer) KID() string { return s.kid }
 
@@ -168,7 +177,7 @@ func (s *Signer) MintFederationToken(userID, audience, email, name string, group
 		PreferredUsername: email,
 		Groups:            groups,
 		AMR:               amr,
-		AuthTime:          authTime.Unix(),
+		AuthTime:          unixOrZero(authTime),
 	}
 	if len(principalTags) > 0 {
 		// Deterministic key order keeps the JWT byte-stable for any
@@ -213,7 +222,7 @@ func (s *Signer) MintIDToken(userID, clientID, email, name, nonce string, scopes
 		IssuedAt:          gojwt.NewNumericDate(now),
 		ID:                uuid.NewV4().String(),
 		Nonce:             nonce,
-		AuthTime:          authTime.Unix(),
+		AuthTime:          unixOrZero(authTime),
 		ACR:               acr,
 		AMR:               amr,
 		SID:               sid,

@@ -454,3 +454,21 @@ func TestPublicKeyToJWK(t *testing.T) {
 		t.Errorf("decoded E = %d, want %d", new(big.Int).SetBytes(e).Int64(), priv.PublicKey.E)
 	}
 }
+
+func TestMint_ZeroAuthTimeOmitted(t *testing.T) {
+	s := newTestSigner(t)
+	tok, err := s.MintIDToken("u", "c", "e@x", "", "", nil, false, nil, time.Time{}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, claims := parseUnverified(t, tok); claims["auth_time"] != nil {
+		t.Errorf("auth_time = %v, want omitted for the zero time", claims["auth_time"])
+	}
+	tok, err = s.MintFederationToken("u", "aud", "e@x", "", nil, nil, time.Time{}, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, claims := parseUnverified(t, tok); claims["auth_time"] != nil {
+		t.Errorf("federation auth_time = %v, want omitted for the zero time", claims["auth_time"])
+	}
+}
