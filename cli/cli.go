@@ -212,8 +212,11 @@ func (a App) Setup(parent context.Context) Runtime {
 // shares the logger's connection identity and the WORKLOAD_* fallback.
 // subject is the app's audit subject (e.g. "ca.audit.events"). With no
 // NATS URL configured it returns a no-op sink (dev/no-broker path).
-func AuditSink[T any](rt Runtime, subject string) (*journal.EncodedSink[T], error) {
-	return jetstream.NewAuditSink[T](jetstream.AuditSinkConfig{
+//
+// Pass [AuditRequired] to make a missing NATS URL an error rather than a
+// silent no-op sink.
+func AuditSink[T any](rt Runtime, subject string, opts ...AuditOption) (*journal.EncodedSink[T], error) {
+	cfg := jetstream.AuditSinkConfig{
 		URL:       rt.NATS.URL,
 		CertFile:  rt.NATS.CertFile,
 		KeyFile:   rt.NATS.KeyFile,
@@ -221,7 +224,20 @@ func AuditSink[T any](rt Runtime, subject string) (*journal.EncodedSink[T], erro
 		Subject:   subject,
 		EnvPrefix: rt.EnvPrefix + "_NATS",
 		Log:       rt.Log,
-	})
+	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	return jetstream.NewAuditSink[T](cfg)
+}
+
+// AuditOption tunes [AuditSink].
+type AuditOption func(*jetstream.AuditSinkConfig)
+
+// AuditRequired makes [AuditSink] fail when no NATS URL is configured, so a
+// production daemon can't boot with audit publishing silently disabled.
+func AuditRequired() AuditOption {
+	return func(c *jetstream.AuditSinkConfig) { c.Required = true }
 }
 
 // AuditSource builds a reader for the daemon's own audit stream from the

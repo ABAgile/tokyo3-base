@@ -163,3 +163,13 @@ func TestAuditHelpersNoopWithoutURL(t *testing.T) {
 		t.Fatal("AuditSource returned nil source")
 	}
 }
+
+func TestAuditSink_RequiredRejectsMissingURL(t *testing.T) {
+	rt := Runtime{EnvPrefix: "TESTD_AUDIT"}
+	if _, err := AuditSink[struct{}](rt, "subj"); err != nil {
+		t.Fatalf("default AuditSink without URL should be a no-op sink, got %v", err)
+	}
+	if _, err := AuditSink[struct{}](rt, "subj", AuditRequired()); err == nil {
+		t.Fatal("AuditRequired with no NATS URL should error")
+	}
+}
