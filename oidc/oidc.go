@@ -127,9 +127,15 @@ func (v *HTTPVerifier) Verify(ctx context.Context, rawIDToken string) (*Claims, 
 		Nonce         string          `json:"nonce"`
 		AuthTime      int64           `json:"auth_time"`
 		SID           string          `json:"sid"`
+		Events        map[string]any  `json:"events"`
 	}
 	if err := tok.Claims(&raw); err != nil {
 		return nil, fmt.Errorf("decode token claims: %w", err)
+	}
+	// A logout_token is signed by the same keys for the same audience and may
+	// carry exp; it must never be accepted as proof of identity.
+	if _, isLogout := raw.Events[backchannelLogoutEvent]; isLogout {
+		return nil, errors.New("logout_token presented as ID token")
 	}
 	var authTime time.Time
 	if raw.AuthTime > 0 {
@@ -172,6 +178,10 @@ type LogoutClaims struct {
 	IssuedAt  time.Time
 	ExpiresAt time.Time
 }
+
+// backchannelLogoutEvent is the `events` member that marks a token as an OIDC
+// Back-Channel Logout logout_token.
+const backchannelLogoutEvent = "http://schemas.openid.net/event/backchannel-logout"
 
 const (
 	logoutTokenMaxAge = 5 * time.Minute
@@ -226,7 +236,7 @@ func (v *HTTPVerifier) VerifyLogoutToken(ctx context.Context, raw string) (*Logo
 			return nil, errors.New("logout_token nbf is invalid or in the future")
 		}
 	}
-	event, ok := body.Events["http://schemas.openid.net/event/backchannel-logout"]
+	event, ok := body.Events[backchannelLogoutEvent]
 	if !ok {
 		return nil, fmt.Errorf("logout_token missing backchannel-logout event")
 	}

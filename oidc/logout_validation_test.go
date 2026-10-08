@@ -92,3 +92,22 @@ func TestVerifyLogoutToken_RejectsTamperedSignatureWithoutExpiry(t *testing.T) {
 		t.Fatal("ID-token verifier accepted a token without exp")
 	}
 }
+
+// A logout_token shares keys, issuer and audience with ID tokens and may carry
+// exp, so Verify must refuse it rather than treat it as proof of identity.
+func TestHTTPVerifier_Verify_RejectsLogoutToken(t *testing.T) {
+	fi := newFakeIssuer(t)
+	ver, err := oidc.NewHTTPVerifier(context.Background(), fi.issuer, testAud)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Unix()
+	raw := fi.signToken(t, map[string]any{
+		"iss": fi.issuer, "aud": testAud, "sub": "u1", "sid": "s", "jti": "j",
+		"iat": now, "exp": now + 300,
+		"events": map[string]any{"http://schemas.openid.net/event/backchannel-logout": map[string]any{}},
+	})
+	if claims, err := ver.Verify(context.Background(), raw); err == nil || !strings.Contains(err.Error(), "logout_token") {
+		t.Fatalf("Verify = %+v, %v, want logout_token rejection", claims, err)
+	}
+}
