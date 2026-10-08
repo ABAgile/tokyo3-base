@@ -872,7 +872,9 @@ ip := ext.FromRequest(r)     // use as the audit "source" / rate-limit key
 
 Use this instead of hand-rolling a `clientIP` helper per daemon. `ratelimit`
 keys on it internally; an audit layer should derive its `source` from it too,
-so a single source IP is computed identically everywhere. It is HTTP-only — an
+so a single source IP is computed identically everywhere. Results are
+canonicalized (IPv4-mapped IPv6 → IPv4), and `ratelimit` buckets IPv6 sources
+by /64 and caps its bucket map (overflow sources share one bucket). It is HTTP-only — an
 SSH/raw-TCP peer is just a `net.Addr` with no forwarding header and needs no
 such reasoning.
 

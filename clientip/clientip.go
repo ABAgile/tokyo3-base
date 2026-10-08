@@ -19,6 +19,7 @@ package clientip
 import (
 	"net"
 	"net/http"
+	"net/netip"
 	"slices"
 	"strings"
 )
@@ -40,11 +41,13 @@ func New(trustedProxies []*net.IPNet) *Extractor {
 
 // FromRequest returns the real client IP for r as a bare host without a port:
 // the immediate TCP peer, or — when that peer is a trusted proxy — the
-// rightmost X-Forwarded-For hop that is not itself trusted. When r.RemoteAddr
-// carries no port it is returned verbatim. All X-Forwarded-For header lines
-// are treated as one list; a malformed hop falls back to the immediate peer.
+// rightmost X-Forwarded-For hop that is not itself trusted. The result is
+// canonicalized (IPv4-mapped IPv6 becomes plain IPv4) so one client maps to
+// one string; a peer that is not an IP is returned verbatim. All
+// X-Forwarded-For header lines are treated as one list; a malformed hop falls
+// back to the immediate peer.
 func (e *Extractor) FromRequest(r *http.Request) string {
-	peer := hostOnly(r.RemoteAddr)
+	peer := canonical(hostOnly(r.RemoteAddr))
 	if len(e.trusted) == 0 || !e.isTrusted(peer) {
 		return peer
 	}
@@ -59,7 +62,7 @@ func (e *Extractor) FromRequest(r *http.Request) string {
 			return peer
 		}
 		if !e.isTrusted(ip) {
-			return ip
+			return canonical(ip)
 		}
 	}
 	return peer
@@ -83,4 +86,42 @@ func hostOnly(remoteAddr string) string {
 		return host
 	}
 	return remoteAddr
+}
+
+// canonical returns the canonical text form of an IP literal, with an
+// IPv4-mapped IPv6 address unmapped to IPv4, or host unchanged if it is not
+// an IP.
+func canonical(host string) string {
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return host
+	}
+	return addr.Unmap().String()
+}
+
+// Network maps a client IP (as returned by [Extractor.FromRequest]) to the
+// string that identifies its source network, for anything that counts or
+// limits per source: IPv6 addresses collapse to their /64 prefix, IPv4 and
+// anything that is not an IP are returned unchanged.
+//
+// A single IPv6 subscriber is normally delegated a whole /64 (or larger), so
+// keying on the exact address lets one client rotate through 2^64 addresses
+// and never hit a per-source limit. Keep audit/attribution on the exact
+// [Extractor.FromRequest] value; use Network only where grouping is the goal.
+func Network(ip string) string {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil || !addr.Is6() || addr.Is4In6() {
+		return ip
+	}
+	p, err := addr.Prefix(64)
+	if err != nil {
+		return ip
+	}
+	return p.String()
+}
+
+// NetworkKey is [Network] applied to [Extractor.FromRequest]: the per-source
+// key for r.
+func (e *Extractor) NetworkKey(r *http.Request) string {
+	return Network(e.FromRequest(r))
 }

@@ -10,6 +10,10 @@
 // LB/WAF/CDN. Nor is it an exploit (e.g. RCE) mitigation; it only slows the
 // probing that precedes one.
 //
+// IPv6 sources are keyed on their /64 prefix, since a single subscriber
+// typically controls a whole /64 and could otherwise rotate addresses to get a
+// fresh bucket per request.
+//
 // The limiter is keyed on the immediate TCP peer (r.RemoteAddr), never a raw
 // X-Forwarded-For — so the key can't be spoofed by a client-supplied header.
 // X-Forwarded-For is consulted only when the peer is itself a configured
@@ -39,6 +43,12 @@ const (
 	// interval, run lazily when a new key is first seen — no background
 	// goroutine to start, stop, or leak.
 	sweepInterval = 5 * time.Minute
+	// maxBuckets bounds the bucket map. Once full (after the periodic
+	// sweep), sources not yet tracked share a single overflow bucket, so a
+	// flood of distinct keys can neither grow memory nor mint fresh tokens.
+	maxBuckets = 100_000
+	// overflowKey keys the shared bucket; it cannot collide with an IP.
+	overflowKey = "overflow"
 )
 
 // Config wires a [Limiter].
@@ -130,7 +140,7 @@ func (l *Limiter) Middleware(next http.Handler, exempt ...string) http.Handler {
 			return
 		}
 		key := l.clientIP.FromRequest(r)
-		if !l.allow(key, time.Now()) {
+		if !l.allow(clientip.Network(key), time.Now()) {
 			w.Header().Set("Retry-After", l.retryAfter())
 			l.log.Warn("rate limit exceeded", "source", key, "path", r.URL.Path)
 			if l.onThrottle != nil {
@@ -151,8 +161,14 @@ func (l *Limiter) allow(key string, now time.Time) bool {
 	b, ok := l.buckets[key]
 	if !ok {
 		l.sweepLocked(now)
-		b = &bucket{lim: rate.NewLimiter(l.rps, l.burst)}
-		l.buckets[key] = b
+		if len(l.buckets) >= maxBuckets {
+			key = overflowKey
+			b = l.buckets[key]
+		}
+		if b == nil {
+			b = &bucket{lim: rate.NewLimiter(l.rps, l.burst)}
+			l.buckets[key] = b
+		}
 	}
 	b.seen = now
 	l.mu.Unlock()

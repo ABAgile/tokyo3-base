@@ -6,8 +6,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 func discard() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -154,5 +157,43 @@ func TestMiddleware_OnThrottle(t *testing.T) {
 	// Retry-After is set before OnThrottle runs, so it's still present.
 	if rec.Header().Get("Retry-After") == "" {
 		t.Error("Retry-After should be set even with a custom OnThrottle")
+	}
+}
+
+func TestMiddleware_IPv6RotationWithinPrefixSharesBucket(t *testing.T) {
+	l := New(Config{RPS: 1, Burst: 1, Log: discard()})
+	h := l.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) }))
+	send := func(remote string) int {
+		r := httptest.NewRequest(http.MethodGet, "/api", nil)
+		r.RemoteAddr = remote
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, r)
+		return rec.Code
+	}
+	if got := send("[2001:db8:1:2::1]:1000"); got != http.StatusTeapot {
+		t.Fatalf("first request: got %d", got)
+	}
+	if got := send("[2001:db8:1:2::2]:1000"); got != http.StatusTooManyRequests {
+		t.Errorf("rotated address in same /64 should share the bucket; got %d", got)
+	}
+	if got := send("[2001:db8:1:3::1]:1000"); got != http.StatusTeapot {
+		t.Errorf("different /64 should have its own bucket; got %d", got)
+	}
+}
+
+func TestAllow_BucketCapUsesSharedOverflow(t *testing.T) {
+	l := New(Config{RPS: 1, Burst: 1, Log: discard()})
+	now := time.Unix(0, 0)
+	for i := range maxBuckets {
+		l.buckets[strconv.Itoa(i)] = &bucket{lim: rate.NewLimiter(1, 1), seen: now}
+	}
+	if !l.allow("new-a", now) {
+		t.Fatal("first overflow request should be allowed")
+	}
+	if l.allow("new-b", now) {
+		t.Error("overflow sources must share one bucket")
+	}
+	if len(l.buckets) != maxBuckets+1 {
+		t.Errorf("buckets = %d, want %d (cap + overflow)", len(l.buckets), maxBuckets+1)
 	}
 }
