@@ -247,6 +247,50 @@ func TestEncodedSource_Close(t *testing.T) {
 	}
 }
 
+// ctxRecorder records the context each Subscribe was called with, so a test
+// can tell whether the wrapper cancelled the inner subscription.
+type ctxRecorder struct {
+	Source
+	ctx context.Context
+}
+
+func (r *ctxRecorder) Subscribe(ctx context.Context, replay int, startFromSeq uint64) (<-chan Msg, error) {
+	r.ctx = ctx
+	return r.Source.Subscribe(ctx, replay, startFromSeq)
+}
+
+// TestEncodedSource_CloseStopsDecoder: Close stops the decoder even when the
+// output channel is never read. The decoder is either idle on the inner
+// channel or blocked sending an event nobody takes. Stopping it cancels the
+// inner subscription.
+func TestEncodedSource_CloseStopsDecoder(t *testing.T) {
+	good, _ := json.Marshal(sample{Name: "x"})
+	cases := []struct {
+		name  string
+		inner Source
+	}{
+		{"idle inner", NoopSource{}},
+		{"unread event held by decoder", &staticSource{msgs: []Msg{{Seq: 1, Data: good}}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &ctxRecorder{Source: tc.inner}
+			s := NewJSONSource[sample](rec)
+			if _, err := s.Subscribe(context.Background(), 0, 0); err != nil {
+				t.Fatalf("Subscribe: %v", err)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+			select {
+			case <-rec.ctx.Done():
+			case <-time.After(time.Second):
+				t.Fatal("Close did not stop the decoder's inner subscription")
+			}
+		})
+	}
+}
+
 // TestEncodedSource_CtxCancelStopsDecoder: cancelling ctx mid-stream stops
 // the decoder goroutine cleanly, even with messages still buffered upstream.
 // The output channel must close shortly after; otherwise the decoder is

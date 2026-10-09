@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -62,14 +63,16 @@ type Event[T any] struct {
 // opaque to EncodedSource, just like EncodedSink. Use NewJSONSource for the
 // common JSON case.
 type EncodedSource[T any] struct {
-	inner  Source
-	decode func([]byte) (T, error)
+	inner     Source
+	decode    func([]byte) (T, error)
+	done      chan struct{} // closed by Close to stop every decoder goroutine
+	closeOnce sync.Once
 }
 
 // NewEncodedSource wraps inner with the given decode function. Subscribe
 // delivers Event[T] values whose Value has been decoded from each Msg.Data.
 func NewEncodedSource[T any](inner Source, decode func([]byte) (T, error)) *EncodedSource[T] {
-	return &EncodedSource[T]{inner: inner, decode: decode}
+	return &EncodedSource[T]{inner: inner, decode: decode, done: make(chan struct{})}
 }
 
 // NewJSONSource is the JSON convenience: equivalent to NewEncodedSource with
@@ -87,22 +90,40 @@ func NewJSONSource[T any](inner Source) *EncodedSource[T] {
 // the wire format is the producer's contract; a decode failure means the
 // stream contains a record this consumer can't read, and the recovery is
 // to fix the producer or the type T, not to retry). Closes the returned
-// channel when the inner channel closes.
+// channel when the inner channel closes, when ctx is cancelled, or when the
+// EncodedSource is closed. Stopping the decoder cancels the inner subscription.
 func (s *EncodedSource[T]) Subscribe(ctx context.Context, replay int, startFromSeq uint64) (<-chan Event[T], error) {
+	ctx, cancel := context.WithCancel(ctx)
 	raw, err := s.inner.Subscribe(ctx, replay, startFromSeq)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	out := make(chan Event[T])
 	go func() {
 		defer close(out)
-		for m := range raw {
+		defer cancel()
+		for {
+			var m Msg
+			var ok bool
+			select {
+			case <-ctx.Done():
+				return
+			case <-s.done:
+				return
+			case m, ok = <-raw:
+				if !ok {
+					return
+				}
+			}
 			v, err := s.decode(m.Data)
 			if err != nil {
 				continue
 			}
 			select {
 			case <-ctx.Done():
+				return
+			case <-s.done:
 				return
 			case out <- Event[T]{Seq: m.Seq, Time: m.Time, Value: v}:
 			}
@@ -111,7 +132,9 @@ func (s *EncodedSource[T]) Subscribe(ctx context.Context, replay int, startFromS
 	return out, nil
 }
 
-// Close drains the inner Source.
+// Close stops every decoder started by Subscribe, which cancels their inner
+// subscriptions, then drains the inner Source.
 func (s *EncodedSource[T]) Close() error {
+	s.closeOnce.Do(func() { close(s.done) })
 	return s.inner.Close()
 }
