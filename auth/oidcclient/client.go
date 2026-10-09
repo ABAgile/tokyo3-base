@@ -514,7 +514,8 @@ type IDTokenSubjectClaims struct {
 // extras may be either absolute paths or paths relative to CacheDir.
 // A relative path must stay inside CacheDir (no "..", and not "." itself);
 // offenders are skipped and reported in the returned error. Missing files
-// are not errors (best-effort cleanup).
+// are not errors (best-effort cleanup); other removal failures are returned
+// after every path has still been attempted.
 func Logout(extras ...string) error {
 	dir, err := CacheDir()
 	if err != nil {
@@ -528,7 +529,10 @@ func Logout(extras ...string) error {
 	if lockErr == nil {
 		defer unlock()
 	}
-	_ = os.Remove(filepath.Join(dir, "tokens.json"))
+	var errs []error
+	if err := os.Remove(filepath.Join(dir, "tokens.json")); err != nil && !errors.Is(err, os.ErrNotExist) {
+		errs = append(errs, err)
+	}
 	var escaped []string
 	for _, p := range extras {
 		if !filepath.IsAbs(p) {
@@ -540,9 +544,10 @@ func Logout(extras ...string) error {
 			}
 			p = filepath.Join(dir, p)
 		}
-		_ = os.RemoveAll(p)
+		if err := os.RemoveAll(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, err)
+		}
 	}
-	var errs []error
 	if len(escaped) > 0 {
 		errs = append(errs, fmt.Errorf("refused to remove relative paths outside the cache dir: %q", escaped))
 	}

@@ -92,3 +92,31 @@ func TestEnsureFreshTokens_NoCacheIsAnError(t *testing.T) {
 		t.Errorf("EnsureFreshTokens with no cache = %+v, want an error", tok)
 	}
 }
+
+// An extra path that cannot be removed must make logout fail, because the
+// credentials it holds would otherwise survive while logout reports success.
+// A missing extra is still not an error.
+func TestLogout_ReportsExtraRemovalFailure(t *testing.T) {
+	base := isolateConfigHome(t)
+	dir := filepath.Join(base, rootDirName)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// The extra's contents cannot be unlinked from a read-only parent.
+	extra := filepath.Join(t.TempDir(), "creds")
+	if err := os.MkdirAll(filepath.Join(extra, "sub"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(extra, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(extra, 0o700) })
+
+	if err := Logout(extra); err == nil {
+		t.Error("Logout succeeded although an extra path could not be removed")
+	}
+	if err := Logout(filepath.Join(base, "missing")); err != nil {
+		t.Errorf("Logout of a missing extra = %v, want nil", err)
+	}
+}
