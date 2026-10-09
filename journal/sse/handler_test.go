@@ -370,3 +370,34 @@ func TestHandler_LastEventIDOverflowIgnored(t *testing.T) {
 		t.Fatalf("gotStartSeq = %d, want 0", src.gotStartSeq)
 	}
 }
+
+// blockingSource's Subscribe blocks until its context ends, like a backend that
+// is slow to set up a subscription.
+type blockingSource struct{}
+
+func (blockingSource) Subscribe(ctx context.Context, _ int, _ uint64) (<-chan journal.Msg, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (blockingSource) Close() error { return nil }
+
+// Done must interrupt a subscription that is still being set up. The request
+// context is never cancelled here, so only Done can end the call.
+func TestHandler_DoneInterruptsBlockedSubscribe(t *testing.T) {
+	done := make(chan struct{})
+	req := httptest.NewRequest(http.MethodGet, "/", nil).WithContext(t.Context())
+	h := sse.Handler{Source: blockingSource{}, Done: done}
+
+	served := make(chan struct{})
+	go func() {
+		h.ServeHTTP(httptest.NewRecorder(), req)
+		close(served)
+	}()
+	close(done)
+	select {
+	case <-served:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler still blocked in Subscribe after Done closed")
+	}
+}

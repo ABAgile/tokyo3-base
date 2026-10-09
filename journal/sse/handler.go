@@ -20,6 +20,7 @@
 package sse
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"math"
@@ -120,7 +121,18 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	msgs, err := h.Source.Subscribe(r.Context(), replay, startFromSeq)
+	// Subscribe can block while the backend sets up, and Shutdown does not cancel
+	// request contexts, so Done must cancel the subscription too.
+	subCtx, cancelSub := context.WithCancel(r.Context())
+	defer cancelSub()
+	go func() {
+		select {
+		case <-h.Done:
+			cancelSub()
+		case <-subCtx.Done():
+		}
+	}()
+	msgs, err := h.Source.Subscribe(subCtx, replay, startFromSeq)
 	if err != nil {
 		log.WarnContext(r.Context(), "journal SSE subscription failed", "err", err)
 		http.Error(w, "subscribe failed", http.StatusServiceUnavailable)
