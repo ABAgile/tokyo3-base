@@ -195,6 +195,11 @@ type Source struct {
 	inactiveThreshold time.Duration
 	log               *slog.Logger
 
+	// closing is closed by Close. Each subscription stops on it, so none
+	// stays blocked on a send that no reader will complete.
+	closing   chan struct{}
+	closeOnce sync.Once
+
 	streamMu sync.Mutex
 	stream   jetstream.Stream
 }
@@ -240,6 +245,7 @@ func NewSource(cfg SourceConfig) (*Source, error) {
 		subject:           cfg.Subject,
 		inactiveThreshold: inactive,
 		log:               cfg.Log,
+		closing:           make(chan struct{}),
 	}, nil
 }
 
@@ -273,8 +279,9 @@ func (s *Source) ensureStream(ctx context.Context) (jetstream.Stream, error) {
 //     records, or All when fewer than replay records match
 //
 // Returns a channel that delivers messages in publish order until ctx is
-// cancelled. The channel closes when the inner iterator stops (server
-// disconnect, ctx cancel, or InactiveThreshold expiry on the server side).
+// cancelled or the Source is closed. The channel closes when the inner
+// iterator stops (server disconnect, ctx cancel, Close, or InactiveThreshold
+// expiry on the server side).
 func (s *Source) Subscribe(ctx context.Context, replay int, startFromSeq uint64) (<-chan journal.Msg, error) {
 	stream, err := s.ensureStream(ctx)
 	if err != nil {
@@ -315,6 +322,7 @@ func (s *Source) Subscribe(ctx context.Context, replay int, startFromSeq uint64)
 	go func() {
 		select {
 		case <-ctx.Done():
+		case <-s.closing:
 		case <-done: // reader exited on its own; don't linger until ctx ends
 		}
 		mc.Stop()
@@ -356,6 +364,8 @@ func (s *Source) Subscribe(ctx context.Context, replay int, startFromSeq uint64)
 			}
 			select {
 			case <-ctx.Done():
+				return
+			case <-s.closing:
 				return
 			case ch <- out:
 			}
@@ -404,9 +414,10 @@ func releaseConsumer(ctx context.Context, stream consumerDeleter, name string, l
 	}
 }
 
-// Close drains the NATS connection. Outstanding Subscribe channels close
-// shortly after, as their iterator returns.
+// Close stops every subscription started from this Source, then drains the
+// NATS connection. Outstanding Subscribe channels close shortly after.
 func (s *Source) Close() error {
+	s.closeOnce.Do(func() { close(s.closing) })
 	return s.nc.Drain()
 }
 

@@ -1609,7 +1609,7 @@ for m := range msgs {
 
 `Subscribe` creates an **ephemeral, ack-none** JetStream consumer per call,
 chooses a delivery policy from the requested backfill window, and tails
-the stream until the caller cancels:
+the stream until the caller cancels or `Source.Close` is called:
 
 | Inputs                         | JetStream `DeliverPolicy` | `OptStartSeq`        |
 |--------------------------------|---------------------------|----------------------|
