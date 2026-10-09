@@ -104,8 +104,8 @@ func (tm *BearerTokenManager) GetToken(ctx context.Context) (string, error) {
 		return token, nil
 	}
 	now := time.Now()
-	stale := tm.Token
-	usable := stale != "" && now.Before(tm.ExpiresAt) // soft-stale: refresh due, token not expired
+	stale, staleExpiry := tm.Token, tm.ExpiresAt
+	usable := stale != "" && now.Before(staleExpiry) // soft-stale: refresh due, token not expired
 
 	call := tm.inflight
 	leader := false
@@ -148,7 +148,8 @@ func (tm *BearerTokenManager) GetToken(ctx context.Context) (string, error) {
 		return "", ctx.Err()
 	}
 	if call.err != nil {
-		if usable {
+		// Judge expiry now: the token may have expired while this caller waited.
+		if stale != "" && time.Now().Before(staleExpiry) {
 			return stale, nil // refresh failed but the previous token has not expired
 		}
 		return "", call.err
