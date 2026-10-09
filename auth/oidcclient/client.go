@@ -385,9 +385,8 @@ func errorBodyText(body []byte) string {
 }
 
 // defaultTokenTTL is the access-token lifetime assumed when the response omits
-// expires_in (optional per RFC 6749 §5.1). Zero would mark the token already
-// expired and force a refresh — burning the rotating refresh token — on every
-// use.
+// expires_in (optional per RFC 6749 §5.1). An explicit expires_in is never
+// replaced by this default.
 const defaultTokenTTL = time.Hour
 
 // noRedirectClient is used for credential-bearing POSTs: a redirect would
@@ -449,7 +448,7 @@ func parseTokens(body []byte) (*Tokens, error) {
 		AccessToken  string `json:"access_token"`
 		RefreshToken string `json:"refresh_token"`
 		IDToken      string `json:"id_token"`
-		ExpiresIn    int64  `json:"expires_in"`
+		ExpiresIn    *int64 `json:"expires_in"`
 		TokenType    string `json:"token_type"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
@@ -458,15 +457,18 @@ func parseTokens(body []byte) (*Tokens, error) {
 	if raw.AccessToken == "" {
 		return nil, errors.New("token endpoint returned no access_token")
 	}
-	ttl := time.Duration(raw.ExpiresIn) * time.Second
-	if ttl <= 0 {
-		ttl = defaultTokenTTL
+	// expires_in is optional, so only its absence gets the default lifetime. An
+	// explicit value is honored even when it is zero or negative, which leaves the
+	// token already expired so it is refreshed before use.
+	expiration := time.Now().Add(defaultTokenTTL)
+	if raw.ExpiresIn != nil {
+		expiration = time.Now().Add(time.Duration(*raw.ExpiresIn) * time.Second)
 	}
 	return &Tokens{
 		AccessToken:  raw.AccessToken,
 		RefreshToken: raw.RefreshToken,
 		IDToken:      raw.IDToken,
-		Expiration:   time.Now().Add(ttl),
+		Expiration:   expiration,
 	}, nil
 }
 

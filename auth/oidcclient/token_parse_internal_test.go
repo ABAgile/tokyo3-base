@@ -51,3 +51,20 @@ func TestEnsureFreshTokens_ExpiredWithoutRefreshTokenAsksForLogin(t *testing.T) 
 		t.Fatalf("err = %v, want a run-login hint without contacting the IdP", err)
 	}
 }
+
+// An explicit expires_in of zero or less means the token is already expired, so
+// it is refreshed on use. Only an absent expires_in gets the default lifetime.
+func TestParseTokens_ExplicitExpiredLifetimeIsHonored(t *testing.T) {
+	for _, body := range []string{
+		`{"access_token":"a","expires_in":0}`,
+		`{"access_token":"a","expires_in":-1}`,
+	} {
+		tok, err := parseTokens([]byte(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if time.Now().Before(tok.Expiration) {
+			t.Errorf("%s: token valid for %v, want already expired", body, time.Until(tok.Expiration))
+		}
+	}
+}
