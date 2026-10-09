@@ -1,6 +1,7 @@
 package crypto
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"fmt"
@@ -90,6 +91,10 @@ func (c *KeyProviderCache) ForKey(ctx context.Context, keyID string, wrappedKey 
 	// from any one caller's cancellation (and bounded by unwrapTimeout), so a
 	// caller that gives up cannot fail the unwrap every other waiter depends
 	// on; each caller still stops waiting when its own ctx is done.
+	// The detached call may read wrappedKey after this function returns, when
+	// the caller is free to reuse its buffer, so it gets a private copy that
+	// matches digest.
+	wrappedKey = bytes.Clone(wrappedKey)
 	ch := c.unwrapFlights.DoChan(flightKey(keyID, digest), func() (any, error) {
 		// Re-check after acquiring the singleflight slot — a previous leader
 		// may have populated the cache while we were queued.

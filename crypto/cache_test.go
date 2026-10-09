@@ -329,3 +329,57 @@ func TestKeyProviderCache_RootPanicBecomesError(t *testing.T) {
 		t.Fatal("expected an error from a panicking root provider")
 	}
 }
+
+// gatedKP holds Unwrap until release is closed, then unwraps with a real
+// AES-256-GCM master key. The wrapped bytes are therefore read only after the
+// caller has already returned.
+type gatedKP struct {
+	master  *LocalKeyProvider
+	release chan struct{}
+}
+
+func (g *gatedKP) Wrap(ctx context.Context, dek []byte) ([]byte, error) {
+	return g.master.Wrap(ctx, dek)
+}
+
+func (g *gatedKP) Unwrap(ctx context.Context, wrapped []byte) ([]byte, error) {
+	<-g.release
+	return g.master.Unwrap(ctx, wrapped)
+}
+
+// TestKeyProviderCache_CancelledCallerBufferReuse: a caller that gives up while
+// the shared unwrap is pending may reuse its buffer. The unwrap must not read
+// those bytes, or it caches another key under the digest of the original
+// wrapped key.
+func TestKeyProviderCache_CancelledCallerBufferReuse(t *testing.T) {
+	ctx := context.Background()
+	master := NewLocalKeyProvider(makeTestKey(1))
+	k1, k2 := makeTestKey(10), makeTestKey(20)
+	wrapped1, err := master.Wrap(ctx, k1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapped2, err := master.Wrap(ctx, k2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := &gatedKP{master: master, release: make(chan struct{})}
+	cache := NewKeyProviderCache(root, time.Minute)
+
+	buf := bytes.Clone(wrapped1)
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := cache.ForKey(cancelled, "id", buf); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ForKey err = %v, want context.Canceled", err)
+	}
+	copy(buf, wrapped2) // the caller reuses its buffer
+	close(root.release)
+
+	kp, err := cache.ForKey(ctx, "id", bytes.Clone(wrapped1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(kp.(*LocalKeyProvider).masterKey, k1) {
+		t.Fatal("key cached for wrapped1 is not k1: the detached unwrap read the reused buffer")
+	}
+}
