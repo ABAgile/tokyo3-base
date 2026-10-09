@@ -877,3 +877,24 @@ func TestNewAuthenticator_RejectsUnusableFlowCookie(t *testing.T) {
 		}
 	}
 }
+
+func TestBegin_KeepsEndpointQueryParameters(t *testing.T) {
+	ver := syncEndpointStub{ep: oauth2.Endpoint{
+		AuthURL:  "https://idp.example.com/authorize?tenant=foo",
+		TokenURL: "https://idp.example.com/token",
+	}}
+	a := testAuth(t, ver, nil)
+	w := httptest.NewRecorder()
+	authURL, err := a.Begin(w, httptest.NewRequest(http.MethodGet, "/auth/login", nil), "")
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	u, err := url.Parse(authURL)
+	if err != nil {
+		t.Fatalf("parse authURL %q: %v", authURL, err)
+	}
+	q := u.Query()
+	if q.Get("tenant") != "foo" || q.Get("client_id") != "portal" || q.Get("response_type") != "code" {
+		t.Errorf("authURL = %q, want tenant=foo and the OAuth parameters", authURL)
+	}
+}

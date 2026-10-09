@@ -10,6 +10,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+
+	"github.com/abagile/tokyo3-base/internal/urlquery"
 )
 
 // RunCodeFlow performs an OAuth2 authorization-code flow with PKCE,
@@ -71,7 +73,10 @@ func RunCodeFlow(ctx context.Context, issuer, clientID string, port int, stderr 
 	// convention (the exact pre-discovery behavior) otherwise.
 	ep := discoverEndpoints(ctx, issuer)
 
-	authURL := buildAuthorizeURLAt(ep.AuthorizationEndpoint, clientID, redirectURI, state, challenge)
+	authURL, err := buildAuthorizeURLAt(ep.AuthorizationEndpoint, clientID, redirectURI, state, challenge)
+	if err != nil {
+		return nil, err
+	}
 	if stderr != nil {
 		fmt.Fprintln(stderr, "Opening browser for OIDC login. If it doesn't open, paste this URL:")
 		fmt.Fprintln(stderr, "  ", authURL)
@@ -90,12 +95,19 @@ func RunCodeFlow(ctx context.Context, issuer, clientID string, port int, stderr 
 // so a caller (or test) can verify the exact wire shape without doing
 // IO. RunCodeFlow itself uses the issuer's discovered authorization
 // endpoint when available (see discoverEndpoints) and only falls back
-// to this convention when discovery is unavailable.
+// to this convention when discovery is unavailable. It returns "" if
+// the issuer does not form a parseable URL.
 func BuildAuthorizeURL(issuer, clientID, redirectURI, state, challenge string) string {
-	return buildAuthorizeURLAt(conventionEndpoints(issuer).AuthorizationEndpoint, clientID, redirectURI, state, challenge)
+	authURL, err := buildAuthorizeURLAt(conventionEndpoints(issuer).AuthorizationEndpoint, clientID, redirectURI, state, challenge)
+	if err != nil {
+		return ""
+	}
+	return authURL
 }
 
-func buildAuthorizeURLAt(authEndpoint, clientID, redirectURI, state, challenge string) string {
+// buildAuthorizeURLAt adds the code-flow parameters to authEndpoint, keeping
+// any query the endpoint already carries.
+func buildAuthorizeURLAt(authEndpoint, clientID, redirectURI, state, challenge string) (string, error) {
 	q := url.Values{}
 	q.Set("response_type", "code")
 	q.Set("client_id", clientID)
@@ -104,7 +116,7 @@ func buildAuthorizeURLAt(authEndpoint, clientID, redirectURI, state, challenge s
 	q.Set("state", state)
 	q.Set("code_challenge", challenge)
 	q.Set("code_challenge_method", "S256")
-	return authEndpoint + "?" + q.Encode()
+	return urlquery.Merge(authEndpoint, q)
 }
 
 func exchangeCodeAt(ctx context.Context, tokenEndpoint, clientID, redirectURI, code, verifier string) (*Tokens, error) {

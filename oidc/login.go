@@ -18,6 +18,7 @@ import (
 
 	"github.com/abagile/tokyo3-base/auth/oidcclient"
 	"github.com/abagile/tokyo3-base/crypto"
+	"github.com/abagile/tokyo3-base/internal/urlquery"
 	"github.com/abagile/tokyo3-base/sealedcookie"
 	"github.com/abagile/tokyo3-base/session"
 )
@@ -349,12 +350,17 @@ func (a *Authenticator) Begin(w http.ResponseWriter, r *http.Request, extra stri
 	}
 	sum := sha256.Sum256([]byte(verifier))
 	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
-	return a.authorizeURL(ep, state, nonce, challenge), nil
+	authURL, err = a.authorizeURL(ep, state, nonce, challenge)
+	if err != nil {
+		return "", fmt.Errorf("oidc: authorize URL: %w", err)
+	}
+	return authURL, nil
 }
 
 // authorizeURL builds the IdP /authorize redirect for the code flow, from
-// the endpoint resolved via [Authenticator.endpoint].
-func (a *Authenticator) authorizeURL(ep oauth2.Endpoint, state, nonce, challenge string) string {
+// the endpoint resolved via [Authenticator.endpoint]. The endpoint's own
+// query parameters (for example a tenant selector) are kept.
+func (a *Authenticator) authorizeURL(ep oauth2.Endpoint, state, nonce, challenge string) (string, error) {
 	q := url.Values{}
 	q.Set("response_type", "code")
 	q.Set("client_id", a.cfg.ClientID)
@@ -364,7 +370,7 @@ func (a *Authenticator) authorizeURL(ep oauth2.Endpoint, state, nonce, challenge
 	q.Set("nonce", nonce)
 	q.Set("code_challenge", challenge)
 	q.Set("code_challenge_method", "S256")
-	return ep.AuthURL + "?" + q.Encode()
+	return urlquery.Merge(ep.AuthURL, q)
 }
 
 // endpointResolver is implemented by verifiers that can report the IdP's

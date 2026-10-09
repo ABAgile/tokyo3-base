@@ -341,3 +341,18 @@ func TestRunCodeFlow_UsesDiscoveredTokenEndpoint(t *testing.T) {
 		t.Errorf("tokens not propagated: %+v", tok)
 	}
 }
+
+func TestBuildAuthorizeURLAt_KeepsEndpointQueryParameters(t *testing.T) {
+	raw, err := buildAuthorizeURLAt("https://id.example.com/authorize?tenant=foo", "cid", "http://127.0.0.1:9/callback", "st", "ch")
+	if err != nil {
+		t.Fatalf("buildAuthorizeURLAt: %v", err)
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse %q: %v", raw, err)
+	}
+	q := u.Query()
+	if q.Get("tenant") != "foo" || q.Get("client_id") != "cid" || q.Get("code_challenge") != "ch" {
+		t.Errorf("authorize URL = %q, want tenant=foo plus the code-flow parameters", raw)
+	}
+}
