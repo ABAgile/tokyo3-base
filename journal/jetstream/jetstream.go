@@ -20,6 +20,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -121,7 +123,7 @@ func connectOptions(tlsCfg *tls.Config, log *slog.Logger, reconnectWait time.Dur
 				log.Warn("nats disconnected", "face", face, "err", err)
 			}),
 			nats.ReconnectHandler(func(nc *nats.Conn) {
-				log.Info("nats reconnected", "face", face, "url", nc.ConnectedUrl())
+				log.Info("nats reconnected", "face", face, "url", logURL(nc.ConnectedUrl()))
 			}),
 			nats.ClosedHandler(func(_ *nats.Conn) {
 				log.Warn("nats connection closed", "face", face)
@@ -129,6 +131,23 @@ func connectOptions(tlsCfg *tls.Config, log *slog.Logger, reconnectWait time.Dur
 		)
 	}
 	return opts
+}
+
+// logURL returns raw with any userinfo (passwords, tokens) removed, so NATS
+// connection URLs can be logged. nats.go accepts a comma-separated server
+// list, so each entry is redacted separately.
+func logURL(raw string) string {
+	servers := strings.Split(raw, ",")
+	for i, s := range servers {
+		u, err := url.Parse(strings.TrimSpace(s))
+		if err != nil {
+			servers[i] = "[invalid URL]"
+			continue
+		}
+		u.User = nil
+		servers[i] = u.String()
+	}
+	return strings.Join(servers, ",")
 }
 
 // Append publishes payload to the configured subject and waits for the

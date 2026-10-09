@@ -77,7 +77,7 @@ func NewAuditSink[T any](cfg AuditSinkConfig) (*journal.EncodedSink[T], error) {
 	}
 	if cfg.Log != nil {
 		if cfg.CertFile != "" && cfg.KeyFile != "" {
-			cfg.Log.Info("audit sink: NATS JetStream with mTLS", "url", cfg.URL)
+			cfg.Log.Info("audit sink: NATS JetStream with mTLS", "url", logURL(cfg.URL))
 		} else {
 			cfg.Log.Warn("audit sink: " + cfg.EnvPrefix + "_CERT not set — connecting without mTLS (not for production)")
 		}
