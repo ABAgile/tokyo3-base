@@ -202,6 +202,9 @@ type Source struct {
 
 	streamMu sync.Mutex
 	stream   jetstream.Stream
+	// lookup is non-nil while a stream lookup is in flight. It is closed
+	// when that lookup ends, whatever its outcome.
+	lookup chan struct{}
 }
 
 // NewSource returns a ready Source. NATS dial failures do NOT cause
@@ -250,22 +253,55 @@ func NewSource(cfg SourceConfig) (*Source, error) {
 }
 
 // ensureStream resolves the configured JetStream stream the first time
-// it's called (memoised under streamMu). Subsequent calls return the
-// cached handle. Failures are not memoised — a transient broker
-// outage on the first Subscribe self-heals when Subscribe is called
-// again after the connection recovers.
+// it's called (memoised under streamMu). At most one lookup runs at a time. A
+// caller that finds one in flight waits for it, but gives up when its own ctx
+// ends, so a slow lookup cannot hold it past its deadline. Failures are not
+// memoised: the caller whose lookup failed gets the error, and a waiter then
+// runs its own lookup, so a transient broker outage on the first Subscribe
+// self-heals when Subscribe is called again after the connection recovers.
 func (s *Source) ensureStream(ctx context.Context) (jetstream.Stream, error) {
-	s.streamMu.Lock()
-	defer s.streamMu.Unlock()
-	if s.stream != nil {
-		return s.stream, nil
+	for {
+		s.streamMu.Lock()
+		if s.stream != nil {
+			stream := s.stream
+			s.streamMu.Unlock()
+			return stream, nil
+		}
+		if inFlight := s.lookup; inFlight != nil {
+			s.streamMu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("jetstream stream %q: %w", s.streamName, ctx.Err())
+			case <-inFlight:
+				continue
+			}
+		}
+		done := make(chan struct{})
+		s.lookup = done
+		s.streamMu.Unlock()
+
+		stream, err := s.fetchStream(ctx, done)
+		if err != nil {
+			return nil, fmt.Errorf("jetstream stream %q: %w", s.streamName, err)
+		}
+		return stream, nil
 	}
-	stream, err := s.js.Stream(ctx, s.streamName)
-	if err != nil {
-		return nil, fmt.Errorf("jetstream stream %q: %w", s.streamName, err)
-	}
-	s.stream = stream
-	return stream, nil
+}
+
+// fetchStream performs the lookup that ensureStream leads and publishes its
+// outcome under streamMu. The deferred release also runs if the lookup panics,
+// so waiters are never left blocked on done.
+func (s *Source) fetchStream(ctx context.Context, done chan struct{}) (stream jetstream.Stream, err error) {
+	defer func() {
+		s.streamMu.Lock()
+		if err == nil {
+			s.stream = stream
+		}
+		s.lookup = nil
+		close(done)
+		s.streamMu.Unlock()
+	}()
+	return s.js.Stream(ctx, s.streamName)
 }
 
 // Subscribe creates an ephemeral, ack-none consumer with a delivery policy

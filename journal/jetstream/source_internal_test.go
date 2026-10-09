@@ -2,6 +2,7 @@ package jetstream
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -10,6 +11,137 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/stretchr/testify/require"
 )
+
+// lookupJS stands in for the JetStream client. ensureStream calls only Stream,
+// so the embedded nil interface is never reached. The first Stream call waits
+// for release or its own ctx; later calls succeed at once.
+type lookupJS struct {
+	jetstream.JetStream
+	calls   atomic.Int32
+	release chan struct{}
+}
+
+type stubStream struct{ jetstream.Stream }
+
+func (f *lookupJS) Stream(ctx context.Context, _ string) (jetstream.Stream, error) {
+	if f.calls.Add(1) == 1 {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-f.release:
+		}
+	}
+	return stubStream{}, nil
+}
+
+// A caller that waits behind an in-flight stream lookup must give up at its
+// own deadline, not when that lookup ends.
+func TestEnsureStreamWaiterHonoursItsOwnContext(t *testing.T) {
+	js := &lookupJS{release: make(chan struct{})}
+	s := &Source{js: js, streamName: "events"}
+
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := s.ensureStream(t.Context())
+		leaderDone <- err
+	}()
+	require.Eventually(t, func() bool { return js.calls.Load() == 1 }, 2*time.Second, time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	waiterDone := make(chan error, 1)
+	go func() {
+		_, err := s.ensureStream(ctx)
+		waiterDone <- err
+	}()
+	select {
+	case err := <-waiterDone:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("waiter error = %v, want DeadlineExceeded", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter stayed blocked behind the in-flight lookup past its deadline")
+	}
+
+	close(js.release)
+	if err := <-leaderDone; err != nil {
+		t.Fatalf("leader lookup: %v", err)
+	}
+	if n := js.calls.Load(); n != 1 {
+		t.Fatalf("Stream called %d times, want 1", n)
+	}
+}
+
+// When the caller running the lookup gives up, a waiter with a live context
+// must not inherit that failure. It runs the lookup itself, and the result is
+// memoised.
+func TestEnsureStreamWaiterRetriesAfterLeaderFails(t *testing.T) {
+	js := &lookupJS{release: make(chan struct{})}
+	s := &Source{js: js, streamName: "events"}
+
+	leaderCtx, cancelLeader := context.WithCancel(t.Context())
+	defer cancelLeader()
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := s.ensureStream(leaderCtx)
+		leaderDone <- err
+	}()
+	require.Eventually(t, func() bool { return js.calls.Load() == 1 }, 2*time.Second, time.Millisecond)
+
+	waiterDone := make(chan error, 1)
+	go func() {
+		_, err := s.ensureStream(t.Context())
+		waiterDone <- err
+	}()
+	cancelLeader()
+
+	if err := <-leaderDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("leader error = %v, want Canceled", err)
+	}
+	select {
+	case err := <-waiterDone:
+		if err != nil {
+			t.Fatalf("waiter inherited the leader's failure: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter never finished after the leader failed")
+	}
+	if n := js.calls.Load(); n != 2 {
+		t.Fatalf("Stream called %d times, want 2", n)
+	}
+	if _, err := s.ensureStream(t.Context()); err != nil {
+		t.Fatalf("memoised lookup: %v", err)
+	}
+	if n := js.calls.Load(); n != 2 {
+		t.Fatalf("memoised lookup re-ran Stream: %d calls, want 2", n)
+	}
+}
+
+// panicJS panics on its first Stream call and succeeds afterwards.
+type panicJS struct {
+	jetstream.JetStream
+	calls atomic.Int32
+}
+
+func (f *panicJS) Stream(context.Context, string) (jetstream.Stream, error) {
+	if f.calls.Add(1) == 1 {
+		panic("lookup failed")
+	}
+	return stubStream{}, nil
+}
+
+// A panicking lookup must not leave later callers blocked behind it. The panic
+// reaches its own caller, and the next caller runs the lookup again.
+func TestEnsureStreamAfterPanickingLookup(t *testing.T) {
+	s := &Source{js: &panicJS{}, streamName: "events"}
+	require.Panics(t, func() { _, _ = s.ensureStream(t.Context()) })
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	if _, err := s.ensureStream(ctx); err != nil {
+		t.Fatalf("lookup after a panic: %v", err)
+	}
+}
 
 // endlessMsgs is an iterator that yields a message on every Next and records
 // when it is stopped.
