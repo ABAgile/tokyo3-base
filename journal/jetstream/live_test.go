@@ -331,3 +331,52 @@ func TestLiveAuditSinkAndSourceRoundTrip(t *testing.T) {
 	assert.Equal(t, want, got)
 	assert.Equal(t, uint64(1), msg.Seq)
 }
+
+// Replay counts the newest records on the subject, not the newest stream
+// sequences: other subjects leave gaps in the sequence that must not shorten
+// the backfill. Each pattern gives one publish per character, 'a' for the
+// subscribed subject and 'b' for another.
+func TestLiveSubscribeReplayCountsMatchingRecords(t *testing.T) {
+	cases := []struct {
+		name    string
+		pattern string
+		replay  int
+		want    []uint64
+	}{
+		// The only match is seq 1, behind 99 records on another subject.
+		{"single match behind a long run", "a" + strings.Repeat("b", 99), 1, []uint64{1}},
+		// The last two matches are seq 1 and seq 11, with a gap between them.
+		{"last two across a gap", "a" + strings.Repeat("b", 9) + "a" + strings.Repeat("b", 9), 2, []uint64{1, 11}},
+		// Fewer matches than requested: everything that matches.
+		{"replay exceeds matches", "a" + strings.Repeat("b", 9), 5, []uint64{1}},
+		// Matches at 1, 2 and 11; the newest two are 2 and 11.
+		{"newest matches with gaps", "aa" + strings.Repeat("b", 8) + "a" + strings.Repeat("b", 3), 2, []uint64{2, 11}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			url, stream, subject := liveEnv(t)
+			base := strings.TrimSuffix(subject, ".events")
+			events := newSink(t, url, subject)
+			other := newSink(t, url, base+".other")
+			src := newSource(t, url, stream, subject)
+			total := uint64(len(tc.pattern))
+			for _, c := range tc.pattern {
+				if c == 'a' {
+					appendAll(t, events, "a")
+				} else {
+					appendAll(t, other, "b")
+				}
+			}
+
+			ch, err := src.Subscribe(opCtx(t), tc.replay, 0)
+			require.NoError(t, err)
+			got := recvN(t, ch, len(tc.want))
+			assert.Equal(t, tc.want, seqs(got))
+
+			// The live tail follows the backfill directly.
+			appendAll(t, events, "live")
+			live := recvN(t, ch, 1)
+			assert.Equal(t, []uint64{total + 1}, seqs(live))
+		})
+	}
+}

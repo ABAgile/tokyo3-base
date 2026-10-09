@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math/rand/v2"
+	"slices"
 	"strings"
 	"testing"
 
@@ -112,7 +114,10 @@ func TestPickDeliverPolicy(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			policy, start := pickDeliverPolicy(tc.replay, tc.startFromSeq, tc.lastSeq)
+			policy, start, err := pickDeliverPolicy(tc.replay, tc.startFromSeq, 1, tc.lastSeq, everyRecordMatches(tc.lastSeq))
+			if err != nil {
+				t.Fatal(err)
+			}
 			if policy != tc.wantPolicy {
 				t.Errorf("policy = %v, want %v", policy, tc.wantPolicy)
 			}
@@ -120,6 +125,64 @@ func TestPickDeliverPolicy(t *testing.T) {
 				t.Errorf("optStart = %d, want %d", start, tc.wantStart)
 			}
 		})
+	}
+}
+
+// everyRecordMatches is the pending function for a stream in which every
+// sequence from 1 to lastSeq matches the subject.
+func everyRecordMatches(lastSeq uint64) pendingFunc {
+	return func(seq uint64) (uint64, error) {
+		if seq > lastSeq {
+			return 0, nil
+		}
+		return lastSeq - seq + 1, nil
+	}
+}
+
+// TestReplayStart checks the replay boundary on random streams where some
+// sequences match and others are gaps. A consumer starting at the boundary must
+// receive exactly the newest n matches, as found by a full scan.
+func TestReplayStart(t *testing.T) {
+	rng := rand.New(rand.NewPCG(1, 2))
+	for range 2000 {
+		firstSeq := 1 + uint64(rng.IntN(5))
+		lastSeq := firstSeq + uint64(rng.IntN(40))
+		var matches []uint64
+		for seq := firstSeq; seq <= lastSeq; seq++ {
+			if rng.IntN(3) == 0 {
+				matches = append(matches, seq)
+			}
+		}
+		pending := func(seq uint64) (uint64, error) {
+			var c uint64
+			for _, m := range matches {
+				if m >= seq {
+					c++
+				}
+			}
+			return c, nil
+		}
+		n := 1 + uint64(rng.IntN(int(lastSeq)))
+
+		start, ok, err := replayStart(n, firstSeq, lastSeq, pending)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if wantOK := uint64(len(matches)) >= n; ok != wantOK {
+			t.Fatalf("firstSeq=%d lastSeq=%d matches=%v n=%d: ok=%v, want %v", firstSeq, lastSeq, matches, n, ok, wantOK)
+		}
+		if !ok {
+			continue
+		}
+		var got []uint64
+		for _, m := range matches {
+			if m >= start {
+				got = append(got, m)
+			}
+		}
+		if want := matches[len(matches)-int(n):]; !slices.Equal(got, want) {
+			t.Fatalf("firstSeq=%d lastSeq=%d matches=%v n=%d: start=%d delivers %v, want %v", firstSeq, lastSeq, matches, n, start, got, want)
+		}
 	}
 }
 

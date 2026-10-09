@@ -287,7 +287,8 @@ func (s *Source) ensureStream(ctx context.Context) (jetstream.Stream, error) {
 //     value past the stream end is treated as a reset and ignored)
 //   - replay <= 0 OR empty:    New                                   (tail only)
 //   - replay >= stream length: All                                   (whole stream)
-//   - otherwise:               ByStartSequence(LastSeq - replay + 1) (last N)
+//   - otherwise:               ByStartSequence at the newest replay matching
+//     records, or All when fewer than replay records match
 //
 // Returns a channel that delivers messages in publish order until ctx is
 // cancelled. The channel closes when the inner iterator stops (server
@@ -301,7 +302,11 @@ func (s *Source) Subscribe(ctx context.Context, replay int, startFromSeq uint64)
 	if err != nil {
 		return nil, fmt.Errorf("stream info: %w", err)
 	}
-	policy, optStart := pickDeliverPolicy(replay, startFromSeq, info.State.LastSeq)
+	pending := func(seq uint64) (uint64, error) { return s.pendingFrom(ctx, stream, seq) }
+	policy, optStart, err := pickDeliverPolicy(replay, startFromSeq, info.State.FirstSeq, info.State.LastSeq, pending)
+	if err != nil {
+		return nil, err
+	}
 	cons, err := stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
 		FilterSubject:     s.subject,
 		AckPolicy:         jetstream.AckNonePolicy,
@@ -377,6 +382,26 @@ func (s *Source) Subscribe(ctx context.Context, replay int, startFromSeq uint64)
 	return ch, nil
 }
 
+// pendingFrom returns how many records matching the subject have a sequence
+// >= seq. The server reports that count as NumPending when a consumer is
+// created, so a short-lived ephemeral consumer answers it without streaming
+// any records. The consumer is deleted straight away.
+func (s *Source) pendingFrom(ctx context.Context, stream jetstream.Stream, seq uint64) (uint64, error) {
+	cons, err := stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+		FilterSubject:     s.subject,
+		AckPolicy:         jetstream.AckNonePolicy,
+		DeliverPolicy:     jetstream.DeliverByStartSequencePolicy,
+		OptStartSeq:       seq,
+		InactiveThreshold: s.inactiveThreshold,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("probe consumer: %w", err)
+	}
+	info := cons.CachedInfo()
+	releaseConsumer(ctx, stream, info.Name, s.log)
+	return info.NumPending, nil
+}
+
 // releaseConsumerTimeout bounds the best-effort consumer cleanup.
 const releaseConsumerTimeout = 5 * time.Second
 
@@ -413,20 +438,94 @@ func decodeMsg(m jetstream.Msg) (journal.Msg, error) {
 	return journal.Msg{Seq: meta.Sequence.Stream, Time: meta.Timestamp, Data: m.Data()}, nil
 }
 
+// pendingFunc reports how many matching records have a sequence >= seq.
+type pendingFunc func(seq uint64) (uint64, error)
+
 // pickDeliverPolicy is the start-policy decision tree, factored out for
-// testing without a live JetStream.
-func pickDeliverPolicy(replay int, startFromSeq, lastSeq uint64) (jetstream.DeliverPolicy, uint64) {
+// testing without a live JetStream. pending is called only for the replay
+// window.
+func pickDeliverPolicy(replay int, startFromSeq, firstSeq, lastSeq uint64, pending pendingFunc) (jetstream.DeliverPolicy, uint64, error) {
 	// A resume point past the stream's end (lastSeq+1 is the next message) means
 	// the stream was reset or recreated since the caller last saw it; waiting
 	// for sequences to catch up would deliver nothing, so fall back to replay.
 	if startFromSeq > 0 && startFromSeq <= lastSeq+1 {
-		return jetstream.DeliverByStartSequencePolicy, startFromSeq
+		return jetstream.DeliverByStartSequencePolicy, startFromSeq, nil
 	}
 	if replay <= 0 || lastSeq == 0 {
-		return jetstream.DeliverNewPolicy, 0
+		return jetstream.DeliverNewPolicy, 0, nil
 	}
 	if uint64(replay) >= lastSeq {
-		return jetstream.DeliverAllPolicy, 0
+		return jetstream.DeliverAllPolicy, 0, nil
 	}
-	return jetstream.DeliverByStartSequencePolicy, lastSeq - uint64(replay) + 1
+	start, ok, err := replayStart(uint64(replay), firstSeq, lastSeq, pending)
+	if err != nil {
+		return 0, 0, err
+	}
+	if !ok {
+		// Fewer matching records than requested: replay all of them.
+		return jetstream.DeliverAllPolicy, 0, nil
+	}
+	return jetstream.DeliverByStartSequencePolicy, start, nil
+}
+
+// replayStart returns the first sequence to deliver so that a consumer starting
+// there receives the newest n matching records. The stream holds sequences
+// firstSeq through lastSeq. Other subjects leave gaps in the sequence, so the
+// answer can sit well below lastSeq-n+1. ok is false when fewer than n records
+// match.
+func replayStart(n, firstSeq, lastSeq uint64, pending pendingFunc) (uint64, bool, error) {
+	// The n sequences lastSeq-n+1..lastSeq hold at most n matches, so starting
+	// there delivers at most n records. The answer is at or below this point.
+	hi := firstSeq
+	if n <= lastSeq && lastSeq-n+1 > firstSeq {
+		hi = lastSeq - n + 1
+	}
+	c, err := pending(hi)
+	if err != nil {
+		return 0, false, err
+	}
+	if c >= n {
+		return hi, true, nil
+	}
+	if hi == firstSeq {
+		return 0, false, nil
+	}
+	// Gallop down from hi, doubling the step, until a start holds at least n
+	// matches. bad always holds fewer than n.
+	bad := hi
+	var good uint64
+	for step := uint64(1); ; step *= 2 {
+		cand := firstSeq
+		if bad-firstSeq > step {
+			cand = bad - step
+		}
+		c, err := pending(cand)
+		if err != nil {
+			return 0, false, err
+		}
+		if c >= n {
+			good = cand
+			break
+		}
+		if cand == firstSeq {
+			return 0, false, nil
+		}
+		bad = cand
+	}
+	// Bisect the bracket. good holds at least n matches and bad fewer. Once
+	// they are adjacent, good holds exactly n: bad is one sequence later and
+	// that sequence can contribute at most one match.
+	for bad-good > 1 {
+		mid := good + (bad-good)/2
+		c, err := pending(mid)
+		if err != nil {
+			return 0, false, err
+		}
+		if c >= n {
+			good = mid
+		} else {
+			bad = mid
+		}
+	}
+	return good, true, nil
 }
