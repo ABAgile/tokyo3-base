@@ -447,6 +447,39 @@ func TestLogoutHandler_ClearsSessionAndRedirects(t *testing.T) {
 	}
 }
 
+// Logout refuses cross-site requests when Sec-Fetch-Site is missing, judging
+// by Origin and Referer instead. Sec-Fetch-Site, when present, decides alone.
+func TestLogoutHandler_CrossSiteWithoutFetchMetadata(t *testing.T) {
+	cases := []struct {
+		name    string
+		headers map[string]string
+		want    int
+	}{
+		{"foreign origin", map[string]string{"Origin": "https://evil.example"}, http.StatusForbidden},
+		{"null origin", map[string]string{"Origin": "null"}, http.StatusForbidden},
+		{"foreign referer", map[string]string{"Referer": "https://evil.example/page"}, http.StatusForbidden},
+		{"same-host origin", map[string]string{"Origin": "https://example.com"}, http.StatusSeeOther},
+		{"same-host referer", map[string]string{"Referer": "https://example.com/app"}, http.StatusSeeOther},
+		{"no evidence", nil, http.StatusSeeOther},
+		{"fetch metadata cross-site", map[string]string{"Sec-Fetch-Site": "cross-site"}, http.StatusForbidden},
+		{"fetch metadata same-origin beats foreign origin", map[string]string{"Sec-Fetch-Site": "same-origin", "Origin": "https://evil.example"}, http.StatusSeeOther},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := testManager(t, nil)
+			r := httptest.NewRequest(http.MethodPost, "https://example.com/auth/logout", nil)
+			for k, v := range tc.headers {
+				r.Header.Set(k, v)
+			}
+			rec := httptest.NewRecorder()
+			m.LogoutHandler()(rec, r)
+			if rec.Code != tc.want {
+				t.Fatalf("code=%d, want %d", rec.Code, tc.want)
+			}
+		})
+	}
+}
+
 // TestCSRFTokenValidate: session-bound tokens round-trip; scope partitions
 // them; tampered tokens, foreign sessions, and missing sessions all fail.
 func TestCSRFTokenValidate(t *testing.T) {

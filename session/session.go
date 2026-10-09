@@ -350,10 +350,13 @@ func (m *Manager) ValidateCSRF(r *http.Request, token, scope string) bool {
 }
 
 // LogoutHandler clears the session cookie and redirects to the login route.
-// Requests a browser marks Sec-Fetch-Site: cross-site are refused so another
-// site can't log the user out by embedding the route. same-site requests (a
-// sibling subdomain) are deliberately allowed, so deployments that share a
-// registrable domain with untrusted subdomains should not rely on this check.
+// Requests the browser marks cross-site are refused, so another site can't log
+// the user out by embedding the route. Browsers that send no Sec-Fetch-Site are
+// judged by a foreign Origin or Referer host instead (see crossSiteRequest). A
+// request with neither header is accepted. Same-site requests (a sibling
+// subdomain) are deliberately allowed, so deployments that share a registrable
+// domain with untrusted subdomains should not rely on this check. GET and POST
+// are both accepted; state-changing forms should use POST.
 //
 // Logout is client-side only: the session is a stateless sealed cookie, so a
 // copy of it captured before logout stays valid until Expiry unless
@@ -361,13 +364,33 @@ func (m *Manager) ValidateCSRF(r *http.Request, token, scope string) bool {
 // [Session.SID] or Subject) that the caller also feeds on logout.
 func (m *Manager) LogoutHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+		if crossSiteRequest(r) {
 			http.Error(w, "cross-site logout rejected", http.StatusForbidden)
 			return
 		}
 		m.cookie.Clear(w, r)
 		http.Redirect(w, r, m.cfg.BasePath+m.cfg.LoginPath, http.StatusSeeOther)
 	}
+}
+
+// crossSiteRequest reports whether r is known to come from another site.
+// Sec-Fetch-Site decides when present. Without it, a foreign Origin (sent on
+// cross-origin POSTs) or Referer (sent on navigations) host marks the request
+// cross-site. A request carrying neither is no evidence either way.
+func crossSiteRequest(r *http.Request) bool {
+	if sfs := r.Header.Get("Sec-Fetch-Site"); sfs != "" {
+		return sfs == "cross-site"
+	}
+	for _, raw := range []string{r.Header.Get("Origin"), r.Referer()} {
+		if raw == "" {
+			continue
+		}
+		u, err := url.Parse(raw)
+		if err != nil || u.Host == "" || !strings.EqualFold(u.Host, r.Host) {
+			return true
+		}
+	}
+	return false
 }
 
 // Gate wraps next behind a valid session and, when RequiredGroup is set,

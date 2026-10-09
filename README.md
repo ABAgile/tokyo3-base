@@ -2259,7 +2259,7 @@ func (m *Manager) NewSession() (Session, error)
 func (m *Manager) IssueSession(w http.ResponseWriter, r *http.Request, sess Session) error
 func (m *Manager) UpdateSession(w http.ResponseWriter, r *http.Request, mutate func(*Session) error) error
 func (m *Manager) Gate(next http.Handler) http.Handler
-func (m *Manager) LogoutHandler() http.HandlerFunc // client-side only: a captured session cookie stays valid until Expiry unless Config.IsRevoked is wired
+func (m *Manager) LogoutHandler() http.HandlerFunc // GET or POST; refuses cross-site (Sec-Fetch-Site, else Origin/Referer); client-side only: a captured session cookie stays valid until Expiry unless Config.IsRevoked is wired
 func (m *Manager) CSRFToken(r *http.Request, scope string) (string, error)
 func (m *Manager) ValidateCSRF(r *http.Request, token, scope string) bool
 func (m *Manager) SiblingCookie(suffix string) sealedcookie.Cookie
