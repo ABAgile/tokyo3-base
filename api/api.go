@@ -35,8 +35,12 @@ var RO RequestOption
 type RestyClientOption func(*resty.Client)
 type RestyRequestOption func(*resty.Request)
 
+// defaultTimeout bounds each request made through NewRestClient unless the
+// caller sets CO.WithTimeout. It covers the whole exchange, body included.
+const defaultTimeout = 30 * time.Second
+
 func NewRestClient(baseURL string, opts ...RestyClientOption) *RestyClient {
-	client := resty.New().SetBaseURL(baseURL)
+	client := resty.New().SetBaseURL(baseURL).SetTimeout(defaultTimeout)
 	for _, opt := range opts {
 		opt(client)
 	}

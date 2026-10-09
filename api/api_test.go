@@ -172,6 +172,11 @@ func TestClientOption_WithTimeout(t *testing.T) {
 	assert.Error(t, err, "request should fail due to timeout")
 }
 
+func TestNewRestClient_DefaultTimeout(t *testing.T) {
+	assert.Equal(t, defaultTimeout, NewRestClient("http://example.invalid").GetClient().Timeout)
+	assert.Equal(t, time.Second, NewRestClient("http://example.invalid", CO.WithTimeout(time.Second)).GetClient().Timeout)
+}
+
 func TestClientOption_WithRetryCount(t *testing.T) {
 	// Resty retries transport errors, so drop the connection for the first two
 	// attempts and answer the third.

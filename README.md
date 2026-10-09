@@ -62,7 +62,7 @@ rc := api.NewRestClient("https://api.example.com",
 | Option | Description |
 |---|---|
 | `CO.WithBaseURL(url)` | Overrides the base URL after construction |
-| `CO.WithTimeout(d)` | Request timeout |
+| `CO.WithTimeout(d)` | Request timeout (`NewRestClient` default: 30s) |
 | `CO.WithRetryCount(n)` | Number of retries on transient errors |
 | `CO.WithHeader(k, v)` | Sets a default request header |
 | `CO.WithHeaders(map)` | Sets multiple default request headers |
