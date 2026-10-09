@@ -5,7 +5,6 @@ import (
 	"crypto/x509"
 	"fmt"
 	"os"
-	"sync"
 	"time"
 
 	btls "github.com/abagile/tokyo3-base/tls"
@@ -26,9 +25,6 @@ import (
 // reload failures. Set them before the loader's first use; they are
 // invoked outside the loader's lock and must not call back into it.
 type CertLoader struct {
-	certFile string
-	keyFile  string
-
 	// OnSwap, when non-nil, is called after each successful load with
 	// the new cert and the cert file's mtime (zero when stat failed).
 	OnSwap func(cert *tls.Certificate, mtime time.Time)
@@ -38,44 +34,39 @@ type CertLoader struct {
 	// Forced [CertLoader.Reload] failures return the error instead.
 	OnError func(err error)
 
-	mu         sync.RWMutex
-	cert       *tls.Certificate
-	modTime    time.Time // cert file mtime at the last successful load
-	keyModTime time.Time // key file mtime at the last successful load
-
-	// failCertM/failKeyM are the mtimes of the last pair that failed to load
-	// while a previous cert was kept, so the same bad pair isn't re-parsed
-	// (and re-logged) on every handshake until a file changes again.
-	failCertM, failKeyM time.Time
-
-	// statFailed records that the files could not be stat'ed (e.g. mid-rotation)
-	// and the previous cert was kept, so that state is reported once rather
-	// than re-parsed and re-logged on every handshake until the files return.
-	statFailed bool
-}
-
-// settledLocked reports whether the files are unchanged since the last load
-// attempt (successful, or failed with a previous cert kept). Caller holds c.mu.
-func (c *CertLoader) settledLocked(certM, keyM time.Time, statOK bool) bool {
-	if c.cert == nil {
-		return false
-	}
-	if !statOK {
-		return c.statFailed
-	}
-	return certM.Equal(c.modTime) && keyM.Equal(c.keyModTime) ||
-		certM.Equal(c.failCertM) && keyM.Equal(c.failKeyM)
+	val fileValue[*tls.Certificate]
 }
 
 // NewCertLoader creates a CertLoader. The cert/key are loaded lazily on first
 // handshake.
 func NewCertLoader(certFile, keyFile string) *CertLoader {
-	return &CertLoader{certFile: certFile, keyFile: keyFile}
+	c := &CertLoader{}
+	c.val = fileValue[*tls.Certificate]{
+		files: []string{certFile, keyFile},
+		read: func() (*tls.Certificate, []byte, error) {
+			cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+			if err != nil {
+				return nil, nil, fmt.Errorf("load cert pair: %w", err)
+			}
+			return &cert, nil, nil
+		},
+		swapped: func(cert *tls.Certificate, _ []byte, mtime time.Time) {
+			if c.OnSwap != nil {
+				c.OnSwap(cert, mtime)
+			}
+		},
+		failed: func(err error) {
+			if c.OnError != nil {
+				c.OnError(err)
+			}
+		},
+	}
+	return c
 }
 
 // GetCertificate satisfies tls.Config.GetCertificate (server side).
 func (c *CertLoader) GetCertificate(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	return c.current()
+	return c.val.get(false)
 }
 
 // GetClientCertificate satisfies tls.Config.GetClientCertificate
@@ -86,45 +77,7 @@ func (c *CertLoader) GetCertificate(_ *tls.ClientHelloInfo) (*tls.Certificate, e
 // external rotator is picked up on the next (re)connect without a
 // process restart.
 func (c *CertLoader) GetClientCertificate(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) {
-	return c.current()
-}
-
-// current returns the loaded cert, reloading from disk when the cert
-// file's mtime has advanced. Shared by GetCertificate and
-// GetClientCertificate.
-func (c *CertLoader) current() (*tls.Certificate, error) {
-	certM, keyM, statOK := c.mtimes()
-
-	c.mu.RLock()
-	if c.settledLocked(certM, keyM, statOK) {
-		cert := c.cert
-		c.mu.RUnlock()
-		return cert, nil
-	}
-	c.mu.RUnlock()
-
-	// Cert is stale or not yet loaded — reload. A failure with a
-	// previous cert loaded falls back to it (rotation in progress:
-	// cert written, key not yet) so in-flight handshakes survive;
-	// OnError has already surfaced the swallowed error.
-	cert, err := c.reload(false)
-	if err != nil && cert != nil {
-		return cert, nil
-	}
-	return cert, err
-}
-
-// mtimes stats the cert and key files. ok is false when either stat fails.
-// Staleness is "mtime differs" rather than "mtime advanced": a replacement
-// that carries an older or preserved mtime (cp -p, a restored backup) must
-// still be picked up, as must a rotation that only touched the key.
-func (c *CertLoader) mtimes() (certM, keyM time.Time, ok bool) {
-	cfi, cerr := os.Stat(c.certFile)
-	kfi, kerr := os.Stat(c.keyFile)
-	if cerr != nil || kerr != nil {
-		return time.Time{}, time.Time{}, false
-	}
-	return cfi.ModTime(), kfi.ModTime(), true
+	return c.val.get(false)
 }
 
 // Reload re-reads the pair from disk regardless of mtime. Use from
@@ -132,51 +85,8 @@ func (c *CertLoader) mtimes() (certM, keyM time.Time, ok bool) {
 // past the cached value (same-second writes on coarse filesystems).
 // On failure the previous cert stays live and the error is returned.
 func (c *CertLoader) Reload() error {
-	_, err := c.reload(true)
+	_, err := c.val.get(true)
 	return err
-}
-
-// reload re-reads the cert+key. forced skips the mtime gate. Returns
-// (previous cert, error) when the read fails with a previous cert
-// loaded — callers decide whether to surface or swallow. Hooks fire
-// outside the lock.
-func (c *CertLoader) reload(forced bool) (*tls.Certificate, error) {
-	certM, keyM, statOK := c.mtimes()
-
-	c.mu.Lock()
-	// Double-check under write lock.
-	if !forced && c.settledLocked(certM, keyM, statOK) {
-		cert := c.cert
-		c.mu.Unlock()
-		return cert, nil
-	}
-	newCert, err := tls.LoadX509KeyPair(c.certFile, c.keyFile)
-	if err != nil {
-		prev := c.cert
-		if prev != nil {
-			if statOK {
-				c.failCertM, c.failKeyM = certM, keyM
-			} else {
-				c.statFailed = true
-			}
-		}
-		c.mu.Unlock()
-		err = fmt.Errorf("load cert pair: %w", err)
-		if prev != nil && !forced && c.OnError != nil {
-			c.OnError(err)
-		}
-		return prev, err
-	}
-	c.cert = &newCert
-	c.statFailed = false
-	if statOK {
-		c.modTime, c.keyModTime = certM, keyM
-	}
-	c.mu.Unlock()
-	if c.OnSwap != nil {
-		c.OnSwap(&newCert, certM)
-	}
-	return &newCert, nil
 }
 
 // CALoader hot-reloads a CA bundle from disk when the file's mtime
@@ -195,8 +105,6 @@ func (c *CertLoader) reload(forced bool) (*tls.Certificate, error) {
 // receives the raw PEM for fingerprinting) or surface swallowed
 // reload failures. Set before first use; invoked outside the lock.
 type CALoader struct {
-	caFile string
-
 	// OnSwap, when non-nil, is called after each successful load with
 	// the bundle's raw PEM bytes and the file's mtime (zero when stat
 	// failed).
@@ -214,49 +122,40 @@ type CALoader struct {
 	// first use.
 	MaxStale time.Duration
 
-	mu      sync.RWMutex
-	pool    *x509.CertPool
-	modTime time.Time
-	// failModTime is the mtime of the last bundle that failed to load while a
-	// previous pool was kept; it stops the same bad file being re-parsed and
-	// re-logged on every call.
-	failModTime time.Time
-	// statFailed records that the files could not be stat'ed while a pool was
-	// kept, so that state is reported once rather than on every call.
-	statFailed bool
-	// failSince is when the current run of failed reloads began; zero when the
-	// last attempt succeeded. failErr is that run's most recent failure.
-	failSince time.Time
-	failErr   error
+	val fileValue[*x509.CertPool]
 }
 
 // NewCALoader creates a CALoader. The bundle is loaded lazily on
 // first use; call [CALoader.Pool] eagerly to fail fast on a missing
 // or malformed file.
 func NewCALoader(caFile string) *CALoader {
-	return &CALoader{caFile: caFile}
-}
-
-// settledLocked reports whether the files are unchanged since the last load
-// attempt (successful, or failed with a previous pool kept). A stat failure
-// with a pool kept is settled once it has been reported. Caller holds l.mu.
-func (l *CALoader) settledLocked(mtime time.Time, statErr error) bool {
-	if l.pool == nil {
-		return false
+	l := &CALoader{}
+	l.val = fileValue[*x509.CertPool]{
+		files: []string{caFile},
+		read: func() (*x509.CertPool, []byte, error) {
+			raw, err := os.ReadFile(caFile)
+			if err != nil {
+				return nil, nil, fmt.Errorf("read %s: %w", caFile, err)
+			}
+			pool, err := btls.CertPoolFromPEM(raw)
+			if err != nil {
+				return nil, nil, fmt.Errorf("%s: %w", caFile, err)
+			}
+			return pool, raw, nil
+		},
+		swapped: func(_ *x509.CertPool, raw []byte, mtime time.Time) {
+			if l.OnSwap != nil {
+				l.OnSwap(raw, mtime)
+			}
+		},
+		failed: func(err error) {
+			if l.OnError != nil {
+				l.OnError(err)
+			}
+		},
+		maxStale: func() time.Duration { return l.MaxStale },
 	}
-	if statErr != nil {
-		return l.statFailed
-	}
-	return mtime.Equal(l.modTime) || mtime.Equal(l.failModTime)
-}
-
-// keptLocked returns the kept pool, or the failure once failures have lasted
-// longer than MaxStale. Caller holds l.mu.
-func (l *CALoader) keptLocked(now time.Time) (*x509.CertPool, error) {
-	if l.MaxStale > 0 && !l.failSince.IsZero() && now.Sub(l.failSince) > l.MaxStale {
-		return nil, fmt.Errorf("last good bundle kept past MaxStale %s: %w", l.MaxStale, l.failErr)
-	}
-	return l.pool, nil
+	return l
 }
 
 // Pool returns the loaded CA pool, re-reading the file when its
@@ -265,7 +164,7 @@ func (l *CALoader) keptLocked(now time.Time) (*x509.CertPool, error) {
 // (OnError surfaces the swallowed error) until MaxStale, if set, has
 // elapsed; with nothing loaded the error is returned.
 func (l *CALoader) Pool() (*x509.CertPool, error) {
-	return l.load(false)
+	return l.val.get(false)
 }
 
 // Reload re-reads the bundle regardless of mtime. Use from rotators'
@@ -274,80 +173,8 @@ func (l *CALoader) Pool() (*x509.CertPool, error) {
 // filesystems). On failure the previous pool stays live and the error is
 // returned rather than reported through OnError.
 func (l *CALoader) Reload() error {
-	_, err := l.load(true)
+	_, err := l.val.get(true)
 	return err
-}
-
-// load implements Pool and Reload. forced skips the mtime gate.
-func (l *CALoader) load(forced bool) (*x509.CertPool, error) {
-	fi, statErr := os.Stat(l.caFile)
-	var mtime time.Time
-	if statErr == nil {
-		mtime = fi.ModTime()
-	}
-
-	l.mu.RLock()
-	if !forced && l.settledLocked(mtime, statErr) {
-		pool, err := l.keptLocked(time.Now())
-		l.mu.RUnlock()
-		return pool, err
-	}
-	l.mu.RUnlock()
-
-	l.mu.Lock()
-	// Double-check under write lock.
-	if !forced && l.settledLocked(mtime, statErr) {
-		pool, err := l.keptLocked(time.Now())
-		l.mu.Unlock()
-		return pool, err
-	}
-
-	raw, err := os.ReadFile(l.caFile)
-	var pool *x509.CertPool
-	if err != nil {
-		err = fmt.Errorf("read %s: %w", l.caFile, err)
-	} else {
-		pool, err = btls.CertPoolFromPEM(raw)
-		if err != nil {
-			err = fmt.Errorf("%s: %w", l.caFile, err)
-		}
-	}
-	if err != nil {
-		// Keep the previous pool live across a failed reload, for at most
-		// MaxStale once the failures began.
-		prev := l.pool
-		if prev == nil {
-			l.mu.Unlock()
-			return nil, err
-		}
-		if statErr == nil {
-			l.failModTime = mtime
-		}
-		l.statFailed = statErr != nil
-		if l.failSince.IsZero() {
-			l.failSince = time.Now()
-		}
-		l.failErr = err
-		kept, keptErr := l.keptLocked(time.Now())
-		l.mu.Unlock()
-		if forced {
-			return kept, err
-		}
-		if l.OnError != nil {
-			l.OnError(err)
-		}
-		return kept, keptErr
-	}
-	l.pool = pool
-	l.failSince, l.failErr, l.statFailed = time.Time{}, nil, false
-	if statErr == nil {
-		l.modTime = mtime
-	}
-	l.mu.Unlock()
-	if l.OnSwap != nil {
-		l.OnSwap(raw, mtime)
-	}
-	return pool, nil
 }
 
 // VerifyConnection runs full chain + hostname verification against

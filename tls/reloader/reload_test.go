@@ -138,3 +138,29 @@ func TestReloader_RefreshReloadsCAPools(t *testing.T) {
 		t.Fatalf("verify after Refresh: %v", err)
 	}
 }
+
+// A key file removed while a cert is kept is reported once, not on every
+// handshake, mirroring the CA loader.
+func TestCertLoader_StatFailureReportedOnce(t *testing.T) {
+	certFile, keyFile, _ := writeCertKeyFiles(t)
+	loader := reloader.NewCertLoader(certFile, keyFile)
+	reported := 0
+	loader.OnError = func(error) { reported++ }
+	want, err := loader.GetCertificate(nil)
+	if err != nil {
+		t.Fatalf("initial load: %v", err)
+	}
+
+	if err := os.Remove(keyFile); err != nil {
+		t.Fatal(err)
+	}
+	for range 5 {
+		cert, err := loader.GetCertificate(nil)
+		if err != nil || cert != want {
+			t.Fatalf("GetCertificate with key removed: cert=%p err=%v, want kept cert", cert, err)
+		}
+	}
+	if reported != 1 {
+		t.Errorf("OnError fired %d times across 5 calls, want 1", reported)
+	}
+}
