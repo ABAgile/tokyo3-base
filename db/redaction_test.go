@@ -52,3 +52,26 @@ func FuzzSanitizeDBConn_RejectsMalformedCredentialTail(f *testing.F) {
 		}
 	})
 }
+
+// pgx can echo an unmasked password in its parse error (it masks only some
+// spellings), so NewPgxPool must report a sanitized summary instead.
+func TestNewPgxPool_ParseErrorDoesNotEchoPassword(t *testing.T) {
+	for _, connStr := range []string{
+		"host=db password = 'SECRET-kv' sslmode=bogus",
+		"host=db PASSWORD='SECRET-kv' sslmode=bogus",
+		"postgres://app:SECRET-kv@db:5432/x?sslmode=bogus",
+	} {
+		t.Run(connStr, func(t *testing.T) {
+			_, err := NewPgxPool(connStr)
+			if err == nil {
+				t.Fatal("expected a parse error")
+			}
+			if strings.Contains(err.Error(), "SECRET-kv") {
+				t.Fatalf("parse error leaks the password: %v", err)
+			}
+			if !strings.Contains(err.Error(), "sslmode=bogus") {
+				t.Fatalf("parse error lacks the routing summary: %v", err)
+			}
+		})
+	}
+}

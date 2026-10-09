@@ -27,10 +27,12 @@ var (
 
 // NewPgxPool parses connStr and builds a pool without contacting the database.
 // Use [NewPgxPoolContext] to also fail fast when the database is unreachable.
+// A parse error reports only the [SanitizeDBConn] summary: pgx's own message can
+// echo the password.
 func NewPgxPool(connStr string, opts ...DatabaseConfigOption) (*pgxpool.Pool, error) {
 	pgConf, err := pgxpool.ParseConfig(connStr)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parse database connection string: %s", SanitizeDBConn(connStr))
 	}
 	for _, opt := range opts {
 		opt(pgConf)
