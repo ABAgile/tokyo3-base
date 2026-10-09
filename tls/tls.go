@@ -126,7 +126,10 @@ func FromFiles(certFile, keyFile, caFile string) (*tls.Config, error) {
 
 // readPEM reads path and returns its contents, or "" when path is empty —
 // the not-configured sentinel [FromPEM] understands, so an unset path maps
-// cleanly to an absent PEM block rather than a read error.
+// cleanly to an absent PEM block rather than a read error. A configured path
+// holding zero bytes is an error: it would otherwise read as unset and drop
+// the material silently (an empty CA falls back to system trust, an empty
+// cert/key pair to plaintext).
 func readPEM(path string) (string, error) {
 	if path == "" {
 		return "", nil
@@ -134,6 +137,9 @@ func readPEM(path string) (string, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return "", fmt.Errorf("read %s: %w", path, err)
+	}
+	if len(b) == 0 {
+		return "", fmt.Errorf("%s: file is empty", path)
 	}
 	return string(b), nil
 }
