@@ -233,7 +233,7 @@ func (h *AttrsHandler) Handle(ctx context.Context, r slog.Record) error {
 			}
 			sb.WriteString(a.Key)
 			sb.WriteString(": [")
-			fmt.Fprint(&sb, a.Value.Resolve().Any()) // Resolve so slog.LogValuer redaction applies
+			fmt.Fprint(&sb, resolveLogValuers(a.Value).Any()) // Resolve so slog.LogValuer redaction applies
 			sb.WriteString("]")
 		}
 		nr := slog.NewRecord(r.Time, r.Level, sb.String(), r.PC)
@@ -245,6 +245,21 @@ func (h *AttrsHandler) Handle(ctx context.Context, r slog.Record) error {
 	}
 
 	return h.inner.Handle(ctx, r)
+}
+
+// resolveLogValuers resolves v and every value inside its groups, at any
+// depth, so slog.LogValuer redaction applies to all printed attributes.
+func resolveLogValuers(v slog.Value) slog.Value {
+	v = v.Resolve()
+	if v.Kind() != slog.KindGroup {
+		return v
+	}
+	members := v.Group()
+	resolved := make([]slog.Attr, len(members))
+	for i, a := range members {
+		resolved[i] = slog.Attr{Key: a.Key, Value: resolveLogValuers(a.Value)}
+	}
+	return slog.GroupValue(resolved...)
 }
 
 // StackFrame returns a formatted stack trace, starting skip frames above the

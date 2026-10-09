@@ -170,3 +170,21 @@ func TestAttrsHandler_ResolvesLogValuer(t *testing.T) {
 		t.Errorf("message annotation missing resolved value: %s", out)
 	}
 }
+
+func TestAttrsHandler_ResolvesLogValuerInsideGroups(t *testing.T) {
+	var buf bytes.Buffer
+	logger := NewAttrsLogger(slog.NewTextHandler(&buf, nil))
+	logger.Info("login",
+		slog.Group("creds", "cred", secretVal{token: "hunter2"}),
+		slog.Group("outer", slog.Group("inner", "cred", secretVal{token: "hunter3"})),
+	)
+	out := buf.String()
+	for _, secret := range []string{"hunter2", "hunter3"} {
+		if strings.Contains(out, secret) {
+			t.Errorf("grouped secret %s leaked into log line: %s", secret, out)
+		}
+	}
+	if !strings.Contains(out, "cred=REDACTED") {
+		t.Errorf("message annotation missing resolved group value: %s", out)
+	}
+}
