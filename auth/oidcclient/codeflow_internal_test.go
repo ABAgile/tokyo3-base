@@ -32,6 +32,8 @@ type codeFlowFixture struct {
 	skipCallback  bool   // if true, OpenBrowser doesn't fire the callback at all
 	strayFirst    bool   // if true, a bad-state request hits the callback before the real one
 	strayError    bool   // if true, a stateless ?error= request hits the callback before the real one
+	callbackError string // if non-empty, the matching callback carries ?error= instead of a code
+	omitCode      bool   // if true, the matching callback carries no ?code=
 }
 
 // reset locks the OpenBrowser var for the duration of a single test.
@@ -109,6 +111,12 @@ func (f *codeFlowFixture) install() {
 				}
 			}
 			cb := redirect + "?code=" + url.QueryEscape(code) + "&state=" + url.QueryEscape(state)
+			switch {
+			case f.callbackError != "":
+				cb = redirect + "?error=" + url.QueryEscape(f.callbackError) + "&state=" + url.QueryEscape(state)
+			case f.omitCode:
+				cb = redirect + "?state=" + url.QueryEscape(state)
+			}
 			resp, err := http.Get(cb)
 			if err == nil {
 				resp.Body.Close()
