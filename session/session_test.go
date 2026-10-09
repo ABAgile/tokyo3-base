@@ -63,6 +63,9 @@ func TestNew_Validation(t *testing.T) {
 		{"short key", func(c *Config) { c.SessionKey = make([]byte, 16) }},
 		{"prefix", func(c *Config) { c.CookiePrefix = "" }},
 		{"basepath", func(c *Config) { c.BasePath = "portal" }}, // missing leading slash
+		// net/http would silently drop these cookies, so construction must fail.
+		{"cookie name", func(c *Config) { c.CookiePrefix = "bad prefix" }},
+		{"cookie path", func(c *Config) { c.BasePath = "/bad;path" }},
 	} {
 		cfg := base
 		tc.mut(&cfg)

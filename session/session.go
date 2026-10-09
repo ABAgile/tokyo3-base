@@ -237,6 +237,12 @@ func New(cfg Config) (*Manager, error) {
 		Now:     cfg.Now,
 		Proxies: m.proxies,
 	}
+	// net/http silently drops a cookie whose name or path is invalid, so an
+	// unusable name would otherwise look like a successful login that set
+	// no session.
+	if err := m.cookie.Validate(); err != nil {
+		return nil, fmt.Errorf("session: cookie: %w", err)
+	}
 	for _, p := range append([]string{cfg.LoginPath, cfg.LogoutPath}, cfg.ExemptPaths...) {
 		m.exempt[p] = struct{}{}
 	}
