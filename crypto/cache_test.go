@@ -383,3 +383,85 @@ func TestKeyProviderCache_CancelledCallerBufferReuse(t *testing.T) {
 		t.Fatal("key cached for wrapped1 is not k1: the detached unwrap read the reused buffer")
 	}
 }
+
+// revocableMaster blocks its first Unwrap until release is closed, then refuses
+// every later Unwrap once revoked, as a KMS does after a key is revoked.
+type revocableMaster struct {
+	calls            atomic.Int32
+	entered, release chan struct{}
+	revoked          atomic.Bool
+}
+
+func (m *revocableMaster) Wrap(_ context.Context, b []byte) ([]byte, error) { return b, nil }
+func (m *revocableMaster) Unwrap(_ context.Context, b []byte) ([]byte, error) {
+	if m.calls.Add(1) == 1 {
+		close(m.entered)
+		<-m.release
+		return b, nil
+	}
+	if m.revoked.Load() {
+		return nil, errors.New("root refused: key revoked")
+	}
+	return b, nil
+}
+
+// TestKeyProviderCache_InFlightUnwrapDoesNotRepopulateAfterInvalidate: an unwrap
+// that began before Invalidate must not cache its result. Otherwise, once the
+// root revokes the same wrapped material, callers keep getting the key from the
+// cache until the TTL expires.
+func TestKeyProviderCache_InFlightUnwrapDoesNotRepopulateAfterInvalidate(t *testing.T) {
+	master := &revocableMaster{entered: make(chan struct{}), release: make(chan struct{})}
+	releaseOnce := sync.OnceFunc(func() { close(master.release) })
+	t.Cleanup(releaseOnce)
+	cache := NewKeyProviderCache(master, time.Hour)
+	ctx := context.Background()
+	wrapped := makeTestKey(1)
+
+	first := make(chan error, 1)
+	go func() {
+		_, err := cache.ForKey(ctx, "id", wrapped)
+		first <- err
+	}()
+	<-master.entered
+	master.revoked.Store(true)
+	cache.Invalidate("id")
+	releaseOnce()
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := cache.ForKey(ctx, "id", wrapped); err == nil {
+		t.Fatal("revoked key still served from cache after the in-flight unwrap finished")
+	}
+}
+
+// TestKeyProviderCache_CallerAfterInvalidateDoesNotJoinStaleUnwrap: a caller
+// that arrives after Invalidate must reach the root itself, not wait on an
+// unwrap that started before the invalidation.
+func TestKeyProviderCache_CallerAfterInvalidateDoesNotJoinStaleUnwrap(t *testing.T) {
+	master := &revocableMaster{entered: make(chan struct{}), release: make(chan struct{})}
+	releaseOnce := sync.OnceFunc(func() { close(master.release) })
+	t.Cleanup(releaseOnce)
+	cache := NewKeyProviderCache(master, time.Hour)
+	ctx := context.Background()
+	wrapped := makeTestKey(1)
+
+	go func() { _, _ = cache.ForKey(ctx, "id", wrapped) }()
+	<-master.entered
+	master.revoked.Store(true)
+	cache.Invalidate("id")
+
+	second := make(chan error, 1)
+	go func() {
+		_, err := cache.ForKey(ctx, "id", wrapped)
+		second <- err
+	}()
+	select {
+	case err := <-second:
+		if err == nil {
+			t.Fatal("caller after Invalidate was served the pre-invalidation unwrap")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("caller after Invalidate waited on the pre-invalidation unwrap")
+	}
+}

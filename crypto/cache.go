@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"sync"
 	"time"
@@ -22,6 +23,12 @@ type KeyProviderCache struct {
 	mu      sync.RWMutex
 	entries map[string]*cacheEntry
 	ttl     time.Duration
+
+	// generation advances on every Invalidate. An unwrap records the generation it
+	// started under and caches its result only if that generation is still
+	// current, so an unwrap that finishes after an invalidation cannot repopulate
+	// the cache with revoked material.
+	generation uint64
 
 	// unwrapFlights collapses concurrent cold misses for the same keyID and
 	// wrapped material — when N goroutines miss simultaneously (cold start,
@@ -94,8 +101,11 @@ func (c *KeyProviderCache) ForKey(ctx context.Context, keyID string, wrappedKey 
 	// The detached call may read wrappedKey after this function returns, when
 	// the caller is free to reuse its buffer, so it gets a private copy that
 	// matches digest.
+	// The flight is keyed by the generation, so a caller arriving after Invalidate
+	// never joins an unwrap that started before it.
 	wrappedKey = bytes.Clone(wrappedKey)
-	ch := c.unwrapFlights.DoChan(flightKey(keyID, digest), func() (any, error) {
+	gen := c.currentGeneration()
+	ch := c.unwrapFlights.DoChan(flightKey(keyID, gen, digest), func() (any, error) {
 		// Re-check after acquiring the singleflight slot — a previous leader
 		// may have populated the cache while we were queued.
 		if kp := c.lookup(keyID, digest); kp != nil {
@@ -109,7 +119,7 @@ func (c *KeyProviderCache) ForKey(ctx context.Context, keyID string, wrappedKey 
 			return nil, fmt.Errorf("unwrap key: %w", err)
 		}
 		kp := NewLocalKeyProvider(plainKey)
-		c.store(keyID, digest, kp)
+		c.store(keyID, digest, gen, kp)
 		return kp, nil
 	})
 	select {
@@ -136,10 +146,24 @@ func (c *KeyProviderCache) unwrap(ctx context.Context, wrappedKey []byte) (key [
 	return c.rootKP.Unwrap(ctx, wrappedKey)
 }
 
-// flightKey scopes a singleflight call to one keyID and wrapped material, so a
-// caller with new material never joins an unwrap of the old one.
-func flightKey(keyID string, digest keyDigest) string {
-	return keyID + "\x00" + string(digest[:])
+// flightKey scopes a singleflight call to one keyID, invalidation generation,
+// and wrapped material, so a caller with new material or after an invalidation
+// never joins an unwrap of the old one. The fixed-width suffix keeps keyIDs that
+// contain NUL bytes from colliding.
+func flightKey(keyID string, gen uint64, digest keyDigest) string {
+	b := make([]byte, 0, len(keyID)+1+8+len(digest))
+	b = append(b, keyID...)
+	b = append(b, 0)
+	b = binary.BigEndian.AppendUint64(b, gen)
+	b = append(b, digest[:]...)
+	return string(b)
+}
+
+// currentGeneration returns the generation an unwrap starting now should record.
+func (c *KeyProviderCache) currentGeneration() uint64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.generation
 }
 
 // lookup returns the live provider cached for keyID that was unwrapped from
@@ -155,11 +179,15 @@ func (c *KeyProviderCache) lookup(keyID string, digest keyDigest) *LocalKeyProvi
 
 // store caches provider for keyID until ttl elapses and drops every expired
 // entry, so idle keys do not stay resident indefinitely. A non-positive ttl
-// disables retention.
-func (c *KeyProviderCache) store(keyID string, digest keyDigest, provider *LocalKeyProvider) {
+// disables retention. A result from an unwrap that started under an older
+// generation is dropped, because an invalidation happened while it ran.
+func (c *KeyProviderCache) store(keyID string, digest keyDigest, gen uint64, provider *LocalKeyProvider) {
 	now := time.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if gen != c.generation {
+		return
+	}
 	for id, e := range c.entries {
 		if !now.Before(e.expiresAt) {
 			delete(c.entries, id)
@@ -171,9 +199,14 @@ func (c *KeyProviderCache) store(keyID string, digest keyDigest, provider *Local
 }
 
 // Invalidate removes a keyID's cached entry, forcing the next ForKey call to
-// re-unwrap from the root. Call this after rotating the underlying key.
+// re-unwrap from the root. Call this after rotating the underlying key. Unwraps
+// already in flight are not cached when they finish, and callers that arrive
+// afterwards do not wait on them. The generation is cache-wide, so unwraps for
+// other keyIDs in flight at the time are also not cached; they cost one more
+// root call.
 func (c *KeyProviderCache) Invalidate(keyID string) {
 	c.mu.Lock()
+	c.generation++
 	delete(c.entries, keyID)
 	c.mu.Unlock()
 }
