@@ -69,7 +69,12 @@ func Start(ctx context.Context, cfg Config) {
 		<-ctx.Done()
 		sc, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(sc)
+		if err := srv.Shutdown(sc); err != nil {
+			// Shutdown leaves active requests running. Close drops their
+			// connections, which cancels their contexts, so any profile they hold
+			// (CPU or trace) stops.
+			_ = srv.Close()
+		}
 	}()
 	go func() {
 		log.Warn("diagnostics server listening — unauthenticated, do NOT expose publicly", "addr", cfg.Addr)

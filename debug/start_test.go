@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"runtime/trace"
 	"strings"
 	"testing"
 	"time"
@@ -134,4 +135,39 @@ func TestNothingRegisteredOnDefaultServeMux(t *testing.T) {
 			t.Errorf("%s is registered on http.DefaultServeMux as %q", path, pattern)
 		}
 	}
+}
+
+// A diagnostics request still running when the shutdown timeout expires must not
+// outlive the server. Its profile must stop, or the next one cannot start.
+func TestStartStopsActiveTraceWhenShutdownTimesOut(t *testing.T) {
+	addr := freeAddr(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	Start(ctx, Config{Addr: addr, Log: discardLogger()})
+	waitFor(t, "diagnostics server to answer", func() bool {
+		resp, err := http.Get("http://" + addr + "/debug/pprof/")
+		if err != nil {
+			return false
+		}
+		resp.Body.Close()
+		return resp.StatusCode == http.StatusOK
+	})
+
+	go func() {
+		resp, err := http.Get("http://" + addr + "/debug/pprof/trace?seconds=120")
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+	}()
+	time.Sleep(200 * time.Millisecond) // let the trace start
+	cancel()
+
+	waitFor(t, "trace to stop after shutdown", func() bool {
+		if err := trace.Start(io.Discard); err != nil {
+			return false
+		}
+		trace.Stop()
+		return true
+	})
 }
