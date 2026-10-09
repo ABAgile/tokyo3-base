@@ -1207,7 +1207,8 @@ Unlike `net/http/pprof`, it registers **nothing** on
 `runtime/pprof` + `runtime/trace` and served on the package's own mux — so
 importing it can never quietly attach profiling to a binary that serves
 the default mux. `Handler()` exposes that mux for mounting on an existing
-admin server.
+admin server. It is unauthenticated: mount it only on a listener that is not
+publicly reachable, or behind your own authentication.
 
 ```go
 debug.Start(ctx, debug.Config{Addr: os.Getenv("CERTD_DEBUG_ADDR"), Log: log})

@@ -83,8 +83,11 @@ func Start(ctx context.Context, cfg Config) {
 // Handler returns the diagnostics mux (profiles under /debug/pprof/),
 // built from runtime/pprof + runtime/trace. It deliberately omits
 // net/http/pprof's /cmdline, which would expose process arguments (and any
-// secrets passed as flags). Exported so callers can mount
-// it on an existing admin server instead of using a dedicated listener.
+// secrets passed as flags). Exported so callers can mount it on an existing
+// admin server instead of using a dedicated listener.
+//
+// WARNING: the handler is unauthenticated. Mount it only on a listener that is
+// not publicly reachable, or behind the caller's own authentication.
 func Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/debug/pprof/", profileIndex)
