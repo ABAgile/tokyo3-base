@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -62,11 +63,12 @@ func TestRestyClient_ReplacedTransportStillCapsErrorBody(t *testing.T) {
 	}
 }
 
-// An error response labelled gzip whose body is not gzip is an error. It must
-// not be passed on as an empty body with the status hidden. The request asks for
-// gzip itself, so the transport leaves the body encoded and the wrapper decodes
-// it.
-func TestErrorBodyTransport_InvalidGzipErrorBodyFails(t *testing.T) {
+// An error response labelled gzip whose body is not gzip keeps its status and
+// passes its bytes through undecoded, so an HTTP error still reaches callers as
+// an error status rather than a transport failure. The request asks for gzip
+// itself, so the transport leaves the body encoded and the wrapper tries to
+// decode it.
+func TestErrorBodyTransport_InvalidGzipErrorBodyKeepsStatus(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Encoding", "gzip")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -81,9 +83,14 @@ func TestErrorBodyTransport_InvalidGzipErrorBodyFails(t *testing.T) {
 	req.Header.Set("Accept-Encoding", "gzip")
 	client := &http.Client{Transport: errorBodyTransport{}}
 	resp, err := client.Do(req)
-	if err == nil {
-		resp.Body.Close()
-		t.Fatal("an undecodable gzip error body was accepted")
+	if err != nil {
+		t.Fatalf("undecodable gzip error body failed the request: %v", err)
+	}
+	defer resp.Body.Close()
+	body := new(strings.Builder)
+	_, _ = io.Copy(body, resp.Body)
+	if resp.StatusCode != http.StatusInternalServerError || body.String() != "definitely not gzip" || resp.Header.Get("Content-Encoding") != "" {
+		t.Fatalf("status=%d body=%q encoding=%q", resp.StatusCode, body.String(), resp.Header.Get("Content-Encoding"))
 	}
 }
 

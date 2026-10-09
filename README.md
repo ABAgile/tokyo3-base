@@ -82,7 +82,9 @@ Executes a request and unmarshals the response body into `result` on success. Re
 
 `NewRestClient` wraps the transport configured by its options to cap error-body
 reads at 64 KiB before Resty buffers/logs them, including after gzip decoding.
-Success bodies are not capped. Configure custom transports/TLS through the
+A body labelled `gzip` that does not decode is passed through undecoded, so the
+HTTP status still reaches the caller as an `APIError`. Success bodies are not
+capped. Configure custom transports/TLS through the
 constructor options (any `func(*resty.Client)` works, e.g.
 `func(c *resty.Client) { c.SetTLSClientConfig(cfg) }`); they run before the
 limiter wraps the transport. Resty's transport setters (`SetTLSClientConfig`,

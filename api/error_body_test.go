@@ -51,6 +51,24 @@ func TestRestyClient_EmptyGzipErrorPreservesStatus(t *testing.T) {
 	}
 }
 
+// A body labelled gzip that does not decode must still surface its status and
+// raw bytes, not a transport error.
+func TestRestyClient_MislabelledGzipErrorKeepsStatusAndBody(t *testing.T) {
+	for _, payload := range []string{"boom", "upstream exploded, not gzip at all"} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Encoding", "gzip")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, payload)
+		}))
+		err := NewRestClient(srv.URL).R(context.Background(), "GET", "/", nil, RO.WithHeader("Accept-Encoding", "gzip"))
+		srv.Close()
+		var ae *APIError
+		if !errors.As(err, &ae) || ae.StatusCode != http.StatusBadGateway || string(ae.Body) != payload {
+			t.Fatalf("payload %q: err = %v, want 502 APIError carrying the raw body", payload, err)
+		}
+	}
+}
+
 func TestRestyClient_ErrorReadIsBounded(t *testing.T) {
 	b := &countedBody{Reader: strings.NewReader(strings.Repeat("x", 1<<20))}
 	tr := &bodyTransport{body: b, status: 500}

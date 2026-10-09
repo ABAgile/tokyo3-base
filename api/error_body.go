@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"compress/gzip"
 	"errors"
 	"io"
@@ -31,7 +32,8 @@ func (t errorBodyTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	// Resty decompresses explicitly requested gzip too. Do it here so the
 	// limit applies to decoded bytes rather than permitting a gzip bomb.
 	if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
-		compressed, err = gzip.NewReader(body)
+		rec := &recordingReader{r: body}
+		compressed, err = gzip.NewReader(rec)
 		if errors.Is(err, io.EOF) {
 			// An error status with an empty gzip-labelled body: hand the
 			// response through (empty) so the caller still sees the status.
@@ -42,8 +44,14 @@ func (t errorBodyTransport) RoundTrip(req *http.Request) (*http.Response, error)
 			return resp, nil
 		}
 		if err != nil {
-			body.Close()
-			return nil, err
+			// Labelled gzip but not decodable. Pass the bytes through undecoded so
+			// the status still reaches the caller; the recording replays what the
+			// failed decoder read.
+			resp.Body = &limitedErrorBody{Reader: io.LimitReader(io.MultiReader(bytes.NewReader(rec.buf.Bytes()), body), apiErrorBodyLimit), body: body}
+			resp.ContentLength = -1
+			resp.Header.Del("Content-Length")
+			resp.Header.Del("Content-Encoding")
+			return resp, nil
 		}
 		reader = compressed
 		resp.Header.Del("Content-Encoding")
@@ -63,6 +71,19 @@ func (t errorBodyTransport) CloseIdleConnections() {
 	if closer, ok := base.(interface{ CloseIdleConnections() }); ok {
 		closer.CloseIdleConnections()
 	}
+}
+
+// recordingReader keeps a copy of everything read through it, so bytes a failed
+// decoder consumed can be replayed.
+type recordingReader struct {
+	r   io.Reader
+	buf bytes.Buffer
+}
+
+func (p *recordingReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	p.buf.Write(b[:n])
+	return n, err
 }
 
 type limitedErrorBody struct {
