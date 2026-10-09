@@ -11,7 +11,7 @@ import (
 
 const apiErrorBodyLimit = 64 * 1024
 
-// errorBodyTransport caps error bodies before Resty's buffering. Wrapping
+// errorBodyTransport caps non-2xx bodies before Resty's buffering. Wrapping
 // after client options preserves the caller's configured transport/TLS.
 type errorBodyTransport struct {
 	base http.RoundTripper
@@ -23,7 +23,7 @@ func (t errorBodyTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		base = http.DefaultTransport
 	}
 	resp, err := base.RoundTrip(req)
-	if err != nil || resp == nil || resp.StatusCode < http.StatusBadRequest || resp.Body == nil || resp.ContentLength == 0 {
+	if err != nil || resp == nil || (resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices) || resp.Body == nil || resp.ContentLength == 0 {
 		return resp, err
 	}
 	body := resp.Body

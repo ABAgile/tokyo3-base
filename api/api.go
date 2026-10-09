@@ -40,7 +40,7 @@ type RestyRequestOption func(*resty.Request)
 const defaultTimeout = 30 * time.Second
 
 func NewRestClient(baseURL string, opts ...RestyClientOption) *RestyClient {
-	client := resty.New().SetBaseURL(baseURL).SetTimeout(defaultTimeout)
+	client := resty.New().SetBaseURL(baseURL).SetTimeout(defaultTimeout).SetLogger(newRestyLogger(sanitizeURL))
 	for _, opt := range opts {
 		opt(client)
 	}
@@ -106,8 +106,15 @@ func (co *ClientOption) WithTransport(rt http.RoundTripper) RestyClientOption {
 	}
 }
 
+// ErrNotModified is returned by [RestyClient.R] for a 304 response. A 304
+// answers a conditional request (If-None-Match or If-Modified-Since) whose
+// validator still matches, so the caller's cached copy is current. That is
+// not a failure; test for it with errors.Is. Every other non-2xx status is
+// an [APIError].
+var ErrNotModified = errors.New("api: not modified")
+
 // APIError is the typed error returned by [RestyClient.R] for non-2xx
-// responses. StatusCode is the HTTP status. Body is the raw response
+// responses other than 304 (see [ErrNotModified]). StatusCode is the HTTP status. Body is the raw response
 // body — captured verbatim so callers can surface server-side error
 // messages in their own error chains without doing a second
 // roundtrip. Body is truncated at 64 KiB to bound memory; servers
@@ -136,19 +143,30 @@ func (e *APIError) Error() string {
 
 func (rc *RestyClient) R(ctx context.Context, method, path string, result any, opts ...RestyRequestOption) error {
 	req := rc.Client.R().SetContext(ctx)
+	// Resty logs transport errors, including every retry attempt, before they
+	// reach this function. Redact with this request's path params as well.
+	req.SetLogger(newRestyLogger(func(raw string) string {
+		return sanitizeRequestURL(raw, req.PathParams)
+	}))
 	for _, opt := range opts {
 		opt(req)
 	}
 	resp, err := req.Execute(method, path)
 	if err != nil {
 		// net/http embeds the full request URL in its error; scrub credential
-		// query parameters (API keys, tokens) before it reaches logs or callers.
+		// query and path parameters (API keys, tokens) before it reaches logs
+		// or callers.
 		if ue, ok := errors.AsType[*url.Error](err); ok {
-			ue.URL = sanitizeURL(ue.URL)
+			ue.URL = sanitizeRequestURL(ue.URL, req.PathParams)
 		}
 		return fmt.Errorf("api call failed: %w", err)
 	}
-	if resp.IsError() {
+	if resp.StatusCode() == http.StatusNotModified {
+		return ErrNotModified
+	}
+	// Anything else outside 2xx is an error, including 3xx responses that were
+	// not followed (for example under a no-redirect policy).
+	if !resp.IsSuccess() {
 		body := resp.Body()
 		// Also enforce the retained-body contract if a caller replaced the
 		// embedded Resty client's transport after construction.

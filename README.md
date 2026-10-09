@@ -78,10 +78,10 @@ rc := api.NewRestClient("https://api.example.com",
 func (rc *RestyClient) R(ctx context.Context, method, path string, result any, opts ...RestyRequestOption) error
 ```
 
-Executes a request and unmarshals the response body into `result` on success. Returns `*APIError` on HTTP error status; the response body is decoded with `encoding/json` directly (no Content-Type heuristics) so test mocks that omit `Content-Type: application/json` work unchanged.
+Executes a request and unmarshals the response body into `result` on success. Returns `*APIError` on any non-2xx status except 304, including an unfollowed 3xx. A 304 returns `ErrNotModified`, meaning a conditional request's cached copy is still current; test for it with `errors.Is`. The response body is decoded with `encoding/json` directly (no Content-Type heuristics) so test mocks that omit `Content-Type: application/json` work unchanged.
 
-`NewRestClient` wraps the transport configured by its options to cap error-body
-reads at 64 KiB before Resty buffers/logs them, including after gzip decoding.
+`NewRestClient` wraps the transport configured by its options to cap non-2xx
+body reads at 64 KiB before Resty buffers/logs them, including after gzip decoding.
 A body labelled `gzip` that does not decode is passed through undecoded, so the
 HTTP status still reaches the caller as an `APIError`. Success bodies are not
 capped. Configure custom transports/TLS through the
@@ -126,6 +126,21 @@ api error: status 403: {"error":"policy denied for groups [eng]"}
 JSON-decode failures on success-path responses surface as
 `"api call failed: decode response: <err>"` so callers can distinguish them
 from transport errors.
+
+#### `ErrNotModified`
+
+A 304 answers a conditional request (`RO.WithHeader("If-None-Match", etag)`)
+whose validator still matches. `R` returns the sentinel `api.ErrNotModified`
+rather than an `APIError`, and `result` is left untouched:
+
+```go
+err := rc.R(ctx, http.MethodGet, "/board", &board,
+    api.RO.WithHeader("If-None-Match", etag),
+)
+if errors.Is(err, api.ErrNotModified) {
+    // keep the cached board
+}
+```
 
 #### Request options (`RO`)
 
@@ -182,7 +197,7 @@ Refresh behavior:
 
 ### Request logging
 
-`CO.WithRequestLogger` attaches a `*slog.Logger` that emits one `OUTGOING_REQUEST` line before each call and one `INCOMING_RESPONSE` line after. Request and response bodies are omitted. Credential-like headers, query parameters, path parameters, and context attributes are redacted by name, including `Authorization`, `Cookie`, `Set-Cookie`, API keys, tokens, and secrets.
+`CO.WithRequestLogger` attaches a `*slog.Logger` that emits one `OUTGOING_REQUEST` line before each call and one `INCOMING_RESPONSE` line after. Request and response bodies are omitted. Credential-like headers, query parameters, path parameters, and context attributes are redacted by name, including `Authorization`, `Cookie`, `Set-Cookie`, API keys, tokens, and secrets. Resty's own warnings for failed attempts and retries redact the request URL the same way.
 
 #### Context log attributes
 
