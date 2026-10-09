@@ -121,7 +121,9 @@ func exchangeCodeAt(ctx context.Context, tokenEndpoint, clientID, redirectURI, c
 // §5, no padding). Used for PKCE verifiers and CSRF state values.
 func randomURLSafe(n int) (string, error) {
 	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
+	// io.ReadFull returns a read failure as an error. rand.Read would crash the
+	// process instead, and RunCodeFlow would never see it.
+	if _, err := io.ReadFull(rand.Reader, b); err != nil {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(b), nil

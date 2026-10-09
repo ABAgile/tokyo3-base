@@ -12,6 +12,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
 
 	"golang.org/x/crypto/bcrypt"
 )
@@ -57,7 +58,9 @@ func CheckPassword(hash, password string) bool {
 // caller is expected to HashToken before storage.
 func GenerateRawToken() (string, error) {
 	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
+	// io.ReadFull returns a read failure as an error. rand.Read would crash the
+	// process instead, and the caller would never see it.
+	if _, err := io.ReadFull(rand.Reader, b); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
