@@ -8,6 +8,41 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    # Real PostgreSQL and NATS (JetStream) for the live tests (see
+    # internal/livetest). Password auth (scram-sha-256, the image default when a
+    # password is set) exercises the real login path, including rejected logins.
+    # The containers are ephemeral.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: fixture-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      nats:
+        image: nats:2.11-alpine
+        # -js enables JetStream, which the stream tests need; -m exposes the
+        # monitoring endpoint that the health check polls.
+        command: -js -m 8222
+        ports:
+          - 4222:4222
+        options: >-
+          --health-cmd "wget -qO- http://127.0.0.1:8222/healthz"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+
+    # The live tests skip unless these are set (see internal/livetest).
+    env:
+      BASE_TEST_DATABASE_URL: postgres://postgres:fixture-password@127.0.0.1:5432/postgres?sslmode=disable
+      BASE_TEST_NATS_URL: nats://127.0.0.1:4222
+
     steps:
       - uses: actions/checkout@v5
 
