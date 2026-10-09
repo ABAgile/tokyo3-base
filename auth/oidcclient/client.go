@@ -567,6 +567,7 @@ const logoutLockTimeout = 30 * time.Second
 //
 // Allowed set is [A-Za-z0-9._-]. Everything else — including '/',
 // '\\', '.' adjacent to slashes, shell metacharacters — becomes '_'.
+// The names "." and ".." are rewritten too, since they name directories.
 // The load-bearing property is "no path separator can appear in the
 // output," which is exercised by oidcclient_test.go.
 func SafeFilename(s string) string {
@@ -586,7 +587,12 @@ func SafeFilename(s string) string {
 	if len(b) == 0 {
 		return "default"
 	}
-	return string(b)
+	out := string(b)
+	if out == "." || out == ".." {
+		// filepath.Join would resolve these outside CacheDir.
+		return strings.ReplaceAll(out, ".", "_")
+	}
+	return out
 }
 
 // WriteFileAtomic writes data to a sibling tempfile and renames it

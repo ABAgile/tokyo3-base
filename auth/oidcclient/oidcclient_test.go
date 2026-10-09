@@ -26,6 +26,8 @@ func TestSafeFilename(t *testing.T) {
 		"":                      "default",
 		"unicode-嗨":             "unicode-___",
 		"shell$injection`echo`": "shell_injection_echo_",
+		".":                     "_",
+		"..":                    "__",
 	}
 	for in, want := range cases {
 		if got := oidcclient.SafeFilename(in); got != want {
