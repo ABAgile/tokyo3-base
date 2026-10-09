@@ -20,12 +20,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/url"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/abagile/tokyo3-base/journal"
+	bnats "github.com/abagile/tokyo3-base/nats"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -91,7 +90,7 @@ func NewSink(cfg SinkConfig) (*Sink, error) {
 	opts := connectOptions(cfg.TLS, cfg.Log, cfg.ReconnectWait, "jetstream-sink")
 	nc, err := nats.Connect(cfg.URL, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("nats connect: %w", err)
+		return nil, fmt.Errorf("nats connect: %w", bnats.RedactError(err))
 	}
 	js, err := jetstream.New(nc)
 	if err != nil {
@@ -123,7 +122,7 @@ func connectOptions(tlsCfg *tls.Config, log *slog.Logger, reconnectWait time.Dur
 				log.Warn("nats disconnected", "face", face, "err", err)
 			}),
 			nats.ReconnectHandler(func(nc *nats.Conn) {
-				log.Info("nats reconnected", "face", face, "url", logURL(nc.ConnectedUrl()))
+				log.Info("nats reconnected", "face", face, "url", bnats.RedactURL(nc.ConnectedUrl()))
 			}),
 			nats.ClosedHandler(func(_ *nats.Conn) {
 				log.Warn("nats connection closed", "face", face)
@@ -131,23 +130,6 @@ func connectOptions(tlsCfg *tls.Config, log *slog.Logger, reconnectWait time.Dur
 		)
 	}
 	return opts
-}
-
-// logURL returns raw with any userinfo (passwords, tokens) removed, so NATS
-// connection URLs can be logged. nats.go accepts a comma-separated server
-// list, so each entry is redacted separately.
-func logURL(raw string) string {
-	servers := strings.Split(raw, ",")
-	for i, s := range servers {
-		u, err := url.Parse(strings.TrimSpace(s))
-		if err != nil {
-			servers[i] = "[invalid URL]"
-			continue
-		}
-		u.User = nil
-		servers[i] = u.String()
-	}
-	return strings.Join(servers, ",")
 }
 
 // Append publishes payload to the configured subject and waits for the
@@ -244,7 +226,7 @@ func NewSource(cfg SourceConfig) (*Source, error) {
 	opts := connectOptions(cfg.TLS, cfg.Log, cfg.ReconnectWait, "jetstream-source")
 	nc, err := nats.Connect(cfg.URL, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("nats connect: %w", err)
+		return nil, fmt.Errorf("nats connect: %w", bnats.RedactError(err))
 	}
 	js, err := jetstream.New(nc)
 	if err != nil {

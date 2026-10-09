@@ -65,3 +65,17 @@ func TestNewSinkAndSource_RejectMalformedURL(t *testing.T) {
 		t.Error("NewSource accepted a malformed URL")
 	}
 }
+
+// The connect error repeats the URL it failed on, so the password must not
+// reach the caller.
+func TestNewSinkAndSource_ErrorOmitsCredentials(t *testing.T) {
+	const raw = "nats://svc:hunter2@host:bad"
+	_, err := NewSink(SinkConfig{URL: raw, Subject: "events"})
+	if err == nil || strings.Contains(err.Error(), "hunter2") {
+		t.Errorf("NewSink error = %v; want an error without credentials", err)
+	}
+	_, err = NewSource(SourceConfig{URL: raw, StreamName: "s", Subject: "events"})
+	if err == nil || strings.Contains(err.Error(), "hunter2") {
+		t.Errorf("NewSource error = %v; want an error without credentials", err)
+	}
+}

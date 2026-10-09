@@ -20,6 +20,19 @@ func TestNewAuditSink_CAOnlyDoesNotClaimMTLS(t *testing.T) {
 	}
 }
 
+func TestNewAuditSink_LogOmitsSchemelessURLCredentials(t *testing.T) {
+	cert, key, ca := writeAuditCertFiles(t)
+	var logs bytes.Buffer
+	sink, err := NewAuditSink[struct{}](AuditSinkConfig{URL: "svc:hunter2@127.0.0.1:1", CertFile: cert, KeyFile: key, CAFile: ca, Subject: "audit", EnvPrefix: "TEST", Log: slog.New(slog.NewTextHandler(&logs, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sink.Close()
+	if got := logs.String(); strings.Contains(got, "hunter2") {
+		t.Fatalf("startup log leaks URL credentials: %s", got)
+	}
+}
+
 func TestNewAuditSink_LogOmitsURLCredentials(t *testing.T) {
 	cert, key, ca := writeAuditCertFiles(t)
 	var logs bytes.Buffer

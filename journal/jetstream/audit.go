@@ -5,6 +5,7 @@ import (
 	"log/slog"
 
 	"github.com/abagile/tokyo3-base/journal"
+	bnats "github.com/abagile/tokyo3-base/nats"
 	"github.com/abagile/tokyo3-base/tls/reloader"
 )
 
@@ -77,7 +78,7 @@ func NewAuditSink[T any](cfg AuditSinkConfig) (*journal.EncodedSink[T], error) {
 	}
 	if cfg.Log != nil {
 		if cfg.CertFile != "" && cfg.KeyFile != "" {
-			cfg.Log.Info("audit sink: NATS JetStream with mTLS", "url", logURL(cfg.URL))
+			cfg.Log.Info("audit sink: NATS JetStream with mTLS", "url", bnats.RedactURL(cfg.URL))
 		} else {
 			cfg.Log.Warn("audit sink: " + cfg.EnvPrefix + "_CERT not set — connecting without mTLS (not for production)")
 		}

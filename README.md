@@ -1828,6 +1828,10 @@ signature. They're applied **after** the implicit `nats.Secure` so the
 caller's TLS opinion (if any) wins for everything other than the cert
 material itself.
 
+Connect errors are returned with the URL's credentials removed. `RedactURL`
+gives the same redaction for logging a connection URL, and `RedactError`
+applies it to an error's URL.
+
 ```go
 nc, err := nats.Dial(
     os.Getenv("VAULT_NATS_URL"),
