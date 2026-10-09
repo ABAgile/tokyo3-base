@@ -25,6 +25,11 @@ func TestResolve(t *testing.T) {
 		want     string
 	}{
 		{"ldflags wins", "v1.2.3", bi("ignored"), "v1.2.3"},
+		// An empty injected value is the unstamped default, not a version.
+		{"empty injected, no build info", "", func() (*debug.BuildInfo, bool) { return nil, false }, "dev"},
+		{"empty injected uses module version", "", bi("v2.0.0"), "v2.0.0"},
+		{"empty injected uses vcs revision", "", bi("(devel)",
+			debug.BuildSetting{Key: "vcs.revision", Value: "abcdef1234567890"}), "dev-abcdef1"},
 		{"injected dev-sha passes through", "dev-abc1234", bi("ignored"), "dev-abc1234"},
 		{"no build info", "dev", func() (*debug.BuildInfo, bool) { return nil, false }, "dev"},
 		{"module version", "dev", bi("v2.0.0"), "v2.0.0"},

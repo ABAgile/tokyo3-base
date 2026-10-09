@@ -21,9 +21,13 @@ const devSentinel = "dev"
 // main.Version) to an effective version string, with the VCS commit time
 // appended as " (<local time>)" whenever the toolchain recorded one.
 //
+// An empty injected value (for example `-X main.Version=` with nothing after
+// it) is treated as the "dev" placeholder, so it gets the same fallbacks as an
+// unstamped binary. Resolve never returns an empty string.
+//
 // Base token, in order:
 //
-//  1. injected, when the linker set it to anything other than "dev"
+//  1. injected, when it is neither empty nor "dev"
 //  2. BuildInfo.Main.Version when it's a real module version (e.g.
 //     "v1.2.3") — what `go install pkg@vX.Y.Z` records
 //  3. "dev-<vcs.revision[:7]>[-dirty]" from the VCS settings the
@@ -43,6 +47,9 @@ func Resolve(injected string) string {
 // tests can feed controlled BuildInfo and a fixed time zone instead of
 // the real binary's.
 func resolve(injected string, readBuildInfo func() (*debug.BuildInfo, bool), loc *time.Location) string {
+	if injected == "" {
+		injected = devSentinel
+	}
 	info, ok := readBuildInfo()
 	if !ok {
 		// No build info: only the injected value is available.
