@@ -318,9 +318,11 @@ func (r *Reloader) VerifyConnection(poolName string) func(tls.ConnectionState) e
 // pull SNI from elsewhere (custom dialers to a fixed host).
 type TLSConfigOption func(*tls.Config)
 
-// WithServerName sets [tls.Config.ServerName] on the returned
-// config. Use when the dial doesn't supply SNI from an
-// http.Transport URL — e.g., custom dialers to a fixed host.
+// WithServerName sets [tls.Config.ServerName] on the returned config.
+// Required when the dial targets an IP literal: no SNI is sent for an IP,
+// and http.Transport sets ServerName only on its own clone of the config,
+// which the verifier cannot see. Without a name the verifier fails closed.
+// Hostname URLs take their name from SNI and need no option.
 func WithServerName(name string) TLSConfigOption {
 	return func(cfg *tls.Config) { cfg.ServerName = name }
 }

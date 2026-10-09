@@ -2569,6 +2569,11 @@ the standard verifier freezes `RootCAs` at config-construction, so
 hot-reload uses `VerifyConnection` against a per-handshake pool snapshot
 instead.
 
+For an IP-literal URL (`https://10.0.0.5:8443`), pass
+`WithServerName("10.0.0.5")`: no SNI is sent for an IP, and the verifier cannot
+see the name `http.Transport` sets on its config clone, so without it the dial
+fails closed. Hostname URLs need no option.
+
 The mechanics are the primitives above — one `CertLoader` for the pair,
 one `CALoader` per file-backed pool — so material whose file mtime has
 advanced is also picked up lazily at the next handshake, with swap and
