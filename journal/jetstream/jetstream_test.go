@@ -124,9 +124,8 @@ func TestPickDeliverPolicy(t *testing.T) {
 }
 
 // Note: live publish/subscribe round-trips are not unit-tested here — they
-// require a running NATS server with JetStream enabled and a stream
-// covering the test subject. Cover that in an integration test (build tag)
-// or via the docker compose stack already used by the broader project.
+// need a running NATS server with JetStream. live_test.go covers them when
+// BASE_TEST_NATS_URL is set.
 
 // ── Subscription cleanup ─────────────────────────────────────────────────────
 

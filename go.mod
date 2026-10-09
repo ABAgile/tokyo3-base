@@ -9,6 +9,7 @@ require (
 	github.com/coreos/go-oidc/v3 v3.21.0
 	github.com/go-resty/resty/v2 v2.17.2
 	github.com/golang-jwt/jwt/v5 v5.3.1
+	github.com/govalues/decimal v0.1.36
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/nats-io/nats.go v1.54.0
 	github.com/phuslu/log v1.0.137
@@ -22,7 +23,6 @@ require (
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/go-jose/go-jose/v4 v4.1.5 // indirect
-	github.com/govalues/decimal v0.1.36 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.3 // indirect
