@@ -73,16 +73,10 @@ func isSensitiveLogField(name string) bool {
 	return false
 }
 
+// sanitizeQuery redacts query parameters by name, exactly as SanitizeHeaders
+// redacts headers.
 func sanitizeQuery(values url.Values) url.Values {
-	safe := make(url.Values, len(values))
-	for key, vals := range values {
-		if isSensitiveLogField(key) {
-			safe[key] = []string{redactedLogValue}
-		} else {
-			safe[key] = vals
-		}
-	}
-	return safe
+	return url.Values(SanitizeHeaders(values))
 }
 
 func sanitizeURL(raw string) string {

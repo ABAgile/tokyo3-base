@@ -77,10 +77,8 @@ func NewEncodedSource[T any](inner Source, decode func([]byte) (T, error)) *Enco
 func NewJSONSource[T any](inner Source) *EncodedSource[T] {
 	return NewEncodedSource(inner, func(b []byte) (T, error) {
 		var v T
-		if err := json.Unmarshal(b, &v); err != nil {
-			return v, err
-		}
-		return v, nil
+		err := json.Unmarshal(b, &v)
+		return v, err
 	})
 }
 

@@ -31,6 +31,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -144,12 +145,8 @@ func (l *Limiter) Middleware(next http.Handler, exempt ...string) http.Handler {
 	if l == nil {
 		return next
 	}
-	exemptSet := make(map[string]struct{}, len(exempt))
-	for _, p := range exempt {
-		exemptSet[p] = struct{}{}
-	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if _, ok := exemptSet[r.URL.Path]; ok {
+		if slices.Contains(exempt, r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}

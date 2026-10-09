@@ -60,11 +60,7 @@ func resolve(injected string, readBuildInfo func() (*debug.BuildInfo, bool), loc
 	for _, s := range info.Settings {
 		switch s.Key {
 		case "vcs.revision":
-			if len(s.Value) >= 7 {
-				rev = s.Value[:7]
-			} else {
-				rev = s.Value
-			}
+			rev = s.Value[:min(len(s.Value), 7)]
 		case "vcs.modified":
 			if s.Value == "true" {
 				dirty = "-dirty"

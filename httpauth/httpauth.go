@@ -78,13 +78,8 @@ func BasicAuth(cfg BasicAuthConfig, next http.Handler, exempt ...string) http.Ha
 	wantUser := sha256.Sum256([]byte(cfg.Username))
 	wantPass := sha256.Sum256([]byte(cfg.Password))
 
-	exemptSet := make(map[string]struct{}, len(exempt))
-	for _, p := range exempt {
-		exemptSet[p] = struct{}{}
-	}
-
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if _, ok := exemptSet[r.URL.Path]; ok {
+		if slices.Contains(exempt, r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}

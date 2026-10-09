@@ -150,15 +150,21 @@ func validAppName(s string) bool {
 
 // SaveConfig writes Config to disk atomically with mode 0o600.
 func SaveConfig(c Config) error {
+	return writeCacheJSON("config.json", c)
+}
+
+// writeCacheJSON marshals v and writes it atomically to name inside the cache
+// dir, with mode 0o600.
+func writeCacheJSON(name string, v any) error {
 	dir, err := CacheDir()
 	if err != nil {
 		return err
 	}
-	b, err := json.MarshalIndent(c, "", "  ")
+	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}
-	return WriteFileAtomic(filepath.Join(dir, "config.json"), b, 0o600)
+	return WriteFileAtomic(filepath.Join(dir, name), b, 0o600)
 }
 
 // LoadConfig reads the persisted Config. Returns a descriptive error
@@ -196,19 +202,11 @@ func SaveTokens(t *Tokens) error {
 }
 
 func saveTokens(t *Tokens, cfg *Config) error {
-	dir, err := CacheDir()
-	if err != nil {
-		return err
-	}
 	var value any = t
 	if t != nil && cfg != nil {
 		value = cachedTokens{Tokens: *t, Config: cfg}
 	}
-	b, err := json.MarshalIndent(value, "", "  ")
-	if err != nil {
-		return err
-	}
-	return WriteFileAtomic(filepath.Join(dir, "tokens.json"), b, 0o600)
+	return writeCacheJSON("tokens.json", value)
 }
 
 // LoadTokens reads the cached Tokens file. Returns a descriptive
