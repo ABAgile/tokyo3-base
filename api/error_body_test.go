@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -114,5 +115,38 @@ func TestRestyClient_ExplicitGzipErrorsAreBoundedAfterDecode(t *testing.T) {
 	}
 	if !bytes.Equal(ae.Body, bytes.Repeat([]byte("x"), apiErrorBodyLimit)) {
 		t.Fatal("error body was not decoded")
+	}
+}
+
+// Valid empty gzip members decode to nothing, so the error body is empty. The
+// compressed stream must not stay reachable from the response once it is read.
+func TestErrorBodyDoesNotRetainCompressedStreamAfterDecode(t *testing.T) {
+	var member bytes.Buffer
+	gz := gzip.NewWriter(&member)
+	gz.Close()
+	stream := bytes.Repeat(member.Bytes(), (8<<20)/member.Len())
+	b := &countedBody{Reader: bytes.NewReader(stream)}
+	req, err := http.NewRequest(http.MethodGet, "http://example.test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := errorBodyTransport{base: &bodyTransport{body: b, status: 500, encoding: "gzip"}}
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := io.Copy(io.Discard, resp.Body)
+	if err != nil || n != 0 {
+		t.Fatalf("decoded %d bytes, err=%v", n, err)
+	}
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	runtime.KeepAlive(resp)
+	if grown := int64(after.HeapAlloc) - int64(before.HeapAlloc); grown > 1<<20 {
+		t.Fatalf("response retained %d bytes of compressed input", grown)
 	}
 }

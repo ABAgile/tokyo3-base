@@ -32,7 +32,7 @@ func (t errorBodyTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	// Resty decompresses explicitly requested gzip too. Do it here so the
 	// limit applies to decoded bytes rather than permitting a gzip bomb.
 	if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
-		rec := &recordingReader{r: body}
+		rec := &recordingReader{r: body, recording: true}
 		compressed, err = gzip.NewReader(rec)
 		if errors.Is(err, io.EOF) {
 			// An error status with an empty gzip-labelled body: hand the
@@ -53,6 +53,9 @@ func (t errorBodyTransport) RoundTrip(req *http.Request) (*http.Response, error)
 			resp.Header.Del("Content-Encoding")
 			return resp, nil
 		}
+		// The header decoded, so nothing needs replaying. Stop copying the
+		// compressed stream, which would otherwise grow with the whole body.
+		rec.stop()
 		reader = compressed
 		resp.Header.Del("Content-Encoding")
 		resp.Uncompressed = true
@@ -73,17 +76,26 @@ func (t errorBodyTransport) CloseIdleConnections() {
 	}
 }
 
-// recordingReader keeps a copy of everything read through it, so bytes a failed
-// decoder consumed can be replayed.
+// recordingReader keeps a copy of everything read through it until stop is
+// called, so bytes a failed decoder consumed can be replayed.
 type recordingReader struct {
-	r   io.Reader
-	buf bytes.Buffer
+	r         io.Reader
+	buf       bytes.Buffer
+	recording bool
 }
 
 func (p *recordingReader) Read(b []byte) (int, error) {
 	n, err := p.r.Read(b)
-	p.buf.Write(b[:n])
+	if p.recording {
+		p.buf.Write(b[:n])
+	}
 	return n, err
+}
+
+// stop ends recording and releases the copy. Reads still pass through.
+func (p *recordingReader) stop() {
+	p.recording = false
+	p.buf = bytes.Buffer{}
 }
 
 type limitedErrorBody struct {
