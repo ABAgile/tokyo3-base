@@ -246,13 +246,20 @@ func CopyDeref[T any, U any](src T, dst *U) (*U, error) {
 	}
 
 	dstType := dstVal.Type()
+	srcType := srcVal.Type()
 
 	for i := 0; i < dstType.NumField(); i++ {
 		dstField := dstVal.Field(i)
 		dstFieldType := dstType.Field(i)
 
-		srcField := srcVal.FieldByName(dstFieldType.Name)
-		if !srcField.IsValid() || !dstField.CanSet() {
+		// Resolve through the index path: a promoted field behind a nil embedded
+		// pointer has no value to copy, so it is skipped rather than panicking.
+		srcStructField, ok := srcType.FieldByName(dstFieldType.Name)
+		if !ok {
+			continue
+		}
+		srcField, err := srcVal.FieldByIndexErr(srcStructField.Index)
+		if err != nil || !dstField.CanSet() {
 			continue
 		}
 

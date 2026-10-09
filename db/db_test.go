@@ -255,3 +255,28 @@ func TestNewPgxPoolContext_FailsFastWhenUnreachable(t *testing.T) {
 		assert.NotContains(t, err.Error(), "secret")
 	}
 }
+
+// A promoted field behind a nil embedded pointer cannot be read. CopyDeref must
+// skip it rather than panic.
+func TestCopyDeref_NilEmbeddedPointerSkipsField(t *testing.T) {
+	type Inner struct{ Name string }
+	type Source struct {
+		*Inner
+		ID int
+	}
+	type Dest struct {
+		ID   int
+		Name string
+	}
+	var dst Dest
+	assert.NotPanics(t, func() {
+		_, err := CopyDeref(Source{ID: 7}, &dst)
+		assert.NoError(t, err)
+	})
+	assert.Equal(t, 7, dst.ID)
+	assert.Empty(t, dst.Name)
+
+	_, err := CopyDeref(Source{Inner: &Inner{Name: "alice"}, ID: 7}, &dst)
+	assert.NoError(t, err)
+	assert.Equal(t, "alice", dst.Name)
+}
