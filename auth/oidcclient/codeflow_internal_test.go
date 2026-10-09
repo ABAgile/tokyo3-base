@@ -1,6 +1,7 @@
 package oidcclient
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net"
@@ -354,5 +355,31 @@ func TestBuildAuthorizeURLAt_KeepsEndpointQueryParameters(t *testing.T) {
 	q := u.Query()
 	if q.Get("tenant") != "foo" || q.Get("client_id") != "cid" || q.Get("code_challenge") != "ch" {
 		t.Errorf("authorize URL = %q, want tenant=foo plus the code-flow parameters", raw)
+	}
+}
+
+// A cleartext remote issuer must not get a browser login: the authorize URL
+// would carry the PKCE challenge and state over http.
+func TestRunCodeFlow_RefusesCleartextRemoteIssuer(t *testing.T) {
+	openBrowserMu.Lock()
+	original := OpenBrowser
+	opened := false
+	OpenBrowser = func(string) error { opened = true; return nil }
+	defer func() {
+		OpenBrowser = original
+		openBrowserMu.Unlock()
+	}()
+
+	var stderr bytes.Buffer
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := RunCodeFlow(ctx, "http://idp.example", "cli-client", 0, &stderr); err == nil {
+		t.Fatal("RunCodeFlow with a cleartext remote issuer succeeded")
+	}
+	if opened {
+		t.Error("browser opened for a cleartext remote issuer")
+	}
+	if strings.Contains(stderr.String(), "idp.example") {
+		t.Errorf("login URL printed for a cleartext remote issuer: %q", stderr.String())
 	}
 }

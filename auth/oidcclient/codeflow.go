@@ -77,6 +77,12 @@ func RunCodeFlow(ctx context.Context, issuer, clientID string, port int, stderr 
 	if err != nil {
 		return nil, err
 	}
+	// The URL carries the PKCE challenge and state, so refuse cleartext before
+	// printing or opening it. Discovery filters its own endpoints, but the
+	// fallback convention is not checked there.
+	if err := requireSecureEndpoint(authURL); err != nil {
+		return nil, err
+	}
 	if stderr != nil {
 		fmt.Fprintln(stderr, "Opening browser for OIDC login. If it doesn't open, paste this URL:")
 		fmt.Fprintln(stderr, "  ", authURL)
