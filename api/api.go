@@ -144,9 +144,10 @@ func (e *APIError) Error() string {
 func (rc *RestyClient) R(ctx context.Context, method, path string, result any, opts ...RestyRequestOption) error {
 	req := rc.Client.R().SetContext(ctx)
 	// Resty logs transport errors, including every retry attempt, before they
-	// reach this function. Redact with this request's path params as well.
+	// reach this function. Redact with this request's path params as well,
+	// including client-level and raw ones.
 	req.SetLogger(newRestyLogger(func(raw string) string {
-		return sanitizeRequestURL(raw, req.PathParams)
+		return sanitizeRequestURL(raw, requestPathParams(rc.Client, req))
 	}))
 	for _, opt := range opts {
 		opt(req)
@@ -157,7 +158,7 @@ func (rc *RestyClient) R(ctx context.Context, method, path string, result any, o
 		// query and path parameters (API keys, tokens) before it reaches logs
 		// or callers.
 		if ue, ok := errors.AsType[*url.Error](err); ok {
-			ue.URL = sanitizeRequestURL(ue.URL, req.PathParams)
+			ue.URL = sanitizeRequestURL(ue.URL, requestPathParams(rc.Client, req))
 		}
 		return fmt.Errorf("api call failed: %w", err)
 	}

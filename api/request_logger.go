@@ -100,6 +100,21 @@ func sanitizeURL(raw string) string {
 	return u.String()
 }
 
+// requestPathParams returns every path parameter Resty substitutes into a
+// request URL, from request and client scope, escaped or raw. The precedence
+// matches Resty's, so the closest scope wins on a name clash.
+func requestPathParams(c *resty.Client, r *resty.Request) map[string]string {
+	params := make(map[string]string, len(r.PathParams)+len(c.PathParams)+len(r.RawPathParams)+len(c.RawPathParams))
+	for _, src := range []map[string]string{r.PathParams, c.PathParams, r.RawPathParams, c.RawPathParams} {
+		for name, value := range src {
+			if _, ok := params[name]; !ok {
+				params[name] = value
+			}
+		}
+	}
+	return params
+}
+
 func sanitizeRequestURL(raw string, pathParams map[string]string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -149,9 +164,9 @@ func (co *ClientOption) WithRequestLogger(logger *slog.Logger) RestyClientOption
 		if logger == nil {
 			logger = slog.Default()
 		}
-		c.OnBeforeRequest(func(_ *resty.Client, r *resty.Request) error {
+		c.OnBeforeRequest(func(client *resty.Client, r *resty.Request) error {
 			queryStr := sanitizeQuery(r.QueryParam).Encode()
-			requestURL := sanitizeRequestURL(r.URL, r.PathParams)
+			requestURL := sanitizeRequestURL(r.URL, requestPathParams(client, r))
 			fullURL := requestURL
 			if queryStr != "" {
 				separator := "?"
@@ -182,10 +197,10 @@ func (co *ClientOption) WithRequestLogger(logger *slog.Logger) RestyClientOption
 			return nil
 		})
 
-		c.OnAfterResponse(func(_ *resty.Client, r *resty.Response) error {
+		c.OnAfterResponse(func(client *resty.Client, r *resty.Response) error {
 			attrs, _ := r.Request.Context().Value(logAttrsKey).(map[string]string)
 			attrs = sanitizeLogAttrs(attrs)
-			requestURL := sanitizeRequestURL(r.Request.URL, r.Request.PathParams)
+			requestURL := sanitizeRequestURL(r.Request.URL, requestPathParams(client, r.Request))
 			logAttrs := append([]slog.Attr{
 				slog.String("method", r.Request.Method),
 				slog.String("url", requestURL),
