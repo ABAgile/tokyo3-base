@@ -50,9 +50,9 @@ type fileValue[T any] struct {
 	mu     sync.RWMutex
 	val    T
 	loaded bool
-	// loadedAt and failedAt are the file mtimes at the last successful load and
-	// at the last failed load that kept a value. A failure whose files could not
-	// be stat'ed records neither.
+	// loadedAt holds the file mtimes at the last successful load. failedAt holds
+	// the mtimes at the latest failed load of the current failure run; nil when
+	// the files could not be stat'ed, and cleared by a successful load.
 	loadedAt, failedAt stamp
 	// statFailed records that the files could not be stat'ed while a value was
 	// kept, so that state is reported once rather than on every call.
@@ -95,9 +95,7 @@ func (f *fileValue[T]) get(forced bool) (T, error) {
 			var zero T
 			return zero, err
 		}
-		if ok {
-			f.failedAt = s
-		}
+		f.failedAt = s
 		f.statFailed = !ok
 		if f.failSince.IsZero() {
 			f.failSince = time.Now()
@@ -115,6 +113,7 @@ func (f *fileValue[T]) get(forced bool) (T, error) {
 	}
 	f.val, f.loaded = val, true
 	f.failSince, f.failErr, f.statFailed = time.Time{}, nil, false
+	f.failedAt = nil
 	if ok {
 		f.loadedAt = s
 	}
@@ -144,7 +143,10 @@ func (f *fileValue[T]) stat() (stamp, bool) {
 }
 
 // settledLocked reports whether the files are unchanged since the last load
-// attempt (successful, or failed with a value kept). A stat failure with a value
+// attempt. While healthy, that means the loaded mtime. While reloads are
+// failing, only the failed mtime counts as settled: a return to the loaded
+// mtime (a restored bundle with its original mtime) is a recovery and must be
+// re-read, or the failure state would never clear. A stat failure with a value
 // kept is settled once it has been reported. Caller holds f.mu.
 func (f *fileValue[T]) settledLocked(s stamp, ok bool) bool {
 	if !f.loaded {
@@ -153,7 +155,10 @@ func (f *fileValue[T]) settledLocked(s stamp, ok bool) bool {
 	if !ok {
 		return f.statFailed
 	}
-	return s.equal(f.loadedAt) || s.equal(f.failedAt)
+	if f.failSince.IsZero() {
+		return s.equal(f.loadedAt)
+	}
+	return s.equal(f.failedAt)
 }
 
 // keptLocked returns the kept value, or the failure once failures have lasted
