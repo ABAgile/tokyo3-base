@@ -2397,11 +2397,13 @@ func (c *CertLoader) Reload() error                                             
 type CALoader struct {
     OnSwap  func(raw []byte, mtime time.Time)  // raw PEM, for fingerprinting
     OnError func(err error)
+    MaxStale time.Duration                      // >0 ⇒ stop trusting the last good bundle after reloads fail this long
     /* ... */
 }
 
 func NewCALoader(caFile string) *CALoader
 func (l *CALoader) Pool() (*x509.CertPool, error)
+func (l *CALoader) Reload() error // forced, bypasses the mtime gate
 func (l *CALoader) VerifyConnection(cs tls.ConnectionState) error
 ```
 
@@ -2542,6 +2544,7 @@ type Config struct {
     CertPath, KeyPath string
     Pools             map[string]string  // name → CA bundle path
     PollCert          bool               // true ⇒ also mtime-poll cert+key
+    CAMaxStale        time.Duration      // 0 ⇒ keep last good CA bundle indefinitely; see CALoader.MaxStale
     Log               *slog.Logger
 }
 
@@ -2576,7 +2579,8 @@ top of that, two refresh disciplines, picked per use case:
   from wherever a new cert lands — typically a renewer's `OnRenewed`
   callback. Suits binaries that mint their own certs in-process;
   `Refresh` bypasses the mtime gate, covering same-second writes that
-  per-handshake pickup would miss.
+  per-handshake pickup would miss. It re-reads the cert+key and every
+  file-backed CA pool, so a CA-only rotation is picked up too.
 - **mtime polling** (`PollCert: true`): `RunPoll` probes the cert+key
   files' mtimes on a fixed cadence. Suits binaries whose cert is
   rotated by an external agent; the poll bounds how long a rotation

@@ -82,7 +82,10 @@ type Config struct {
 	CertPath, KeyPath string
 	Pools             map[string]string
 	PollCert          bool
-	Log               *slog.Logger
+	// CAMaxStale is applied to every file-backed pool; see [CALoader.MaxStale].
+	// Zero keeps each last good bundle for as long as its file stays unloadable.
+	CAMaxStale time.Duration
+	Log        *slog.Logger
 }
 
 // Reloader composes the base tls loaders into named-pool
@@ -168,6 +171,7 @@ func New(cfg Config) (*Reloader, error) {
 			continue
 		}
 		loader := NewCALoader(path)
+		loader.MaxStale = cfg.CAMaxStale
 		loader.OnSwap = func(raw []byte, mtime time.Time) {
 			log.Info("CA bundle reloaded",
 				"name", name,
@@ -187,13 +191,24 @@ func New(cfg Config) (*Reloader, error) {
 	return r, nil
 }
 
-// Refresh re-reads the cert+key from disk regardless of mtime.
-// Use from external rotators' OnRenewed callbacks where the path
-// has been written but mtime may or may not have advanced past
-// the cached value (some filesystems coalesce mtimes within the
-// same second). For passive mtime-driven pickup, prefer RunPoll
-// with [Config.PollCert] = true.
-func (r *Reloader) Refresh() error { return r.loader.Reload() }
+// Refresh re-reads the cert+key and every file-backed CA pool from disk
+// regardless of mtime. Use from external rotators' OnRenewed callbacks where
+// the files have been written but mtime may or may not have advanced past the
+// cached value (some filesystems coalesce mtimes within the same second). A
+// file that fails keeps its previous material; the errors are joined. For
+// passive mtime-driven pickup, prefer RunPoll with [Config.PollCert] = true.
+func (r *Reloader) Refresh() error {
+	errs := []error{r.loader.Reload()}
+	for name, e := range r.pools {
+		if e.loader == nil {
+			continue
+		}
+		if err := e.loader.Reload(); err != nil {
+			errs = append(errs, fmt.Errorf("pool %q: %w", name, err))
+		}
+	}
+	return errors.Join(errs...)
+}
 
 // bundleFingerprint is the first 8 bytes of sha256(pem), hex-encoded.
 // Short enough for human-friendly log diffing across a fleet, long

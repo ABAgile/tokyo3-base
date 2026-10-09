@@ -206,6 +206,14 @@ type CALoader struct {
 	// the error would otherwise be invisible.
 	OnError func(err error)
 
+	// MaxStale, when > 0, bounds how long the last good pool is kept after
+	// reloads start failing: once failures have lasted longer than MaxStale,
+	// Pool returns the failure instead. This stops a CA removed in a bundle
+	// that no longer parses from staying trusted indefinitely. Zero keeps the
+	// last good pool for as long as the file stays unloadable. Set before
+	// first use.
+	MaxStale time.Duration
+
 	mu      sync.RWMutex
 	pool    *x509.CertPool
 	modTime time.Time
@@ -213,6 +221,13 @@ type CALoader struct {
 	// previous pool was kept; it stops the same bad file being re-parsed and
 	// re-logged on every call.
 	failModTime time.Time
+	// statFailed records that the files could not be stat'ed while a pool was
+	// kept, so that state is reported once rather than on every call.
+	statFailed bool
+	// failSince is when the current run of failed reloads began; zero when the
+	// last attempt succeeded. failErr is that run's most recent failure.
+	failSince time.Time
+	failErr   error
 }
 
 // NewCALoader creates a CALoader. The bundle is loaded lazily on
@@ -222,19 +237,49 @@ func NewCALoader(caFile string) *CALoader {
 	return &CALoader{caFile: caFile}
 }
 
-// settledLocked reports whether the file is unchanged since the last load
-// attempt (successful, or failed with a previous pool kept). Caller holds l.mu.
+// settledLocked reports whether the files are unchanged since the last load
+// attempt (successful, or failed with a previous pool kept). A stat failure
+// with a pool kept is settled once it has been reported. Caller holds l.mu.
 func (l *CALoader) settledLocked(mtime time.Time, statErr error) bool {
-	return l.pool != nil && statErr == nil &&
-		(mtime.Equal(l.modTime) || mtime.Equal(l.failModTime))
+	if l.pool == nil {
+		return false
+	}
+	if statErr != nil {
+		return l.statFailed
+	}
+	return mtime.Equal(l.modTime) || mtime.Equal(l.failModTime)
+}
+
+// keptLocked returns the kept pool, or the failure once failures have lasted
+// longer than MaxStale. Caller holds l.mu.
+func (l *CALoader) keptLocked(now time.Time) (*x509.CertPool, error) {
+	if l.MaxStale > 0 && !l.failSince.IsZero() && now.Sub(l.failSince) > l.MaxStale {
+		return nil, fmt.Errorf("last good bundle kept past MaxStale %s: %w", l.MaxStale, l.failErr)
+	}
+	return l.pool, nil
 }
 
 // Pool returns the loaded CA pool, re-reading the file when its
 // mtime has advanced. Shared by VerifyConnection and eager startup
 // checks. A reload failure with a previous pool loaded keeps it live
-// (OnError surfaces the swallowed error); with nothing loaded the
-// error is returned.
+// (OnError surfaces the swallowed error) until MaxStale, if set, has
+// elapsed; with nothing loaded the error is returned.
 func (l *CALoader) Pool() (*x509.CertPool, error) {
+	return l.load(false)
+}
+
+// Reload re-reads the bundle regardless of mtime. Use from rotators'
+// post-write callbacks where the file was rewritten but its mtime may not
+// have advanced past the cached value (same-second writes on coarse
+// filesystems). On failure the previous pool stays live and the error is
+// returned rather than reported through OnError.
+func (l *CALoader) Reload() error {
+	_, err := l.load(true)
+	return err
+}
+
+// load implements Pool and Reload. forced skips the mtime gate.
+func (l *CALoader) load(forced bool) (*x509.CertPool, error) {
 	fi, statErr := os.Stat(l.caFile)
 	var mtime time.Time
 	if statErr == nil {
@@ -242,19 +287,19 @@ func (l *CALoader) Pool() (*x509.CertPool, error) {
 	}
 
 	l.mu.RLock()
-	if l.settledLocked(mtime, statErr) {
-		pool := l.pool
+	if !forced && l.settledLocked(mtime, statErr) {
+		pool, err := l.keptLocked(time.Now())
 		l.mu.RUnlock()
-		return pool, nil
+		return pool, err
 	}
 	l.mu.RUnlock()
 
 	l.mu.Lock()
 	// Double-check under write lock.
-	if l.settledLocked(mtime, statErr) {
-		pool := l.pool
+	if !forced && l.settledLocked(mtime, statErr) {
+		pool, err := l.keptLocked(time.Now())
 		l.mu.Unlock()
-		return pool, nil
+		return pool, err
 	}
 
 	raw, err := os.ReadFile(l.caFile)
@@ -268,21 +313,33 @@ func (l *CALoader) Pool() (*x509.CertPool, error) {
 		}
 	}
 	if err != nil {
-		// Keep the previous pool live across a failed reload.
+		// Keep the previous pool live across a failed reload, for at most
+		// MaxStale once the failures began.
 		prev := l.pool
-		if prev != nil && statErr == nil {
+		if prev == nil {
+			l.mu.Unlock()
+			return nil, err
+		}
+		if statErr == nil {
 			l.failModTime = mtime
 		}
-		l.mu.Unlock()
-		if prev != nil {
-			if l.OnError != nil {
-				l.OnError(err)
-			}
-			return prev, nil
+		l.statFailed = statErr != nil
+		if l.failSince.IsZero() {
+			l.failSince = time.Now()
 		}
-		return nil, err
+		l.failErr = err
+		kept, keptErr := l.keptLocked(time.Now())
+		l.mu.Unlock()
+		if forced {
+			return kept, err
+		}
+		if l.OnError != nil {
+			l.OnError(err)
+		}
+		return kept, keptErr
 	}
 	l.pool = pool
+	l.failSince, l.failErr, l.statFailed = time.Time{}, nil, false
 	if statErr == nil {
 		l.modTime = mtime
 	}
