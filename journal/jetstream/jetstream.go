@@ -340,14 +340,13 @@ func (s *Source) Subscribe(ctx context.Context, replay int, startFromSeq uint64)
 				}
 				return
 			}
-			meta, mErr := msg.Metadata()
-			if mErr != nil {
+			out, err := decodeMsg(msg)
+			if err != nil {
+				// AckNone leaves nothing to redeliver, so the gap is visible only here.
+				if s.log != nil {
+					s.log.Warn("jetstream message dropped: unreadable metadata", "stream", s.streamName, "subject", s.subject, "err", err)
+				}
 				continue
-			}
-			out := journal.Msg{
-				Seq:  meta.Sequence.Stream,
-				Time: meta.Timestamp,
-				Data: msg.Data(),
 			}
 			select {
 			case <-ctx.Done():
@@ -383,6 +382,16 @@ func releaseConsumer(ctx context.Context, stream consumerDeleter, name string, l
 // shortly after, as their iterator returns.
 func (s *Source) Close() error {
 	return s.nc.Drain()
+}
+
+// decodeMsg converts a JetStream message to a journal.Msg. It fails when the
+// metadata, and so the stream sequence, cannot be read.
+func decodeMsg(m jetstream.Msg) (journal.Msg, error) {
+	meta, err := m.Metadata()
+	if err != nil {
+		return journal.Msg{}, err
+	}
+	return journal.Msg{Seq: meta.Sequence.Stream, Time: meta.Timestamp, Data: m.Data()}, nil
 }
 
 // pickDeliverPolicy is the start-policy decision tree, factored out for
