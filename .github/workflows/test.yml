@@ -17,10 +17,10 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-          # go.mod only names the minor series (go 1.27). Without this,
-          # setup-go prefers whatever 1.27.x the runner image has cached,
-          # which can lag a patch release and trip govulncheck on stdlib fixes.
-          check-latest: true
+          # go.mod's toolchain line pins the patch release. setup-go reads it;
+          # when its version manifest lags, setup-go downloads that release from
+          # go.dev. Bump the toolchain line with each Go patch release. The go
+          # line stays at the minor series so consumers' minimum does not move.
           cache: true
           cache-dependency-path: |
             go.sum

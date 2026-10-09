@@ -2,6 +2,8 @@ module github.com/abagile/tokyo3-base
 
 go 1.27
 
+toolchain go1.27.2
+
 require (
 	github.com/ColeBurch/pgx-govalues-decimal v0.1.0
 	github.com/coreos/go-oidc/v3 v3.18.0
@@ -28,7 +30,7 @@ require (
 	github.com/nats-io/nkeys v0.4.15 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
-	golang.org/x/net v0.58.0 // indirect
+	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
