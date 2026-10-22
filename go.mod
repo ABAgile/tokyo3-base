@@ -2,7 +2,7 @@ module github.com/abagile/tokyo3-base
 
 go 1.27
 
-toolchain go1.27.2
+toolchain go1.27.3
 
 require (
 	github.com/ColeBurch/pgx-govalues-decimal v0.1.0
