@@ -15,7 +15,7 @@ func TestRestyLoggerRedactsTransportErrorURLs(t *testing.T) {
 	err := &url.Error{Op: "Get", URL: "http://127.0.0.1:1/x?api_key=SECRETKEY&page=2", Err: errors.New("connection refused")}
 
 	l.Warnf("%v, Attempt %v", err, 1)
-	l.Errorf("%v", wrapped{err})
+	l.Errorf("%v", &wrapped{err})
 
 	got := buf.String()
 	if strings.Contains(got, "SECRETKEY") {
@@ -59,5 +59,5 @@ func TestRestyLoggerPassesOtherOutputThrough(t *testing.T) {
 // wrapped hides a *url.Error one level down, as a caller-side wrapper would.
 type wrapped struct{ err error }
 
-func (w wrapped) Error() string { return "retry failed: " + w.err.Error() }
-func (w wrapped) Unwrap() error { return w.err }
+func (w *wrapped) Error() string { return "retry failed: " + w.err.Error() }
+func (w *wrapped) Unwrap() error { return w.err }
